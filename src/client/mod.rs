@@ -15,6 +15,7 @@
 #[cfg(unix)]
 mod direct_graphics;
 mod input;
+mod shell;
 
 use std::collections::HashSet;
 #[cfg(unix)]
@@ -44,7 +45,7 @@ use crate::protocol::render_ansi;
 use crate::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD;
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientKeybindings, ClientLaunchMode,
-    ClientMessage, NotifyKind, RenderEncoding, ServerMessage, MAX_FRAME_SIZE,
+    ClientMessage, FrameData, NotifyKind, RenderEncoding, ServerMessage, MAX_FRAME_SIZE,
     MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use crate::server::socket_paths::client_socket_path;
@@ -63,6 +64,7 @@ struct ClientLoopConfig {
     kitty_graphics_enabled: bool,
     mouse_capture_active: bool,
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
+    shell_config: Option<shell::ClientShellConfig>,
 }
 
 /// State tracking for the thin client.
@@ -98,6 +100,8 @@ struct ClientState {
     repaint_pending: bool,
     /// Whether this client draws the cursor into frame cells instead of using the host cursor.
     draw_host_cursor: bool,
+    /// Experimental client-owned shell state.
+    shell: Option<shell::ClientShellState>,
 }
 
 #[derive(Debug, Default)]
@@ -240,6 +244,30 @@ fn attach_scroll_action(
 impl ClientState {
     fn request_repaint(&mut self) {
         self.repaint_pending = true;
+    }
+
+    fn present_frame(&mut self, frame_data: FrameData) {
+        let frame_data = if self.draw_host_cursor {
+            render_ansi::frame_with_drawn_cursor(frame_data)
+        } else {
+            frame_data
+        };
+        let encoded = if self.draw_host_cursor {
+            self.blit_encoder
+                .encode_with_suppressed_visible_cursor(&frame_data, self.repaint_pending)
+        } else {
+            self.blit_encoder.encode(&frame_data, self.repaint_pending)
+        };
+        let mut stdout = io::stdout();
+        let graphics = if self.kitty_graphics_enabled {
+            frame_data.graphics.as_slice()
+        } else {
+            &[]
+        };
+        let _ = write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
+        let _ = stdout.flush();
+        self.blit_encoder.commit(frame_data, encoded);
+        self.repaint_pending = false;
     }
 }
 
@@ -849,26 +877,39 @@ fn do_handshake(
     exact_cell_size: bool,
     requested_encoding: RenderEncoding,
     direct_attach_requested: bool,
+    shell_surface_size: Option<crate::protocol::ClientSurfaceSize>,
 ) -> Result<RenderEncoding, ClientError> {
     stream
         .set_nonblocking(false)
         .map_err(ClientError::ConnectionFailed)?;
 
-    // Send Hello.
-    let hello = ClientMessage::Hello {
-        version: PROTOCOL_VERSION,
-        cols,
-        rows,
-        cell_width_px,
-        cell_height_px,
-        requested_encoding,
-        keybindings: requested_keybindings(),
-        launch_mode: client_launch_mode(
-            direct_attach_requested,
-            exact_cell_size,
+    // Send the matching handshake without changing the released Hello shape.
+    let hello = if let Some(surface_size) = shell_surface_size {
+        ClientMessage::ClientShellHello {
+            version: PROTOCOL_VERSION,
+            cols,
+            rows,
             cell_width_px,
             cell_height_px,
-        ),
+            requested_encoding,
+            surface_size,
+        }
+    } else {
+        ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            cols,
+            rows,
+            cell_width_px,
+            cell_height_px,
+            requested_encoding,
+            keybindings: requested_keybindings(),
+            launch_mode: client_launch_mode(
+                direct_attach_requested,
+                exact_cell_size,
+                cell_width_px,
+                cell_height_px,
+            ),
+        }
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -927,6 +968,12 @@ enum ClientLoopEvent {
     ServerMessage(ServerMessage),
     /// Server reader thread exited (connection lost).
     ServerDisconnected,
+    /// A client-shell endpoint API request completed.
+    ClientShellEndpointResult {
+        boot_id: String,
+        request_id: String,
+        result: Box<Result<crate::api::schema::ResponseResult, shell::ClientShellEndpointError>>,
+    },
     /// Timer tick.
     Timer,
 }
@@ -1049,6 +1096,7 @@ fn connect_terminal_session_stream(
         false,
         RenderEncoding::TerminalAnsi,
         true,
+        None,
     ) {
         Ok(RenderEncoding::TerminalAnsi) => {}
         Ok(encoding) => {
@@ -1233,14 +1281,19 @@ fn run_client_with_mode(
 
     let loaded_config = crate::config::Config::load();
     crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
+    let client_rendered_shell =
+        attach_request.is_none() && std::env::var_os("HERDR_CLIENT_RENDERED_SHELL").is_some();
+    let shell_config =
+        client_rendered_shell.then(|| shell::ClientShellConfig::from_config(&loaded_config.config));
     let mouse_capture = loaded_config.config.ui.mouse_capture;
     let mouse_scroll_lines = loaded_config.config.ui.mouse_scroll_lines();
     let redraw_on_focus_gained = loaded_config.config.ui.redraw_on_focus_gained;
     let host_cursor = loaded_config.config.ui.host_cursor;
     let direct_attach_requested = attach_request.is_some();
     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
-    let kitty_graphics_enabled =
-        loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
+    let kitty_graphics_enabled = loaded_config.config.experimental.kitty_graphics
+        && !direct_attach_requested
+        && !client_rendered_shell;
     let loop_config = ClientLoopConfig {
         sound_config: loaded_config.config.ui.sound,
         mouse_scroll_lines,
@@ -1249,6 +1302,7 @@ fn run_client_with_mode(
         kitty_graphics_enabled,
         mouse_capture_active: mouse_capture,
         remote_image_paste_key,
+        shell_config,
     };
 
     let socket_path = client_socket_path();
@@ -1270,6 +1324,16 @@ fn run_client_with_mode(
     let (cols, rows, cell_width_px, cell_height_px, exact_cell_size) =
         initial_terminal_geometry(kitty_graphics_enabled);
 
+    let shell_surface_size = loop_config
+        .shell_config
+        .as_ref()
+        .map(|shell| shell.initial_surface_size(cols, rows));
+    let requested_encoding = if shell_surface_size.is_some() {
+        RenderEncoding::SemanticFrame
+    } else {
+        requested_encoding
+    };
+
     // Perform handshake while the stream is still in blocking mode.
     let negotiated_encoding = match do_handshake(
         &mut stream,
@@ -1280,6 +1344,7 @@ fn run_client_with_mode(
         exact_cell_size,
         requested_encoding,
         direct_attach_requested,
+        shell_surface_size,
     ) {
         Ok(encoding) => encoding,
         Err(err) => {
@@ -1388,6 +1453,46 @@ fn run_client_with_mode(
     Ok(())
 }
 
+fn dispatch_client_shell_actions(
+    actions: Vec<shell::ClientShellAction>,
+    endpoint_tx: Option<&std::sync::mpsc::Sender<(String, crate::api::schema::Request)>>,
+) {
+    for action in actions {
+        match action {
+            shell::ClientShellAction::Endpoint { boot_id, request } => {
+                if endpoint_tx.is_none_or(|tx| tx.send((boot_id, *request)).is_err()) {
+                    warn!("client shell endpoint worker unavailable");
+                }
+            }
+            shell::ClientShellAction::Keybind(action) => {
+                debug!(
+                    ?action,
+                    "client shell action awaits its presentation family"
+                );
+            }
+            shell::ClientShellAction::CustomCommand(command) => {
+                debug!(command = %command.label, "client shell custom command awaits endpoint manifest routing");
+            }
+        }
+    }
+}
+
+fn client_shell_resize_message(
+    shell: &shell::ClientShellState,
+    cols: u16,
+    rows: u16,
+    cell_width_px: u32,
+    cell_height_px: u32,
+) -> ClientMessage {
+    ClientMessage::ClientShellResize {
+        cols,
+        rows,
+        cell_width_px,
+        cell_height_px,
+        surface_size: shell.surface_size(cols, rows),
+    }
+}
+
 /// The main client event loop.
 ///
 /// Uses a threaded architecture:
@@ -1429,6 +1534,7 @@ async fn run_client_loop(
         redraw_on_focus_gained: config.redraw_on_focus_gained,
         repaint_pending: false,
         draw_host_cursor,
+        shell: config.shell_config.map(shell::ClientShellState::new),
     };
     debug!(?negotiated_encoding, "client render encoding active");
     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
@@ -1440,9 +1546,66 @@ async fn run_client_loop(
     // Channel for events from the stdin, resize, and server reader threads.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
 
+    let shell_endpoint_tx = state.shell.as_ref().map(|_| {
+        let (request_tx, request_rx) =
+            std::sync::mpsc::channel::<(String, crate::api::schema::Request)>();
+        let result_tx = event_tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("herdr-client-shell-endpoint".into())
+            .spawn(move || {
+                let client = crate::api::client::ApiClient::local();
+                while let Ok((boot_id, request)) = request_rx.recv() {
+                    let request_id = request.id.clone();
+                    let result = match client.request(request) {
+                        Ok(response) if response.id == request_id => Ok(response.result),
+                        Ok(response) => Err(shell::ClientShellEndpointError {
+                            code: None,
+                            message: format!(
+                                "endpoint response id {:?} did not match {request_id:?}",
+                                response.id
+                            ),
+                        }),
+                        Err(crate::api::client::ApiClientError::ErrorResponse(response))
+                            if response.id == request_id =>
+                        {
+                            Err(shell::ClientShellEndpointError {
+                                code: Some(response.error.code),
+                                message: response.error.message,
+                            })
+                        }
+                        Err(crate::api::client::ApiClientError::ErrorResponse(response)) => {
+                            Err(shell::ClientShellEndpointError {
+                                code: None,
+                                message: format!(
+                                    "endpoint error id {:?} did not match {request_id:?}",
+                                    response.id
+                                ),
+                            })
+                        }
+                        Err(error) => Err(shell::ClientShellEndpointError {
+                            code: None,
+                            message: error.to_string(),
+                        }),
+                    };
+                    if result_tx
+                        .blocking_send(ClientLoopEvent::ClientShellEndpointResult {
+                            boot_id,
+                            request_id,
+                            result: Box::new(result),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        request_tx
+    });
+
     // Spawn the stdin reader thread.
-    let will_query_host_terminal_theme =
-        state.attach_escape.is_none() && should_query_host_terminal_theme();
+    let will_query_host_terminal_theme = state.attach_escape.is_none()
+        && state.shell.is_none()
+        && should_query_host_terminal_theme();
     // Terminals behind ConPTY report no pixel size through the ioctl, so ask the
     // host terminal directly instead of falling back to an assumed cell size.
     let will_query_host_cell_size = state.attach_escape.is_none()
@@ -1540,6 +1703,44 @@ async fn run_client_loop(
         match event {
             #[cfg(unix)]
             ClientLoopEvent::StdinInput(data) => {
+                if state.shell.is_some() {
+                    let (outcome, frame) = {
+                        let shell = state.shell.as_mut().expect("checked shell mode");
+                        let outcome = shell.handle_input_bytes(&data);
+                        let frame = outcome
+                            .repaint
+                            .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
+                            .flatten();
+                        (outcome, frame)
+                    };
+                    if outcome.detach {
+                        let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
+                        return Ok(());
+                    }
+                    if outcome.resize {
+                        let shell = state.shell.as_ref().expect("shell mode remains active");
+                        let resize = client_shell_resize_message(
+                            shell,
+                            state.reported_size.0,
+                            state.reported_size.1,
+                            0,
+                            0,
+                        );
+                        if let Err(err) = write_to_server(&mut write_stream, &resize) {
+                            return Err(ClientError::ConnectionLost(err));
+                        }
+                    }
+                    dispatch_client_shell_actions(outcome.actions, shell_endpoint_tx.as_ref());
+                    for request in outcome.requests {
+                        if let Err(err) = write_to_server(&mut write_stream, &request) {
+                            return Err(ClientError::ConnectionLost(err));
+                        }
+                    }
+                    if let Some(frame) = frame {
+                        state.present_frame(frame);
+                    }
+                    continue;
+                }
                 let data = if let Some(attach_escape) = &mut state.attach_escape {
                     match attach_escape.filter_input(
                         data,
@@ -1648,6 +1849,44 @@ async fn run_client_loop(
             }
             #[cfg(windows)]
             ClientLoopEvent::StdinEvents(events) => {
+                if state.shell.is_some() {
+                    let (outcome, frame) = {
+                        let shell = state.shell.as_mut().expect("checked shell mode");
+                        let outcome = shell.handle_client_events(&events);
+                        let frame = outcome
+                            .repaint
+                            .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
+                            .flatten();
+                        (outcome, frame)
+                    };
+                    if outcome.detach {
+                        let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
+                        return Ok(());
+                    }
+                    if outcome.resize {
+                        let shell = state.shell.as_ref().expect("shell mode remains active");
+                        let resize = client_shell_resize_message(
+                            shell,
+                            state.reported_size.0,
+                            state.reported_size.1,
+                            0,
+                            0,
+                        );
+                        if let Err(err) = write_to_server(&mut write_stream, &resize) {
+                            return Err(ClientError::ConnectionLost(err));
+                        }
+                    }
+                    dispatch_client_shell_actions(outcome.actions, shell_endpoint_tx.as_ref());
+                    for request in outcome.requests {
+                        if let Err(err) = write_to_server(&mut write_stream, &request) {
+                            return Err(ClientError::ConnectionLost(err));
+                        }
+                    }
+                    if let Some(frame) = frame {
+                        state.present_frame(frame);
+                    }
+                    continue;
+                }
                 if state.attach_escape.is_some() {
                     continue;
                 }
@@ -1683,48 +1922,89 @@ async fn run_client_loop(
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
+            ClientLoopEvent::ClientShellEndpointResult {
+                boot_id,
+                request_id,
+                result,
+            } => {
+                let repaint = state.shell.as_mut().is_some_and(|shell| {
+                    shell.handle_endpoint_result(&boot_id, &request_id, *result)
+                });
+                if repaint {
+                    if let Some(frame) = state.shell.as_mut().and_then(|shell| {
+                        shell.compose(state.reported_size.0, state.reported_size.1)
+                    }) {
+                        state.present_frame(frame);
+                    }
+                }
+            }
             ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
                 state.reported_size = (new_cols, new_rows);
                 // Resizing invalidates the host-side blit baseline.
                 state.request_repaint();
-                let msg = ClientMessage::Resize {
-                    cols: new_cols,
-                    rows: new_rows,
-                    cell_width_px,
-                    cell_height_px,
+                let msg = if let Some(shell) = &state.shell {
+                    client_shell_resize_message(
+                        shell,
+                        new_cols,
+                        new_rows,
+                        cell_width_px,
+                        cell_height_px,
+                    )
+                } else {
+                    ClientMessage::Resize {
+                        cols: new_cols,
+                        rows: new_rows,
+                        cell_width_px,
+                        cell_height_px,
+                    }
                 };
                 if let Err(e) = write_to_server(&mut write_stream, &msg) {
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
             ClientLoopEvent::ServerMessage(msg) => match msg {
-                ServerMessage::Frame(frame_data) => {
-                    let frame_data = if state.draw_host_cursor {
-                        render_ansi::frame_with_drawn_cursor(frame_data)
-                    } else {
-                        frame_data
-                    };
-                    let encoded = if state.draw_host_cursor {
-                        state.blit_encoder.encode_with_suppressed_visible_cursor(
-                            &frame_data,
-                            state.repaint_pending,
+                ServerMessage::Frame(frame_data) => state.present_frame(frame_data),
+                ServerMessage::ClientShellSnapshot(snapshot) => {
+                    let (composed, resize) = if let Some(shell) = &mut state.shell {
+                        let previous_size =
+                            shell.surface_size(state.reported_size.0, state.reported_size.1);
+                        shell.set_snapshot(snapshot);
+                        let next_size =
+                            shell.surface_size(state.reported_size.0, state.reported_size.1);
+                        (
+                            shell.compose(state.reported_size.0, state.reported_size.1),
+                            (previous_size != next_size).then(|| {
+                                client_shell_resize_message(
+                                    shell,
+                                    state.reported_size.0,
+                                    state.reported_size.1,
+                                    0,
+                                    0,
+                                )
+                            }),
                         )
                     } else {
-                        state
-                            .blit_encoder
-                            .encode(&frame_data, state.repaint_pending)
+                        (None, None)
                     };
-                    let mut stdout = io::stdout();
-                    let graphics = if state.kitty_graphics_enabled {
-                        frame_data.graphics.as_slice()
+                    if let Some(resize) = resize {
+                        if let Err(err) = write_to_server(&mut write_stream, &resize) {
+                            return Err(ClientError::ConnectionLost(err));
+                        }
+                    }
+                    if let Some(frame) = composed {
+                        state.present_frame(frame);
+                    }
+                }
+                ServerMessage::PaneSurface(surface) => {
+                    let composed = if let Some(shell) = &mut state.shell {
+                        shell.set_pane_surface(surface);
+                        shell.compose(state.reported_size.0, state.reported_size.1)
                     } else {
-                        &[]
+                        None
                     };
-                    let _ =
-                        write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
-                    let _ = stdout.flush();
-                    state.blit_encoder.commit(frame_data, encoded);
-                    state.repaint_pending = false;
+                    if let Some(frame) = composed {
+                        state.present_frame(frame);
+                    }
                 }
                 ServerMessage::Terminal(frame) => {
                     if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {

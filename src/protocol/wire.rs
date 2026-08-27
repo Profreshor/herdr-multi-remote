@@ -55,12 +55,19 @@ pub enum ClientKeybindings {
 /// Client behavior requested at connection time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientLaunchMode {
-    /// Full app client.
+    /// Full app client rendered by the server.
     App,
     /// Full app client eligible for audited local direct graphics.
     AppDirectGraphics,
     /// Direct terminal attach client.
     TerminalAttach,
+}
+
+/// Size of the pane surface requested by a client-owned shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientSurfaceSize {
+    pub cols: u16,
+    pub rows: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +142,24 @@ pub enum ClientInputEvent {
     FocusLost,
 }
 
+/// Pane-domain input after the client has classified and consumed shell actions.
+///
+/// Keys are semantic rather than outer-terminal VT bytes so the target pane can
+/// encode them for the child application's negotiated keyboard protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClientPaneInputEvent {
+    Key {
+        code: ClientKeyCode,
+        modifiers: u8,
+        kind: ClientKeyKind,
+        repeat_count: u16,
+        shifted_codepoint: Option<u32>,
+        generated_text: Option<String>,
+    },
+    TextCommit(String),
+    Paste(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientKeySource {
     Synthesized,
@@ -147,7 +172,6 @@ pub enum ClientKeySource {
 }
 
 impl ClientKeyKind {
-    #[cfg(any(windows, test))]
     pub(crate) fn from_crossterm(kind: crossterm::event::KeyEventKind) -> Self {
         match kind {
             crossterm::event::KeyEventKind::Press => Self::Press,
@@ -166,7 +190,6 @@ impl ClientKeyKind {
 }
 
 impl ClientKeyCode {
-    #[cfg(any(windows, test))]
     pub(crate) fn from_crossterm(code: crossterm::event::KeyCode) -> Option<Self> {
         use crossterm::event::KeyCode;
         Some(match code {
@@ -267,6 +290,48 @@ impl ClientMouseKind {
     }
 }
 
+impl ClientPaneInputEvent {
+    pub(crate) fn from_terminal_key(key: crate::input::TerminalKey) -> Option<Self> {
+        Some(Self::Key {
+            code: ClientKeyCode::from_crossterm(key.code)?,
+            modifiers: key.modifiers.bits(),
+            kind: ClientKeyKind::from_crossterm(key.kind),
+            repeat_count: key.repeat_count,
+            shifted_codepoint: key.shifted_codepoint,
+            generated_text: key.generated_text,
+        })
+    }
+
+    pub(crate) fn to_raw_input_event(&self) -> crate::raw_input::RawInputEvent {
+        match self {
+            Self::Key {
+                code,
+                modifiers,
+                kind,
+                repeat_count,
+                shifted_codepoint,
+                generated_text,
+            } => {
+                let mut key = crate::input::TerminalKey::new(
+                    code.to_crossterm(),
+                    crossterm::event::KeyModifiers::from_bits_truncate(*modifiers),
+                )
+                .with_kind(kind.to_crossterm())
+                .with_repeat_count(*repeat_count)
+                .with_generated_text(generated_text.clone());
+                if let Some(shifted_codepoint) = shifted_codepoint {
+                    key = key.with_shifted_codepoint(*shifted_codepoint);
+                }
+                crate::raw_input::RawInputEvent::Key(key)
+            }
+            Self::TextCommit(text) => {
+                crate::raw_input::RawInputEvent::Text(crate::input::TextCommit::new(text.clone()))
+            }
+            Self::Paste(text) => crate::raw_input::RawInputEvent::Paste(text.clone()),
+        }
+    }
+}
+
 impl ClientInputEvent {
     #[cfg(any(windows, test))]
     pub(crate) fn from_crossterm(event: crossterm::event::Event) -> Option<Self> {
@@ -357,7 +422,7 @@ pub enum ClientMessage {
         requested_encoding: RenderEncoding,
         /// Keybinding profile requested by the client.
         keybindings: ClientKeybindings,
-        /// Whether this connection will render the full app or attach directly to a pane terminal.
+        /// Whether this connection will render the full app or attach directly to one terminal.
         launch_mode: ClientLaunchMode,
     },
 
@@ -449,6 +514,32 @@ pub enum ClientMessage {
 
     /// The direct command was written and flushed; terminal response timing starts now.
     GraphicsTransmissionStarted { transfer_id: u64, image_id: u32 },
+
+    /// Experimental handshake for a client-owned shell around one pane surface.
+    ClientShellHello {
+        version: u32,
+        cols: u16,
+        rows: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+        requested_encoding: RenderEncoding,
+        surface_size: ClientSurfaceSize,
+    },
+
+    /// Resize the outer terminal and pane viewport of a client-owned shell.
+    ClientShellResize {
+        cols: u16,
+        rows: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+        surface_size: ClientSurfaceSize,
+    },
+
+    /// Deliver client-classified semantic input directly to a stable pane target.
+    ClientShellPaneInput {
+        pane_id: String,
+        events: Vec<ClientPaneInputEvent>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -603,8 +694,7 @@ impl FrameData {
     /// Reconstructs a ratatui `Buffer` from this frame data.
     ///
     /// Returns `None` if the cells vector length doesn't match `width * height`.
-    #[cfg(test)]
-    pub fn to_ratatui_buffer(&self) -> Option<ratatui::buffer::Buffer> {
+    pub(crate) fn to_ratatui_buffer(&self) -> Option<ratatui::buffer::Buffer> {
         let expected = (self.width as usize) * (self.height as usize);
         if self.cells.len() != expected {
             return None;
@@ -628,6 +718,118 @@ impl FrameData {
 
         Some(buffer)
     }
+}
+
+/// Initial resource projection used by the experimental client-owned shell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientShellSnapshot {
+    /// Changes whenever the endpoint process restarts.
+    pub boot_id: String,
+    /// Monotonic replacement revision within one endpoint boot.
+    pub revision: u64,
+    pub focused_workspace_id: Option<String>,
+    pub focused_tab_id: Option<String>,
+    pub focused_pane_id: Option<String>,
+    pub workspaces: Vec<ClientShellWorkspace>,
+    pub tabs: Vec<ClientShellTab>,
+    pub panes: Vec<ClientShellPane>,
+    pub agents: Vec<ClientShellAgent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientShellWorkspace {
+    pub workspace_id: String,
+    pub number: usize,
+    pub label: String,
+    pub custom_label: bool,
+    pub branch: Option<String>,
+    pub git_ahead_behind: Option<(usize, usize)>,
+    pub tokens: Vec<(String, String)>,
+    pub worktree: Option<ClientShellWorktree>,
+    pub focused: bool,
+    pub agent_status: crate::api::schema::AgentStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientShellWorktree {
+    pub key: String,
+    pub label: String,
+    pub is_linked_worktree: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientShellTab {
+    pub tab_id: String,
+    pub workspace_id: String,
+    pub number: usize,
+    pub label: String,
+    pub custom_label: bool,
+    pub zoomed: bool,
+    pub focused: bool,
+    pub agent_status: crate::api::schema::AgentStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientShellPane {
+    pub pane_id: String,
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub label: Option<String>,
+    pub cwd: Option<String>,
+    pub foreground_cwd: Option<String>,
+    pub focused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientShellAgent {
+    pub pane_id: String,
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub name: Option<String>,
+    pub display_agent: Option<String>,
+    pub agent: Option<String>,
+    pub title: Option<String>,
+    pub agent_status: crate::api::schema::AgentStatus,
+    pub focused: bool,
+}
+
+/// Origin-relative geometry for one pane in a rendered pane surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSurfacePane {
+    pub pane_id: String,
+    pub rect: SurfaceRect,
+    pub inner_rect: SurfaceRect,
+    pub scrollbar_rect: Option<SurfaceRect>,
+    pub focused: bool,
+}
+
+/// Wire-safe rectangle relative to a pane surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceRect {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+impl From<ratatui::layout::Rect> for SurfaceRect {
+    fn from(rect: ratatui::layout::Rect) -> Self {
+        Self {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        }
+    }
+}
+
+/// One server-rendered active-tab surface without sidebar, tab bar, or overlays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSurfaceFrame {
+    /// Projection revision whose focused IDs and topology produced this surface.
+    pub projection_revision: u64,
+    pub frame: FrameData,
+    pub panes: Vec<PaneSurfacePane>,
 }
 
 /// Terminal ANSI bytes encoded by the server for network-efficient clients.
@@ -753,6 +955,12 @@ pub enum ServerMessage {
 
     /// Suppress a direct command that expired before terminal delivery.
     GraphicsTransmissionRetired { transfer_id: u64, image_id: u32 },
+
+    /// Initial metadata for a client-owned shell.
+    ClientShellSnapshot(Box<ClientShellSnapshot>),
+
+    /// Active-tab pane content rendered at a client-requested origin-relative size.
+    PaneSurface(PaneSurfaceFrame),
 }
 
 // ---------------------------------------------------------------------------
@@ -792,7 +1000,6 @@ pub(crate) fn color_to_u32(color: ratatui::style::Color) -> u32 {
 }
 
 /// Converts a packed u32 back to a ratatui `Color`.
-#[cfg(test)]
 fn u32_to_color(val: u32) -> ratatui::style::Color {
     match val >> 24 {
         0x00 => match val & 0xFF {
@@ -847,7 +1054,6 @@ pub(crate) fn modifier_with_underline_style(
 }
 
 /// Converts a u16 back to a ratatui `Modifier`.
-#[cfg(test)]
 fn u16_to_modifier(val: u16) -> ratatui::style::Modifier {
     ratatui::style::Modifier::from_bits_truncate(val & !UNDERLINE_STYLE_MASK)
 }
@@ -1199,6 +1405,35 @@ mod tests {
     }
 
     #[test]
+    fn client_shell_pane_input_roundtrips_semantic_keys() {
+        let message = ClientMessage::ClientShellPaneInput {
+            pane_id: "w1:p2".into(),
+            events: vec![ClientPaneInputEvent::Key {
+                code: ClientKeyCode::Char('l'),
+                modifiers: crossterm::event::KeyModifiers::SHIFT.bits(),
+                kind: ClientKeyKind::Release,
+                repeat_count: 1,
+                shifted_codepoint: Some('L' as u32),
+                generated_text: None,
+            }],
+        };
+        let encoded = bincode::serde::encode_to_vec(&message, bincode::config::standard())
+            .expect("encode targeted semantic input");
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+                .expect("decode targeted semantic input");
+        assert_eq!(decoded, message);
+        let ClientMessage::ClientShellPaneInput { events, .. } = decoded else {
+            panic!("expected targeted semantic input");
+        };
+        let crate::raw_input::RawInputEvent::Key(key) = events[0].to_raw_input_event() else {
+            panic!("expected semantic key");
+        };
+        assert_eq!(key.shifted_codepoint, Some('L' as u32));
+        assert_eq!(key.kind, crossterm::event::KeyEventKind::Release);
+    }
+
+    #[test]
     fn wire_release_cannot_restore_a_grouped_repeat_count() {
         let event = ClientInputEvent::Key {
             code: ClientKeyCode::Esc,
@@ -1479,6 +1714,53 @@ mod tests {
             }
             other => panic!("expected frame, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn client_shell_snapshot_roundtrip() {
+        let msg = ServerMessage::ClientShellSnapshot(Box::new(ClientShellSnapshot {
+            boot_id: "boot-1".into(),
+            revision: 1,
+            focused_workspace_id: Some("w1".into()),
+            focused_tab_id: Some("w1:t1".into()),
+            focused_pane_id: Some("w1:p1".into()),
+            workspaces: vec![ClientShellWorkspace {
+                workspace_id: "w1".into(),
+                number: 1,
+                label: "shell".into(),
+                custom_label: false,
+                branch: Some("main".into()),
+                git_ahead_behind: None,
+                tokens: Vec::new(),
+                worktree: None,
+                focused: true,
+                agent_status: crate::api::schema::AgentStatus::Idle,
+            }],
+            tabs: vec![ClientShellTab {
+                tab_id: "w1:t1".into(),
+                workspace_id: "w1".into(),
+                number: 1,
+                label: "main".into(),
+                custom_label: true,
+                zoomed: false,
+                focused: true,
+                agent_status: crate::api::schema::AgentStatus::Idle,
+            }],
+            panes: vec![ClientShellPane {
+                pane_id: "w1:p1".into(),
+                workspace_id: "w1".into(),
+                tab_id: "w1:t1".into(),
+                label: None,
+                cwd: Some("/repo".into()),
+                foreground_cwd: Some("/repo".into()),
+                focused: true,
+            }],
+            agents: Vec::new(),
+        }));
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ServerMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
     }
 
     #[test]

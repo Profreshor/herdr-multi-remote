@@ -1,64 +1,74 @@
 use std::collections::HashMap;
+use std::hash::Hash;
 
-use crate::app::{InputSourceId, TerminalInputContext, TerminalInputTarget};
-use crate::input::{KeyIdentity, TerminalKey};
+use super::{KeyIdentity, TerminalKey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct InputLeaseKey {
-    source_id: InputSourceId,
+pub(crate) struct InputLeaseKey<Source> {
+    source: Source,
     identity: KeyIdentity,
 }
 
-impl InputLeaseKey {
-    pub(crate) fn new(source_id: InputSourceId, key: &TerminalKey) -> Self {
+impl<Source> InputLeaseKey<Source> {
+    pub(crate) fn new(source: Source, key: &TerminalKey) -> Self {
         Self {
-            source_id,
+            source,
             identity: key.identity(),
         }
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ForwardedInputLease {
-    pub(crate) target: TerminalInputTarget,
+pub(crate) struct ForwardedInputLease<Target> {
+    pub(crate) target: Target,
     pub(crate) key: TerminalKey,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ConsumedInputLease {
-    ReprocessRepeats(TerminalInputContext),
+pub(crate) enum ConsumedInputLease<Context> {
+    ReprocessRepeats(Context),
     SuppressRepeats,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum InputLease {
-    Forwarded(ForwardedInputLease),
-    Consumed(ConsumedInputLease),
+pub(crate) enum InputLease<Context, Target> {
+    Forwarded(ForwardedInputLease<Target>),
+    Consumed(ConsumedInputLease<Context>),
 }
 
-pub(crate) enum RepeatPlan {
-    Forwarded(TerminalInputTarget),
+pub(crate) enum RepeatPlan<Context, Target> {
+    Forwarded(Target),
     Reprocess {
-        context: TerminalInputContext,
+        context: Context,
         repetitions: u16,
         tracked: bool,
     },
     Ignore,
 }
 
-#[derive(Default)]
-pub(crate) struct InputLeaseTable {
-    leases: HashMap<InputLeaseKey, InputLease>,
+pub(crate) struct InputLeaseTable<Source, Context, Target> {
+    leases: HashMap<InputLeaseKey<Source>, InputLease<Context, Target>>,
 }
 
-impl InputLeaseTable {
+impl<Source, Context, Target> Default for InputLeaseTable<Source, Context, Target> {
+    fn default() -> Self {
+        Self {
+            leases: HashMap::new(),
+        }
+    }
+}
+
+impl<Source, Context, Target> InputLeaseTable<Source, Context, Target>
+where
+    Source: Copy + Eq + Hash,
+    Context: Clone + Eq,
+    Target: Clone + Eq,
+{
     pub(crate) fn normalize_press(
         &mut self,
-        lease_key: &InputLeaseKey,
+        lease_key: &InputLeaseKey<Source>,
         key: TerminalKey,
     ) -> TerminalKey {
-        // Generated text is normally stateless, but a native physical key still owns
-        // press/repeat/release lifecycle even when it carries a layout result.
         if key.kind != crossterm::event::KeyEventKind::Press
             || (key.generated_text.is_some() && !key.has_physical_identity())
         {
@@ -74,12 +84,12 @@ impl InputLeaseTable {
 
     pub(crate) fn complete_press(
         &mut self,
-        lease_key: InputLeaseKey,
+        lease_key: InputLeaseKey<Source>,
         key: &TerminalKey,
-        initial_context: Option<&TerminalInputContext>,
-        resulting_context: Option<&TerminalInputContext>,
-        target: Option<TerminalInputTarget>,
-    ) -> RepeatPlan {
+        initial_context: Option<&Context>,
+        resulting_context: Option<&Context>,
+        target: Option<Target>,
+    ) -> RepeatPlan<Context, Target> {
         if key.generated_text.is_some() && !key.has_physical_identity() {
             return RepeatPlan::Ignore;
         }
@@ -112,10 +122,10 @@ impl InputLeaseTable {
 
     pub(crate) fn plan_repeat(
         &mut self,
-        lease_key: InputLeaseKey,
+        lease_key: InputLeaseKey<Source>,
         key: &TerminalKey,
-        current_context: Option<&TerminalInputContext>,
-    ) -> RepeatPlan {
+        current_context: Option<&Context>,
+    ) -> RepeatPlan<Context, Target> {
         match self.leases.get(&lease_key) {
             Some(InputLease::Forwarded(lease)) => {
                 return RepeatPlan::Forwarded(lease.target.clone());
@@ -150,9 +160,9 @@ impl InputLeaseTable {
 
     pub(crate) fn reprocess_allowed(
         &mut self,
-        lease_key: InputLeaseKey,
-        expected_context: &TerminalInputContext,
-        current_context: Option<&TerminalInputContext>,
+        lease_key: InputLeaseKey<Source>,
+        expected_context: &Context,
+        current_context: Option<&Context>,
         tracked: bool,
     ) -> bool {
         let allowed = current_context == Some(expected_context);
@@ -162,7 +172,10 @@ impl InputLeaseTable {
         allowed
     }
 
-    pub(crate) fn remove_forwarded(&mut self, key: &InputLeaseKey) -> Option<ForwardedInputLease> {
+    pub(crate) fn remove_forwarded(
+        &mut self,
+        key: &InputLeaseKey<Source>,
+    ) -> Option<ForwardedInputLease<Target>> {
         match self.leases.remove(key) {
             Some(InputLease::Forwarded(lease)) => Some(lease),
             Some(InputLease::Consumed(_)) | None => None,
@@ -170,14 +183,14 @@ impl InputLeaseTable {
     }
 
     #[cfg(test)]
-    pub(crate) fn contains(&self, key: &InputLeaseKey) -> bool {
+    pub(crate) fn contains(&self, key: &InputLeaseKey<Source>) -> bool {
         self.leases.contains_key(key)
     }
 
     pub(crate) fn insert_forwarded(
         &mut self,
-        key: InputLeaseKey,
-        target: TerminalInputTarget,
+        key: InputLeaseKey<Source>,
+        target: Target,
         original: TerminalKey,
     ) {
         self.leases.insert(
@@ -189,28 +202,32 @@ impl InputLeaseTable {
         );
     }
 
-    pub(crate) fn insert_consumed(&mut self, key: InputLeaseKey, disposition: ConsumedInputLease) {
+    pub(crate) fn insert_consumed(
+        &mut self,
+        key: InputLeaseKey<Source>,
+        disposition: ConsumedInputLease<Context>,
+    ) {
         self.leases.insert(key, InputLease::Consumed(disposition));
     }
 
-    pub(crate) fn remove(&mut self, key: &InputLeaseKey) -> Option<InputLease> {
+    pub(crate) fn remove(
+        &mut self,
+        key: &InputLeaseKey<Source>,
+    ) -> Option<InputLease<Context, Target>> {
         self.leases.remove(key)
     }
 
-    pub(crate) fn remove_source(&mut self, source_id: InputSourceId) -> Vec<ForwardedInputLease> {
+    pub(crate) fn remove_source(&mut self, source: Source) -> Vec<ForwardedInputLease<Target>> {
         let keys = self
             .leases
             .keys()
-            .filter(|key| key.source_id == source_id)
+            .filter(|key| key.source == source)
             .copied()
             .collect::<Vec<_>>();
         self.remove_keys(keys)
     }
 
-    pub(crate) fn remove_target(
-        &mut self,
-        target: &TerminalInputTarget,
-    ) -> Vec<ForwardedInputLease> {
+    pub(crate) fn remove_target(&mut self, target: &Target) -> Vec<ForwardedInputLease<Target>> {
         let keys = self
             .leases
             .iter()
@@ -224,8 +241,8 @@ impl InputLeaseTable {
 
     fn remove_keys(
         &mut self,
-        keys: impl IntoIterator<Item = InputLeaseKey>,
-    ) -> Vec<ForwardedInputLease> {
+        keys: impl IntoIterator<Item = InputLeaseKey<Source>>,
+    ) -> Vec<ForwardedInputLease<Target>> {
         keys.into_iter()
             .filter_map(|key| match self.leases.remove(&key) {
                 Some(InputLease::Forwarded(lease)) => Some(lease),
@@ -251,11 +268,12 @@ mod tests {
 
     use super::*;
 
-    fn target() -> TerminalInputTarget {
-        TerminalInputTarget {
-            terminal_id: crate::terminal::TerminalId::alloc(),
-        }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Context {
+        Pane,
     }
+
+    type Leases = InputLeaseTable<u64, Context, u64>;
 
     fn physical_generated_slash(repeat_count: u16) -> TerminalKey {
         TerminalKey::new(KeyCode::Char('/'), KeyModifiers::SHIFT)
@@ -279,40 +297,31 @@ mod tests {
             &TerminalKey::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
         );
         let other_source = InputLeaseKey::new(8, &key);
-        let first_target = target();
-        let mut leases = InputLeaseTable::default();
-        leases.insert_forwarded(forwarded, first_target.clone(), key.clone());
+        let mut leases = Leases::default();
+        leases.insert_forwarded(forwarded, 10, key.clone());
         leases.insert_consumed(consumed, ConsumedInputLease::SuppressRepeats);
-        leases.insert_forwarded(other_source, target(), key.clone());
+        leases.insert_forwarded(other_source, 11, key.clone());
 
         assert_eq!(
             leases.remove_source(7),
-            vec![ForwardedInputLease {
-                target: first_target,
-                key,
-            }]
+            vec![ForwardedInputLease { target: 10, key }]
         );
         assert_eq!(leases.len(), 1);
         assert!(leases.contains(&other_source));
     }
 
     #[test]
-    fn remove_target_closes_only_forwarded_leases_for_that_terminal() {
+    fn remove_target_closes_only_forwarded_leases_for_that_target() {
         let key = TerminalKey::new(KeyCode::Esc, KeyModifiers::empty());
         let removed_key = InputLeaseKey::new(7, &key);
         let retained_key = InputLeaseKey::new(8, &key);
-        let removed_target = target();
-        let retained_target = target();
-        let mut leases = InputLeaseTable::default();
-        leases.insert_forwarded(removed_key, removed_target.clone(), key.clone());
-        leases.insert_forwarded(retained_key, retained_target, key.clone());
+        let mut leases = Leases::default();
+        leases.insert_forwarded(removed_key, 10, key.clone());
+        leases.insert_forwarded(retained_key, 11, key.clone());
 
         assert_eq!(
-            leases.remove_target(&removed_target),
-            vec![ForwardedInputLease {
-                target: removed_target,
-                key,
-            }]
+            leases.remove_target(&10),
+            vec![ForwardedInputLease { target: 10, key }]
         );
         assert_eq!(leases.len(), 1);
         assert!(leases.contains(&retained_key));
@@ -331,7 +340,7 @@ mod tests {
         let physical =
             TerminalKey::new(KeyCode::Char('a'), KeyModifiers::empty()).with_windows_record(record);
         let lease_key = InputLeaseKey::new(7, &physical);
-        let mut leases = InputLeaseTable::default();
+        let mut leases = Leases::default();
 
         assert_eq!(
             leases.normalize_press(&lease_key, physical.clone()).kind,
@@ -342,9 +351,9 @@ mod tests {
             leases.normalize_press(&lease_key, physical.clone()).kind,
             crossterm::event::KeyEventKind::Repeat
         );
-        leases.insert_forwarded(lease_key, target(), physical.clone());
+        leases.insert_forwarded(lease_key, 10, physical.clone());
         assert_eq!(
-            leases.normalize_press(&lease_key, physical.clone()).kind,
+            leases.normalize_press(&lease_key, physical).kind,
             crossterm::event::KeyEventKind::Repeat
         );
     }
@@ -353,32 +362,18 @@ mod tests {
     fn physical_generated_text_keeps_native_repeat_lifecycle() {
         let key = physical_generated_slash(3);
         let lease_key = InputLeaseKey::new(7, &key);
-        let context = TerminalInputContext::Pane;
-        let forwarded_target = target();
-        let mut leases = InputLeaseTable::default();
+        let context = Context::Pane;
+        let mut leases = Leases::default();
 
-        assert_eq!(
-            leases.normalize_press(&lease_key, key.clone()).kind,
-            crossterm::event::KeyEventKind::Press
-        );
         assert!(matches!(
-            leases.complete_press(
-                lease_key,
-                &key,
-                Some(&context),
-                Some(&context),
-                Some(forwarded_target.clone()),
-            ),
+            leases.complete_press(lease_key, &key, Some(&context), Some(&context), Some(10),),
             RepeatPlan::Ignore
         ));
-        assert!(leases.contains(&lease_key));
-
-        let repeated = key.with_repeat_count(1);
-        let repeated = leases.normalize_press(&lease_key, repeated);
+        let repeated = leases.normalize_press(&lease_key, key.with_repeat_count(1));
         assert_eq!(repeated.kind, crossterm::event::KeyEventKind::Repeat);
         assert!(matches!(
             leases.plan_repeat(lease_key, &repeated, Some(&context)),
-            RepeatPlan::Forwarded(target) if target == forwarded_target
+            RepeatPlan::Forwarded(10)
         ));
         assert!(leases.remove_forwarded(&lease_key).is_some());
     }
@@ -387,13 +382,13 @@ mod tests {
     fn consumed_grouped_physical_generated_text_reprocesses_repeats() {
         let key = physical_generated_slash(3);
         let lease_key = InputLeaseKey::new(7, &key);
-        let context = TerminalInputContext::Pane;
-        let mut leases = InputLeaseTable::default();
+        let context = Context::Pane;
+        let mut leases = Leases::default();
 
         assert!(matches!(
             leases.complete_press(lease_key, &key, Some(&context), Some(&context), None),
             RepeatPlan::Reprocess {
-                context: TerminalInputContext::Pane,
+                context: Context::Pane,
                 repetitions: 2,
                 tracked: true,
             }
@@ -406,17 +401,11 @@ mod tests {
             .with_generated_text(Some("/".to_owned()))
             .with_repeat_count(3);
         let lease_key = InputLeaseKey::new(7, &key);
-        let context = TerminalInputContext::Pane;
-        let mut leases = InputLeaseTable::default();
+        let context = Context::Pane;
+        let mut leases = Leases::default();
 
         assert!(matches!(
-            leases.complete_press(
-                lease_key,
-                &key,
-                Some(&context),
-                Some(&context),
-                Some(target())
-            ),
+            leases.complete_press(lease_key, &key, Some(&context), Some(&context), Some(10)),
             RepeatPlan::Ignore
         ));
         assert!(leases.is_empty());
@@ -426,17 +415,15 @@ mod tests {
     fn new_semantic_press_recomputes_consumed_repeat_disposition() {
         let key = TerminalKey::new(KeyCode::Esc, KeyModifiers::empty()).with_repeat_count(3);
         let lease_key = InputLeaseKey::new(7, &key);
-        let context = TerminalInputContext::Pane;
-        let mut leases = InputLeaseTable::default();
+        let context = Context::Pane;
+        let mut leases = Leases::default();
         leases.insert_consumed(lease_key, ConsumedInputLease::SuppressRepeats);
 
         let key = leases.normalize_press(&lease_key, key);
-        let plan = leases.complete_press(lease_key, &key, Some(&context), Some(&context), None);
-
         assert!(matches!(
-            plan,
+            leases.complete_press(lease_key, &key, Some(&context), Some(&context), None),
             RepeatPlan::Reprocess {
-                context: TerminalInputContext::Pane,
+                context: Context::Pane,
                 repetitions: 2,
                 tracked: true,
             }

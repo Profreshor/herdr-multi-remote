@@ -1,0 +1,245 @@
+use super::*;
+
+#[path = "../shell/overlays.rs"]
+mod overlays;
+#[path = "../shell/sidebar.rs"]
+mod sidebar;
+#[path = "../shell/tabs.rs"]
+mod tabs;
+
+pub(super) use overlays::{client_navigator_rows, render_client_overlay};
+pub(super) use sidebar::{render_collapsed_sidebar, render_sidebar, workspace_entries};
+pub(super) use tabs::render_tab_bar;
+pub(super) fn render_mode_bar(
+    buffer: &mut Buffer,
+    pane_area: Rect,
+    mode: ClientShellMode,
+    endpoint_error: Option<&str>,
+    keybinds: &LiveKeybindConfig,
+    palette: &Palette,
+) -> Option<Rect> {
+    if (mode == ClientShellMode::Terminal && endpoint_error.is_none()) || pane_area.is_empty() {
+        return None;
+    }
+
+    let bar = Rect::new(
+        pane_area.x,
+        pane_area.y + pane_area.height.saturating_sub(1),
+        pane_area.width,
+        1,
+    );
+    let base = Style::default().fg(palette.overlay0).bg(palette.panel_bg);
+    for x in bar.x..bar.x + bar.width {
+        buffer[(x, bar.y)].set_symbol(" ").set_style(base);
+    }
+
+    let key = Style::default()
+        .fg(palette.accent)
+        .bg(palette.panel_bg)
+        .add_modifier(Modifier::BOLD);
+    let mode_style = Style::default()
+        .fg(match palette.panel_bg {
+            ratatui::style::Color::Reset => palette.surface_dim,
+            color => color,
+        })
+        .bg(if mode == ClientShellMode::Resize {
+            palette.mauve
+        } else {
+            palette.accent
+        })
+        .add_modifier(Modifier::BOLD);
+    let prefix = crate::config::format_key_combo(keybinds.prefix);
+    let prefix_rhs = |bindings: &crate::config::ActionKeybinds| {
+        bindings
+            .prefix_rhs_label()
+            .unwrap_or_else(|| "unset".to_owned())
+    };
+
+    let mut segments = Vec::<(String, Style)>::new();
+    if let Some(error) = endpoint_error {
+        segments.extend([
+            (" ERROR ".to_owned(), mode_style),
+            (format!(" {error}"), base),
+        ]);
+    } else {
+        match mode {
+            ClientShellMode::Prefix => {
+                segments.extend([
+                    (" PREFIX ".to_owned(), mode_style),
+                    (" ".to_owned(), base),
+                    ("esc".to_owned(), key),
+                    (" cancel  ".to_owned(), base),
+                    (prefix, key),
+                    (" send prefix  ".to_owned(), base),
+                    (prefix_rhs(&keybinds.keybinds.workspace_picker), key),
+                    (" workspace nav  ".to_owned(), base),
+                    (prefix_rhs(&keybinds.keybinds.help), key),
+                    (" keybinds".to_owned(), base),
+                ]);
+            }
+            ClientShellMode::Navigate => {
+                segments.extend([
+                    (" NAVIGATE ".to_owned(), mode_style),
+                    (" esc back  ".to_owned(), base),
+                    ("↑/↓".to_owned(), key),
+                    (" workspace  ".to_owned(), base),
+                    ("tab".to_owned(), key),
+                    (" pane  ".to_owned(), base),
+                    (prefix_rhs(&keybinds.keybinds.help), key),
+                    (" keybinds".to_owned(), base),
+                ]);
+            }
+            ClientShellMode::Resize => {
+                segments.extend([
+                    (" RESIZE ".to_owned(), mode_style),
+                    ("  ".to_owned(), base),
+                    ("h/l".to_owned(), key),
+                    (" width  ".to_owned(), base),
+                    ("j/k".to_owned(), key),
+                    (" height  ".to_owned(), base),
+                    ("esc".to_owned(), key),
+                    (" done".to_owned(), base),
+                ]);
+            }
+            ClientShellMode::Terminal => unreachable!(),
+        }
+    }
+
+    let mut x = bar.x;
+    let end = bar.x + bar.width;
+    for (text, style) in segments {
+        if x >= end {
+            break;
+        }
+        let remaining = end - x;
+        buffer.set_stringn(x, bar.y, &text, usize::from(remaining), style);
+        x = x.saturating_add(
+            u16::try_from(UnicodeWidthStr::width(text.as_str()))
+                .unwrap_or(u16::MAX)
+                .min(remaining),
+        );
+    }
+    Some(bar)
+}
+
+pub(super) fn render_shell(
+    buffer: &mut Buffer,
+    layout: ClientShellLayout,
+    snapshot: &ClientShellSnapshot,
+    config: &ClientShellConfig,
+    collapsed_groups: &HashSet<String>,
+    workspace_scroll: &mut usize,
+    tab_scroll: &mut usize,
+    sidebar_collapsed: bool,
+    selected_workspace_id: Option<&str>,
+) -> ShellHitMap {
+    let mut hits = ShellHitMap::default();
+    if layout.mobile_header.height > 0 {
+        render_mobile_header(buffer, layout.mobile_header, snapshot, &config.palette);
+    }
+    if layout.sidebar.width > 0 {
+        if sidebar_collapsed {
+            render_collapsed_sidebar(
+                buffer,
+                layout.sidebar,
+                snapshot,
+                &config.palette,
+                selected_workspace_id,
+                &mut hits,
+            );
+        } else {
+            render_sidebar(
+                buffer,
+                layout.sidebar,
+                snapshot,
+                config,
+                collapsed_groups,
+                workspace_scroll,
+                selected_workspace_id,
+                &mut hits,
+            );
+        }
+    }
+    if layout.tab_bar.height > 0 {
+        render_tab_bar(
+            buffer,
+            layout.tab_bar,
+            snapshot,
+            &config.palette,
+            tab_scroll,
+            &mut hits,
+        );
+    }
+    hits
+}
+
+fn render_mobile_header(
+    buffer: &mut Buffer,
+    area: Rect,
+    snapshot: &ClientShellSnapshot,
+    palette: &Palette,
+) {
+    buffer.set_style(area, Style::default().bg(palette.panel_bg));
+    let workspace = snapshot
+        .focused_workspace_id
+        .as_deref()
+        .and_then(|id| snapshot.workspaces.iter().find(|ws| ws.workspace_id == id))
+        .map(|ws| ws.label.as_str())
+        .unwrap_or("Herdr");
+    put_text(
+        buffer,
+        area.x,
+        area.y,
+        area.width,
+        &format!(" ☰  {workspace}"),
+        Style::default()
+            .fg(palette.text)
+            .bg(palette.panel_bg)
+            .add_modifier(Modifier::BOLD),
+    );
+    if area.height > 1 {
+        let tab = snapshot
+            .focused_tab_id
+            .as_deref()
+            .and_then(|id| snapshot.tabs.iter().find(|tab| tab.tab_id == id))
+            .map(|tab| tab.label.as_str())
+            .unwrap_or("terminal");
+        put_text(
+            buffer,
+            area.x + 1,
+            area.y + 1,
+            area.width.saturating_sub(1),
+            tab,
+            Style::default().fg(palette.overlay1).bg(palette.panel_bg),
+        );
+    }
+}
+
+fn put_right_text(buffer: &mut Buffer, area: Rect, y: u16, text: &str, style: Style) {
+    let width = display_width(text).min(area.width);
+    put_text(
+        buffer,
+        area.right().saturating_sub(width),
+        y,
+        width,
+        text,
+        style,
+    );
+}
+
+fn put_segment(buffer: &mut Buffer, x: u16, y: u16, right: u16, text: &str, style: Style) -> u16 {
+    let width = display_width(text).min(right.saturating_sub(x));
+    put_text(buffer, x, y, width, text, style);
+    x.saturating_add(width)
+}
+
+fn put_text(buffer: &mut Buffer, x: u16, y: u16, width: u16, text: &str, style: Style) {
+    if width == 0 || y >= buffer.area.bottom() || x >= buffer.area.right() {
+        return;
+    }
+    buffer.set_stringn(x, y, text, width as usize, style);
+}
+
+fn display_width(text: &str) -> u16 {
+    UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16
+}

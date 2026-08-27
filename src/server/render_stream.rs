@@ -6,13 +6,20 @@ use ratatui::layout::{Position, Rect, Size};
 use crate::app::state::AppState;
 use crate::app::Mode;
 use crate::protocol::render_ansi::{BlitEncoder, EncodedBlit};
-use crate::protocol::{CursorState, FrameData, RenderEncoding, ServerMessage, TerminalFrame};
+use crate::protocol::{
+    CursorState, FrameData, PaneSurfaceFrame, PaneSurfacePane, RenderEncoding, ServerMessage,
+    TerminalFrame,
+};
 use crate::terminal::TerminalRuntimeRegistry;
 
 /// Per-client render baseline for the negotiated render encoding.
 pub(crate) enum ClientRenderState {
     /// Semantic clients compare full frame data and skip identical frames.
-    Semantic { last_frame: Option<FrameData> },
+    Semantic {
+        last_frame: Option<FrameData>,
+        last_surface_panes: Option<Vec<PaneSurfacePane>>,
+        last_surface_projection_revision: Option<u64>,
+    },
     /// Terminal-ANSI clients keep a terminal diff encoder and sequence number.
     TerminalAnsi {
         blit_encoder: BlitEncoder,
@@ -24,7 +31,11 @@ pub(crate) enum ClientRenderState {
 impl ClientRenderState {
     pub(crate) fn new(render_encoding: RenderEncoding) -> Self {
         match render_encoding {
-            RenderEncoding::SemanticFrame => Self::Semantic { last_frame: None },
+            RenderEncoding::SemanticFrame => Self::Semantic {
+                last_frame: None,
+                last_surface_panes: None,
+                last_surface_projection_revision: None,
+            },
             RenderEncoding::TerminalAnsi => Self::TerminalAnsi {
                 blit_encoder: BlitEncoder::new(),
                 seq: 0,
@@ -35,7 +46,15 @@ impl ClientRenderState {
 
     pub(crate) fn reset_baseline(&mut self) {
         match self {
-            Self::Semantic { last_frame } => *last_frame = None,
+            Self::Semantic {
+                last_frame,
+                last_surface_panes,
+                last_surface_projection_revision,
+            } => {
+                *last_frame = None;
+                *last_surface_panes = None;
+                *last_surface_projection_revision = None;
+            }
             Self::TerminalAnsi {
                 blit_encoder,
                 repaint_pending,
@@ -49,7 +68,15 @@ impl ClientRenderState {
 
     pub(crate) fn request_repaint(&mut self) {
         match self {
-            Self::Semantic { last_frame } => *last_frame = None,
+            Self::Semantic {
+                last_frame,
+                last_surface_panes,
+                last_surface_projection_revision,
+            } => {
+                *last_frame = None;
+                *last_surface_panes = None;
+                *last_surface_projection_revision = None;
+            }
             Self::TerminalAnsi {
                 repaint_pending, ..
             } => *repaint_pending = true,
@@ -57,15 +84,26 @@ impl ClientRenderState {
     }
 
     pub(crate) fn reset_semantic_input_baseline(&mut self) {
-        if let Self::Semantic { last_frame } = self {
+        if let Self::Semantic {
+            last_frame,
+            last_surface_panes,
+            last_surface_projection_revision,
+        } = self
+        {
             *last_frame = None;
+            *last_surface_panes = None;
+            *last_surface_projection_revision = None;
         }
     }
 
     pub(crate) fn prepare_frame(&mut self, frame: FrameData) -> Option<PreparedRender> {
         match self {
-            Self::Semantic { last_frame } => {
-                if last_frame.as_ref() == Some(&frame) {
+            Self::Semantic {
+                last_frame,
+                last_surface_panes,
+                ..
+            } => {
+                if last_frame.as_ref() == Some(&frame) && last_surface_panes.is_none() {
                     crate::render_prof::event("prepare_frame.semantic.skip_current");
                     return None;
                 }
@@ -111,9 +149,32 @@ impl ClientRenderState {
         }
     }
 
+    pub(crate) fn prepare_pane_surface(
+        &mut self,
+        surface: PaneSurfaceFrame,
+    ) -> Option<PreparedRender> {
+        let Self::Semantic {
+            last_frame,
+            last_surface_panes,
+            last_surface_projection_revision,
+        } = self
+        else {
+            return None;
+        };
+        if last_frame.as_ref() == Some(&surface.frame)
+            && last_surface_panes.as_ref() == Some(&surface.panes)
+            && *last_surface_projection_revision == Some(surface.projection_revision)
+        {
+            return None;
+        }
+        Some(PreparedRender::Semantic {
+            message: ServerMessage::PaneSurface(surface),
+        })
+    }
+
     pub(crate) fn last_frame(&self) -> Option<&FrameData> {
         match self {
-            Self::Semantic { last_frame } => last_frame.as_ref(),
+            Self::Semantic { last_frame, .. } => last_frame.as_ref(),
             Self::TerminalAnsi { blit_encoder, .. } => blit_encoder.last_frame(),
         }
     }
@@ -121,11 +182,33 @@ impl ClientRenderState {
     pub(crate) fn commit_sent_frame(&mut self, prepared: PreparedRender) {
         match (self, prepared) {
             (
-                Self::Semantic { last_frame },
+                Self::Semantic {
+                    last_frame,
+                    last_surface_panes,
+                    last_surface_projection_revision,
+                },
                 PreparedRender::Semantic {
                     message: ServerMessage::Frame(frame),
                 },
-            ) => *last_frame = Some(frame),
+            ) => {
+                *last_frame = Some(frame);
+                *last_surface_panes = None;
+                *last_surface_projection_revision = None;
+            }
+            (
+                Self::Semantic {
+                    last_frame,
+                    last_surface_panes,
+                    last_surface_projection_revision,
+                },
+                PreparedRender::Semantic {
+                    message: ServerMessage::PaneSurface(surface),
+                },
+            ) => {
+                *last_surface_projection_revision = Some(surface.projection_revision);
+                *last_frame = Some(surface.frame);
+                *last_surface_panes = Some(surface.panes);
+            }
             (
                 Self::TerminalAnsi {
                     blit_encoder,
@@ -191,6 +274,9 @@ impl PreparedRender {
             Self::Semantic {
                 message: ServerMessage::Frame(frame),
             } => Some(frame),
+            Self::Semantic {
+                message: ServerMessage::PaneSurface(surface),
+            } => Some(surface.frame),
             Self::TerminalAnsi { frame, .. } => Some(frame),
             _ => None,
         }
@@ -362,6 +448,46 @@ fn popup_terminal_cursor(
         visible: cursor.visible && !crate::ui::pane_is_scrolled_back(runtime),
         shape: cursor.shape,
     })
+}
+
+pub(crate) type RenderedTabSurface = (
+    ratatui::buffer::Buffer,
+    Option<CursorState>,
+    Vec<((u16, u16), String, String)>,
+    crate::ui::TabSurfaceLayout,
+);
+
+/// Renders only the active tab's pane surface at an origin-relative client viewport.
+pub(crate) fn render_tab_surface_virtual(
+    app_state: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    area: Rect,
+    resize_panes: bool,
+    cell_size: crate::kitty_graphics::HostCellSize,
+) -> RenderedTabSurface {
+    let layout =
+        crate::ui::compute_tab_surface(app_state, terminal_runtimes, area, resize_panes, cell_size);
+    let surface = crate::ui::TabSurfaceView {
+        pane_infos: &layout.pane_infos,
+        split_borders: &layout.split_borders,
+    };
+    let cursor = crate::ui::tab_surface_cursor(app_state, terminal_runtimes, surface);
+    let hyperlinks = crate::ui::tab_surface_hyperlinks(app_state, terminal_runtimes, surface);
+
+    let backend = CursorTrackingBackend::new(area.width, area.height);
+    let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
+    terminal
+        .draw(|frame| {
+            crate::ui::render_tab_surface(app_state, terminal_runtimes, surface, frame);
+        })
+        .expect("render to TestBackend should never fail");
+
+    (
+        terminal.backend().buffer().clone(),
+        cursor,
+        hyperlinks,
+        layout,
+    )
 }
 
 /// Renders one server-owned terminal directly for `terminal attach` clients.

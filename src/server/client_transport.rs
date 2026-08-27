@@ -19,8 +19,8 @@ use tracing::{debug, warn};
 use crate::ipc::LocalStream;
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientInputEvent, ClientKeybindings,
-    ClientLaunchMode, ClientMessage, RenderEncoding, ServerMessage, MAX_CLIPBOARD_IMAGE_PAYLOAD,
-    MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
+    ClientLaunchMode, ClientMessage, ClientPaneInputEvent, RenderEncoding, ServerMessage,
+    MAX_CLIPBOARD_IMAGE_PAYLOAD, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
 
 /// Minimum accepted attached client size.
@@ -318,6 +318,15 @@ pub(crate) enum ServerEvent {
         direct_graphics: bool,
         writer: ClientWriter,
     },
+    /// A client-owned shell completed its dedicated handshake.
+    ClientShellConnected {
+        client_id: u64,
+        surface_cols: u16,
+        surface_rows: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+        writer: ClientWriter,
+    },
     /// A client sent an input message.
     ClientInput { client_id: u64, data: Vec<u8> },
     /// A client reported the one armed Kitty regular-file response.
@@ -387,6 +396,20 @@ pub(crate) enum ServerEvent {
         cell_width_px: u32,
         cell_height_px: u32,
     },
+    /// A client-owned shell recomputed its pane viewport.
+    ClientShellResize {
+        client_id: u64,
+        surface_cols: u16,
+        surface_rows: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    },
+    /// A client-owned shell delivered semantic input to one stable pane target.
+    ClientShellPaneInput {
+        client_id: u64,
+        pane_id: String,
+        events: Vec<ClientPaneInputEvent>,
+    },
     /// A client detached gracefully.
     ClientDetach { client_id: u64 },
     /// A client connection was lost.
@@ -429,6 +452,40 @@ enum InputEventLimit {
     InputPayloadTooLarge { size: usize },
 }
 
+fn pane_input_event_limit(events: &[ClientPaneInputEvent]) -> InputEventLimit {
+    let mut expanded_events = 0usize;
+    let mut paste_bytes = 0usize;
+    let mut input_bytes = 0usize;
+    for event in events {
+        expanded_events = expanded_events.saturating_add(match event {
+            ClientPaneInputEvent::Key { repeat_count, .. } => usize::from((*repeat_count).max(1)),
+            ClientPaneInputEvent::TextCommit(_) | ClientPaneInputEvent::Paste(_) => 1,
+        });
+        match event {
+            ClientPaneInputEvent::Key {
+                repeat_count,
+                generated_text,
+                ..
+            } => {
+                if let Some(text) = generated_text {
+                    input_bytes = input_bytes.saturating_add(
+                        text.len()
+                            .saturating_mul(usize::from((*repeat_count).max(1))),
+                    );
+                }
+            }
+            ClientPaneInputEvent::TextCommit(text) => {
+                input_bytes = input_bytes.saturating_add(text.len());
+            }
+            ClientPaneInputEvent::Paste(text) => {
+                paste_bytes = paste_bytes.saturating_add(text.len());
+            }
+        }
+    }
+
+    classify_input_event_size(expanded_events, paste_bytes, input_bytes)
+}
+
 fn input_event_limit(events: &[ClientInputEvent]) -> InputEventLimit {
     let mut expanded_events = 0usize;
     let mut paste_bytes = 0usize;
@@ -467,6 +524,14 @@ fn input_event_limit(events: &[ClientInputEvent]) -> InputEventLimit {
         }
     }
 
+    classify_input_event_size(expanded_events, paste_bytes, input_bytes)
+}
+
+fn classify_input_event_size(
+    expanded_events: usize,
+    paste_bytes: usize,
+    input_bytes: usize,
+) -> InputEventLimit {
     if expanded_events > MAX_INPUT_EVENT_BATCH {
         return InputEventLimit::TooManyEvents;
     }
@@ -563,6 +628,7 @@ pub(crate) fn handle_client_handshake(
         keybindings,
         direct_attach_requested,
         direct_graphics,
+        client_rendered_shell,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -574,21 +640,17 @@ pub(crate) fn handle_client_handshake(
             keybindings,
             launch_mode,
         } => {
-            // Version check.
-            match protocol::check_client_version(version) {
-                protocol::VersionCheck::Compatible => {}
-                protocol::VersionCheck::Incompatible(reason) => {
-                    // Send rejection Welcome.
-                    let welcome = ServerMessage::Welcome {
-                        version: PROTOCOL_VERSION,
-                        encoding: RenderEncoding::SemanticFrame,
-                        error: Some(reason),
-                    };
-                    let _ = protocol::write_message(&mut stream, &welcome);
-                    return Ok(());
-                }
+            if let protocol::VersionCheck::Incompatible(reason) =
+                protocol::check_client_version(version)
+            {
+                let welcome = ServerMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                    encoding: RenderEncoding::SemanticFrame,
+                    error: Some(reason),
+                };
+                let _ = protocol::write_message(&mut stream, &welcome);
+                return Ok(());
             }
-
             let keybindings = match parse_client_keybindings(keybindings) {
                 Ok(keybindings) => keybindings,
                 Err(error) => {
@@ -601,23 +663,68 @@ pub(crate) fn handle_client_handshake(
                     return Ok(());
                 }
             };
-
-            // Clamp size.
-            let (clamped_cols, clamped_rows) = clamp_terminal_size(cols, rows);
+            let (cols, rows) = clamp_terminal_size(cols, rows);
             (
-                clamped_cols,
-                clamped_rows,
+                cols,
+                rows,
                 cell_width_px,
                 cell_height_px,
                 requested_encoding,
                 keybindings,
                 launch_mode == ClientLaunchMode::TerminalAttach,
                 launch_mode == ClientLaunchMode::AppDirectGraphics,
+                false,
+            )
+        }
+        ClientMessage::ClientShellHello {
+            version,
+            cols,
+            rows,
+            cell_width_px,
+            cell_height_px,
+            requested_encoding,
+            surface_size,
+        } => {
+            if let protocol::VersionCheck::Incompatible(reason) =
+                protocol::check_client_version(version)
+            {
+                let welcome = ServerMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                    encoding: RenderEncoding::SemanticFrame,
+                    error: Some(reason),
+                };
+                let _ = protocol::write_message(&mut stream, &welcome);
+                return Ok(());
+            }
+            if requested_encoding != RenderEncoding::SemanticFrame
+                || surface_size.cols == 0
+                || surface_size.rows == 0
+            {
+                let welcome = ServerMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                    encoding: RenderEncoding::SemanticFrame,
+                    error: Some(
+                        "client shell requires semantic encoding and a non-empty pane surface"
+                            .to_owned(),
+                    ),
+                };
+                let _ = protocol::write_message(&mut stream, &welcome);
+                return Ok(());
+            }
+            (
+                surface_size.cols.min(cols.max(1)),
+                surface_size.rows.min(rows.max(1)),
+                cell_width_px,
+                cell_height_px,
+                requested_encoding,
+                None,
+                false,
+                false,
+                true,
             )
         }
         _ => {
-            // First message must be Hello.
-            debug!(client_id, "first message was not Hello, closing");
+            debug!(client_id, "first message was not a handshake, closing");
             let welcome = ServerMessage::Welcome {
                 version: PROTOCOL_VERSION,
                 encoding: RenderEncoding::SemanticFrame,
@@ -667,21 +774,36 @@ pub(crate) fn handle_client_handshake(
     }
 
     // Notify the main loop about the new client.
-    let connected = ServerEvent::ClientConnected {
-        client_id,
-        cols: client_cols,
-        rows: client_rows,
-        cell_width_px,
-        cell_height_px,
-        render_encoding,
-        keybindings,
-        direct_attach_requested,
-        direct_graphics,
-        writer,
+    let connected = if client_rendered_shell {
+        ServerEvent::ClientShellConnected {
+            client_id,
+            surface_cols: client_cols,
+            surface_rows: client_rows,
+            cell_width_px,
+            cell_height_px,
+            writer,
+        }
+    } else {
+        ServerEvent::ClientConnected {
+            client_id,
+            cols: client_cols,
+            rows: client_rows,
+            cell_width_px,
+            cell_height_px,
+            render_encoding,
+            keybindings,
+            direct_attach_requested,
+            direct_graphics,
+            writer,
+        }
     };
     if let Err(err) = server_event_tx.blocking_send(connected) {
-        if let ServerEvent::ClientConnected { writer, .. } = err.0 {
-            send_shutdown_to_unregistered_client(&writer);
+        match err.0 {
+            ServerEvent::ClientConnected { writer, .. }
+            | ServerEvent::ClientShellConnected { writer, .. } => {
+                send_shutdown_to_unregistered_client(&writer);
+            }
+            _ => {}
         }
     }
 
@@ -945,6 +1067,62 @@ fn client_read_loop(
                     cell_height_px,
                 }
             }
+            ClientMessage::ClientShellResize {
+                cols,
+                rows,
+                cell_width_px,
+                cell_height_px,
+                surface_size,
+            } => ServerEvent::ClientShellResize {
+                client_id,
+                surface_cols: surface_size.cols.max(1).min(cols.max(1)),
+                surface_rows: surface_size.rows.max(1).min(rows.max(1)),
+                cell_width_px,
+                cell_height_px,
+            },
+            ClientMessage::ClientShellPaneInput { pane_id, events } => {
+                match pane_input_event_limit(&events) {
+                    InputEventLimit::WithinLimits => ServerEvent::ClientShellPaneInput {
+                        client_id,
+                        pane_id,
+                        events,
+                    },
+                    InputEventLimit::TooManyEvents => {
+                        warn!(
+                            client_id,
+                            count = events.len(),
+                            "oversized targeted pane input batch, closing"
+                        );
+                        let _ = server_event_tx
+                            .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                        break;
+                    }
+                    InputEventLimit::PasteTooLarge { size } => {
+                        warn!(
+                            client_id,
+                            size,
+                            max = MAX_INPUT_PAYLOAD,
+                            "oversized targeted pane paste, rejecting"
+                        );
+                        ServerEvent::ClientPasteRejected {
+                            client_id,
+                            size,
+                            max: MAX_INPUT_PAYLOAD,
+                        }
+                    }
+                    InputEventLimit::InputPayloadTooLarge { size } => {
+                        warn!(
+                            client_id,
+                            size,
+                            max = MAX_INPUT_PAYLOAD,
+                            "oversized targeted pane input, closing"
+                        );
+                        let _ = server_event_tx
+                            .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                        break;
+                    }
+                }
+            }
             ClientMessage::Detach => ServerEvent::ClientDetach { client_id },
             ClientMessage::AttachTerminal {
                 terminal_id,
@@ -970,8 +1148,8 @@ fn client_read_loop(
                 row,
                 modifiers,
             },
-            ClientMessage::Hello { .. } => {
-                // Duplicate Hello — ignore.
+            ClientMessage::Hello { .. } | ClientMessage::ClientShellHello { .. } => {
+                // Duplicate handshake — ignore.
                 continue;
             }
         };
@@ -1375,6 +1553,68 @@ new_tab = "ctrl+notakey"
                 drop(writer);
             }
             other => panic!("expected ClientConnected, got {other:?}"),
+        }
+
+        drop(client_stream);
+        should_quit.store(true, Ordering::Release);
+        handle
+            .join()
+            .expect("handshake thread join")
+            .expect("handshake thread result");
+    }
+
+    #[test]
+    fn dedicated_client_shell_handshake_uses_surface_viewport() {
+        let (mut client_stream, server_stream, _path) = local_stream_pair("client-shell-handshake");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let handshake_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            handle_client_handshake(server_stream, 43, &server_event_tx, &handshake_quit)
+        });
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::ClientShellHello {
+                version: PROTOCOL_VERSION,
+                cols: 106,
+                rows: 30,
+                cell_width_px: 8,
+                cell_height_px: 16,
+                requested_encoding: RenderEncoding::SemanticFrame,
+                surface_size: crate::protocol::ClientSurfaceSize { cols: 80, rows: 29 },
+            },
+        )
+        .expect("write shell hello");
+
+        let welcome: ServerMessage =
+            protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("read welcome");
+        assert!(matches!(
+            welcome,
+            ServerMessage::Welcome {
+                encoding: RenderEncoding::SemanticFrame,
+                error: None,
+                ..
+            }
+        ));
+        match server_event_rx
+            .blocking_recv()
+            .expect("client shell connected event")
+        {
+            ServerEvent::ClientShellConnected {
+                client_id,
+                surface_cols,
+                surface_rows,
+                cell_width_px,
+                cell_height_px,
+                writer,
+            } => {
+                assert_eq!(client_id, 43);
+                assert_eq!((surface_cols, surface_rows), (80, 29));
+                assert_eq!((cell_width_px, cell_height_px), (8, 16));
+                drop(writer);
+            }
+            other => panic!("expected ClientShellConnected, got {other:?}"),
         }
 
         drop(client_stream);

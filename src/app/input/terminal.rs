@@ -84,7 +84,7 @@ impl App {
                 action = ?action,
                 "intercepted terminal direct keybinding before forwarding to pane"
             );
-            if action == super::navigate::NavigateAction::EditScrollback {
+            if action == crate::input::KeybindAction::EditScrollback {
                 self.launch_focused_scrollback_editor();
             } else {
                 self.execute_tui_navigate_action(action, super::navigate::ActionContext::Direct);
@@ -95,7 +95,7 @@ impl App {
         if let Some(binding) = super::navigate::command_for_key(
             &self.state,
             &key,
-            super::navigate::BindingDispatch::Direct,
+            crate::input::KeybindDispatch::Direct,
         ) {
             debug!(
                 code = ?key_event.code,

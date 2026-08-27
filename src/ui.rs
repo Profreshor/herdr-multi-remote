@@ -595,12 +595,15 @@ fn _build_hints(items: &[(&str, &str)], key_style: Style, dim_style: Style) -> V
 
 #[cfg(test)]
 mod tests {
-    use super::keybind_help::keybind_help_groups;
     use super::scrollbar::scrollbar_thumb;
     use super::*;
     use crate::{app::state::ViewLayout, layout::PaneInfo, workspace::Workspace};
     use ratatui::style::Color;
     use ratatui::{backend::TestBackend, Terminal};
+
+    fn keybind_help_groups(app: &AppState) -> Vec<crate::input::KeybindHelpGroup> {
+        crate::input::keybind_help_groups(&app.keybinds, (app.prefix_code, app.prefix_mods))
+    }
 
     #[test]
     fn copy_feedback_offset_only_increases_when_toast_rect_overlaps() {

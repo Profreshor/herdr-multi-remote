@@ -16,7 +16,10 @@ use crate::{
         state::{AppState, Mode},
         App,
     },
-    input::TerminalKey,
+    input::{
+        KeybindAction as NavigateAction, KeybindDispatch as BindingDispatch,
+        KeybindMatch as PrefixBindingMatch, TerminalKey,
+    },
     layout::NavDirection,
     terminal::TerminalRuntimeRegistry,
 };
@@ -1166,47 +1169,8 @@ impl App {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BindingDispatch {
-    Direct,
-    Prefix,
-}
-
-enum PrefixBindingMatch {
-    Action(NavigateAction),
-    Command(crate::config::CustomCommandKeybind),
-}
-
 fn prefix_binding_for_key(state: &AppState, key: &TerminalKey) -> Option<PrefixBindingMatch> {
-    exact_prefix_binding_for_key(state, key).or_else(|| {
-        generated_character_key(key)
-            .as_ref()
-            .and_then(|generated_key| exact_prefix_binding_for_key(state, generated_key))
-    })
-}
-
-fn exact_prefix_binding_for_key(state: &AppState, key: &TerminalKey) -> Option<PrefixBindingMatch> {
-    non_indexed_action_for_key(state, key, BindingDispatch::Prefix)
-        .map(PrefixBindingMatch::Action)
-        .or_else(|| {
-            command_for_key(state, key, BindingDispatch::Prefix).map(PrefixBindingMatch::Command)
-        })
-        .or_else(|| {
-            indexed_navigation_action(state, key, BindingDispatch::Prefix)
-                .map(PrefixBindingMatch::Action)
-        })
-}
-
-fn generated_character_key(key: &TerminalKey) -> Option<TerminalKey> {
-    let mut characters = key.generated_text.as_deref()?.chars();
-    let character = characters.next()?;
-    if character.is_control() || characters.next().is_some() {
-        return None;
-    }
-    Some(TerminalKey::new(
-        KeyCode::Char(character),
-        crossterm::event::KeyModifiers::empty(),
-    ))
+    crate::input::resolve_prefix_binding(&state.keybinds, key)
 }
 
 pub(crate) fn command_for_key(
@@ -1214,15 +1178,7 @@ pub(crate) fn command_for_key(
     key: &TerminalKey,
     dispatch: BindingDispatch,
 ) -> Option<crate::config::CustomCommandKeybind> {
-    state
-        .keybinds
-        .custom_commands
-        .iter()
-        .find(|binding| match dispatch {
-            BindingDispatch::Direct => binding.bindings.matches_direct_key(key),
-            BindingDispatch::Prefix => binding.bindings.matches_prefix_key(key),
-        })
-        .cloned()
+    crate::input::resolve_custom_command(&state.keybinds, key, dispatch)
 }
 
 fn unmodified_digit_for_key(key: &TerminalKey) -> Option<char> {
@@ -1402,61 +1358,6 @@ pub(crate) fn handle_navigate_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NavigateAction {
-    NewWorkspace,
-    NewWorktree,
-    OpenWorktree,
-    RemoveWorktree,
-    RenameWorkspace,
-    CloseWorkspace,
-    SwitchWorkspace(usize),
-    SwitchTab(usize),
-    FocusAgent(usize),
-    WorkspacePicker,
-    PreviousWorkspace,
-    NextWorkspace,
-    PreviousAgent,
-    NextAgent,
-    NewTab,
-    RenameTab,
-    PreviousTab,
-    NextTab,
-    MoveTabPrevious,
-    MoveTabNext,
-    CloseTab,
-    RenamePane,
-    FocusPaneLeft,
-    FocusPaneDown,
-    FocusPaneUp,
-    FocusPaneRight,
-    SwapPaneLeft,
-    SwapPaneDown,
-    SwapPaneUp,
-    SwapPaneRight,
-    SplitVertical,
-    SplitHorizontal,
-    ClosePane,
-    EditScrollback,
-    CopyMode,
-    Zoom,
-    EnterResizeMode,
-    ResizePaneLeft,
-    ResizePaneDown,
-    ResizePaneUp,
-    ResizePaneRight,
-    ToggleSidebar,
-    CyclePaneNext,
-    CyclePanePrevious,
-    LastPane,
-    Help,
-    Settings,
-    ReloadConfig,
-    OpenNotificationTarget,
-    Detach,
-    OpenNavigator,
-}
-
 fn copy_mode_survives_prefix_action(action: NavigateAction) -> bool {
     matches!(
         action,
@@ -1485,54 +1386,7 @@ fn indexed_navigation_action(
     key: &TerminalKey,
     dispatch: BindingDispatch,
 ) -> Option<NavigateAction> {
-    let kb = &state.keybinds;
-    let actual_modifiers = crate::config::normalize_key_combo((key.code, key.modifiers)).1;
-
-    for exact_modifiers in [true, false] {
-        let trigger_matches = |binding: &crate::config::IndexedKeybind| {
-            let dispatch_matches = match dispatch {
-                BindingDispatch::Direct => binding.trigger.is_direct(),
-                BindingDispatch::Prefix => binding.trigger.is_prefix(),
-            };
-            let expected_modifiers = crate::config::normalize_key_combo(binding.trigger.combo()).1;
-            dispatch_matches && (actual_modifiers == expected_modifiers) == exact_modifiers
-        };
-
-        for binding in &kb.switch_tab {
-            if trigger_matches(binding) {
-                if let Some(idx) = binding.matched_index(key) {
-                    return Some(NavigateAction::SwitchTab(idx));
-                }
-            }
-        }
-        for binding in &kb.switch_workspace {
-            if trigger_matches(binding) {
-                if let Some(idx) = binding.matched_index(key) {
-                    return Some(NavigateAction::SwitchWorkspace(idx));
-                }
-            }
-        }
-        for binding in &kb.focus_agent {
-            if trigger_matches(binding) {
-                if let Some(idx) = binding.matched_index(key) {
-                    return Some(NavigateAction::FocusAgent(idx));
-                }
-            }
-        }
-    }
-
-    None
-}
-
-fn action_matches(
-    bindings: &crate::config::ActionKeybinds,
-    key: &TerminalKey,
-    dispatch: BindingDispatch,
-) -> bool {
-    match dispatch {
-        BindingDispatch::Direct => bindings.matches_direct_key(key),
-        BindingDispatch::Prefix => bindings.matches_prefix_key(key),
-    }
+    crate::input::resolve_indexed_action(&state.keybinds, key, dispatch)
 }
 
 #[cfg(test)]
@@ -1550,65 +1404,7 @@ fn non_indexed_action_for_key(
     key: &TerminalKey,
     dispatch: BindingDispatch,
 ) -> Option<NavigateAction> {
-    let kb = &state.keybinds;
-    for (bindings, action) in [
-        (&kb.help, NavigateAction::Help),
-        (&kb.settings, NavigateAction::Settings),
-        (&kb.workspace_picker, NavigateAction::WorkspacePicker),
-        (&kb.new_workspace, NavigateAction::NewWorkspace),
-        (&kb.new_worktree, NavigateAction::NewWorktree),
-        (&kb.open_worktree, NavigateAction::OpenWorktree),
-        (&kb.remove_worktree, NavigateAction::RemoveWorktree),
-        (&kb.rename_workspace, NavigateAction::RenameWorkspace),
-        (&kb.close_workspace, NavigateAction::CloseWorkspace),
-        (&kb.previous_workspace, NavigateAction::PreviousWorkspace),
-        (&kb.next_workspace, NavigateAction::NextWorkspace),
-        (&kb.previous_agent, NavigateAction::PreviousAgent),
-        (&kb.next_agent, NavigateAction::NextAgent),
-        (&kb.new_tab, NavigateAction::NewTab),
-        (&kb.rename_tab, NavigateAction::RenameTab),
-        (&kb.previous_tab, NavigateAction::PreviousTab),
-        (&kb.next_tab, NavigateAction::NextTab),
-        (&kb.move_tab_previous, NavigateAction::MoveTabPrevious),
-        (&kb.move_tab_next, NavigateAction::MoveTabNext),
-        (&kb.close_tab, NavigateAction::CloseTab),
-        (&kb.rename_pane, NavigateAction::RenamePane),
-        (&kb.edit_scrollback, NavigateAction::EditScrollback),
-        (&kb.copy_mode, NavigateAction::CopyMode),
-        (&kb.focus_pane_left, NavigateAction::FocusPaneLeft),
-        (&kb.focus_pane_down, NavigateAction::FocusPaneDown),
-        (&kb.focus_pane_up, NavigateAction::FocusPaneUp),
-        (&kb.focus_pane_right, NavigateAction::FocusPaneRight),
-        (&kb.swap_pane_left, NavigateAction::SwapPaneLeft),
-        (&kb.swap_pane_down, NavigateAction::SwapPaneDown),
-        (&kb.swap_pane_up, NavigateAction::SwapPaneUp),
-        (&kb.swap_pane_right, NavigateAction::SwapPaneRight),
-        (&kb.last_pane, NavigateAction::LastPane),
-        (&kb.cycle_pane_next, NavigateAction::CyclePaneNext),
-        (&kb.cycle_pane_previous, NavigateAction::CyclePanePrevious),
-        (&kb.split_vertical, NavigateAction::SplitVertical),
-        (&kb.split_horizontal, NavigateAction::SplitHorizontal),
-        (&kb.close_pane, NavigateAction::ClosePane),
-        (&kb.zoom, NavigateAction::Zoom),
-        (&kb.resize_mode, NavigateAction::EnterResizeMode),
-        (&kb.resize_pane_left, NavigateAction::ResizePaneLeft),
-        (&kb.resize_pane_down, NavigateAction::ResizePaneDown),
-        (&kb.resize_pane_up, NavigateAction::ResizePaneUp),
-        (&kb.resize_pane_right, NavigateAction::ResizePaneRight),
-        (&kb.toggle_sidebar, NavigateAction::ToggleSidebar),
-        (&kb.reload_config, NavigateAction::ReloadConfig),
-        (
-            &kb.open_notification_target,
-            NavigateAction::OpenNotificationTarget,
-        ),
-        (&kb.detach, NavigateAction::Detach),
-        (&kb.goto, NavigateAction::OpenNavigator),
-    ] {
-        if action_matches(bindings, key, dispatch) {
-            return Some(action);
-        }
-    }
-    None
+    crate::input::resolve_non_indexed_action(&state.keybinds, key, dispatch)
 }
 
 #[cfg(test)]

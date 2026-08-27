@@ -38,7 +38,6 @@ fn modified_url_click_modifier_matches_terminal_mouse_reporting() {
 
 mod clipboard;
 mod copy_mode;
-mod lease;
 mod modal;
 mod mouse;
 mod navigate;
@@ -49,7 +48,6 @@ mod sidebar;
 mod terminal;
 
 pub(crate) use self::{
-    lease::{ConsumedInputLease, ForwardedInputLease, InputLeaseKey, InputLeaseTable, RepeatPlan},
     modal::{
         handle_global_menu_key, handle_keybind_help_key, handle_navigator_key,
         insert_keybind_help_query_text, insert_navigator_search_text, insert_rename_input_text,
@@ -60,6 +58,16 @@ pub(crate) use self::{
     },
     settings::open_settings_at,
 };
+pub(crate) type ConsumedInputLease = crate::input::ConsumedInputLease<super::TerminalInputContext>;
+pub(crate) type ForwardedInputLease = crate::input::ForwardedInputLease<super::TerminalInputTarget>;
+pub(crate) type InputLeaseKey = crate::input::InputLeaseKey<super::InputSourceId>;
+pub(crate) type InputLeaseTable = crate::input::InputLeaseTable<
+    super::InputSourceId,
+    super::TerminalInputContext,
+    super::TerminalInputTarget,
+>;
+pub(crate) type RepeatPlan =
+    crate::input::RepeatPlan<super::TerminalInputContext, super::TerminalInputTarget>;
 use self::{
     modal::{
         modal_action_from_key, ModalAction, ONBOARDING_WELCOME_ACTIONS, RELEASE_NOTES_ACTIONS,

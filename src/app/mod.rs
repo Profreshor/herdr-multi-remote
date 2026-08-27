@@ -393,6 +393,11 @@ fn resolve_effective_theme(
     )
 }
 
+pub(crate) fn client_palette_from_config(config: &Config) -> state::Palette {
+    let runtime = theme_runtime_config(config, true);
+    resolve_effective_theme(&runtime, None).0
+}
+
 impl App {
     pub fn new(
         config: &Config,

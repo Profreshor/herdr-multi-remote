@@ -8,6 +8,7 @@ use crate::server::render_stream::ClientRenderState;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ClientConnectionMode {
     App,
+    ClientShell,
     TerminalAttach { terminal_id: String },
     TerminalObserve { terminal_id: String },
 }
@@ -71,6 +72,10 @@ pub(crate) struct ClientConnection {
     pub(crate) host_keyboard_report_all_active: Option<bool>,
     /// Temporary files staged from this client's local clipboard image pastes.
     pub(crate) staged_clipboard_files: Vec<PathBuf>,
+    /// Last coherent shell replacement sent to this client.
+    pub(crate) shell_snapshot: Option<crate::protocol::ClientShellSnapshot>,
+    /// Monotonic shell replacement revision for this connection.
+    pub(crate) shell_projection_revision: u64,
     /// Channels for sending framed ServerMessage data to the client writer thread.
     pub(crate) writer: Option<ClientWriter>,
 }
@@ -136,6 +141,8 @@ impl ClientConnection {
             host_sgr_pixels_active: None,
             host_keyboard_report_all_active: None,
             staged_clipboard_files: Vec::new(),
+            shell_snapshot: None,
+            shell_projection_revision: 0,
             writer,
         }
     }
@@ -168,6 +175,13 @@ impl ClientConnection {
 
     pub(crate) fn is_full_app_client(&self) -> bool {
         matches!(self.mode, ClientConnectionMode::App) && !self.pending_terminal_attach
+    }
+
+    pub(crate) fn is_app_surface_client(&self) -> bool {
+        matches!(
+            self.mode,
+            ClientConnectionMode::App | ClientConnectionMode::ClientShell
+        ) && !self.pending_terminal_attach
     }
 
     pub(crate) fn request_semantic_redraw_after_input(&mut self) {
@@ -262,7 +276,7 @@ pub(crate) fn events_include_interaction(events: &[crate::raw_input::RawInputEve
 pub(crate) fn latest_app_client(clients: &HashMap<u64, ClientConnection>) -> Option<u64> {
     clients
         .iter()
-        .filter(|(_, client)| client.is_full_app_client())
+        .filter(|(_, client)| client.is_app_surface_client())
         .max_by_key(|(_, client)| client.last_activity)
         .map(|(&client_id, _)| client_id)
 }
@@ -293,7 +307,7 @@ pub(crate) fn render_targets(
         .iter()
         .filter(|(_, client)| {
             client.writer.is_some()
-                && (client.is_full_app_client()
+                && (client.is_app_surface_client()
                     || matches!(
                         client.mode,
                         ClientConnectionMode::TerminalAttach { .. }

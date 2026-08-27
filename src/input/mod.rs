@@ -1,4 +1,7 @@
 mod encode;
+mod keybind_help;
+mod keybindings;
+mod lease;
 mod model;
 pub(crate) mod mouse;
 mod parse;
@@ -6,6 +9,17 @@ mod parse;
 #[allow(unused_imports)]
 pub use encode::{
     encode_cursor_key, encode_key, encode_mouse_button, encode_mouse_scroll, encode_terminal_key,
+};
+#[cfg(test)]
+pub(crate) use keybind_help::KeybindHelpGroup;
+pub(crate) use keybind_help::{filter_keybind_help_groups, keybind_help_groups};
+pub(crate) use keybindings::{
+    resolve_custom_command, resolve_direct_binding, resolve_indexed_action,
+    resolve_non_indexed_action, resolve_prefix_binding, KeybindAction, KeybindDispatch,
+    KeybindMatch,
+};
+pub(crate) use lease::{
+    ConsumedInputLease, ForwardedInputLease, InputLeaseKey, InputLeaseTable, RepeatPlan,
 };
 #[cfg(not(windows))]
 pub use model::ime_compatible_keyboard_enhancement_flags;
