@@ -84,16 +84,64 @@ pub(super) fn snapshot(
     let agents = snapshot
         .agents
         .into_iter()
-        .map(|agent| protocol::ClientShellAgent {
-            pane_id: agent.pane_id,
-            workspace_id: agent.workspace_id,
-            tab_id: agent.tab_id,
-            name: agent.name,
-            display_agent: agent.display_agent,
-            agent: agent.agent,
-            title: agent.title,
-            agent_status: agent.agent_status,
-            focused: agent.focused,
+        .map(|agent| {
+            let mut state_labels = agent.state_labels.into_iter().collect::<Vec<_>>();
+            state_labels.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut tokens = agent.tokens.into_iter().collect::<Vec<_>>();
+            tokens.sort_by(|left, right| left.0.cmp(&right.0));
+            protocol::ClientShellAgent {
+                pane_id: agent.pane_id,
+                workspace_id: agent.workspace_id,
+                tab_id: agent.tab_id,
+                name: agent.name,
+                display_agent: agent.display_agent,
+                agent: agent.agent,
+                title: agent.title,
+                terminal_title: agent.terminal_title,
+                terminal_title_stripped: agent.terminal_title_stripped,
+                agent_status: agent.agent_status,
+                state_change_seq: agent.state_change_seq,
+                state_labels,
+                tokens,
+                focused: agent.focused,
+            }
+        })
+        .collect();
+
+    let agent_view_label = app
+        .state
+        .agent_view_override
+        .as_ref()
+        .map(|view| view.label.clone().unwrap_or_else(|| "filtered".to_owned()));
+    let agent_order = crate::ui::agent_panel_entries_from(&app.state, &app.terminal_runtimes)
+        .into_iter()
+        .filter_map(|entry| app.public_pane_id(entry.ws_idx, entry.pane_id))
+        .collect();
+
+    let zoomed = app
+        .state
+        .active
+        .and_then(|index| app.state.workspaces.get(index))
+        .is_some_and(|workspace| workspace.zoomed);
+    let tab_bar_right = app
+        .state
+        .tab_bar_right
+        .iter()
+        .filter_map(|segment| match segment {
+            crate::app::state::TabBarStatusSegment::Zoom if zoomed => {
+                Some(protocol::ClientShellTabStatusSegment {
+                    text: "ZOOM".to_owned(),
+                    accent: true,
+                })
+            }
+            crate::app::state::TabBarStatusSegment::Text(Some(text)) if !text.is_empty() => {
+                Some(protocol::ClientShellTabStatusSegment {
+                    text: text.clone(),
+                    accent: false,
+                })
+            }
+            crate::app::state::TabBarStatusSegment::Zoom
+            | crate::app::state::TabBarStatusSegment::Text(_) => None,
         })
         .collect();
 
@@ -103,6 +151,10 @@ pub(super) fn snapshot(
         focused_workspace_id: snapshot.focused_workspace_id,
         focused_tab_id: snapshot.focused_tab_id,
         focused_pane_id: snapshot.focused_pane_id,
+        tab_bar_right,
+        tab_bar_right_separator: app.state.tab_bar_right_separator.clone(),
+        agent_view_label,
+        agent_order,
         workspaces,
         tabs,
         panes,
@@ -115,7 +167,11 @@ pub(super) fn render_pane_surface(
     area: Rect,
     is_foreground: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
-) -> (FrameData, Vec<protocol::PaneSurfacePane>) {
+) -> (
+    FrameData,
+    Vec<protocol::PaneSurfacePane>,
+    Vec<protocol::PaneSurfaceSplit>,
+) {
     let (buffer, cursor, hyperlinks, layout) =
         crate::server::render_stream::render_tab_surface_virtual(
             &app.state,
@@ -166,8 +222,154 @@ pub(super) fn render_pane_surface(
                 .collect()
         })
         .unwrap_or_default();
+    let pane_frames = layout
+        .pane_infos
+        .iter()
+        .map(|pane| pane.rect)
+        .collect::<Vec<_>>();
+    let splits = layout
+        .split_borders
+        .iter()
+        .filter_map(|split| {
+            let hit_rect = split_hit_rect(
+                split,
+                app.state.pane_borders,
+                app.state.pane_gaps,
+                &pane_frames,
+            )?;
+            let direction = match split.direction {
+                ratatui::layout::Direction::Horizontal => {
+                    protocol::PaneSurfaceSplitDirection::Horizontal
+                }
+                ratatui::layout::Direction::Vertical => {
+                    protocol::PaneSurfaceSplitDirection::Vertical
+                }
+            };
+            Some(protocol::PaneSurfaceSplit {
+                direction,
+                pos: split.pos,
+                area: split.area.into(),
+                hit_rect: hit_rect.into(),
+                path: split.path.clone(),
+            })
+        })
+        .collect();
     (
         FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, cursor, &hyperlinks),
         panes,
+        splits,
     )
+}
+
+fn split_hit_rect(
+    split: &crate::layout::SplitBorder,
+    pane_borders: bool,
+    pane_gaps: bool,
+    pane_frames: &[Rect],
+) -> Option<Rect> {
+    let hit = match (split.direction, pane_borders, pane_gaps) {
+        (ratatui::layout::Direction::Horizontal, true, false) => {
+            Rect::new(split.pos, split.area.y, 1, split.area.height)
+        }
+        (ratatui::layout::Direction::Horizontal, true, true) => {
+            let start = split.pos.saturating_sub(1);
+            Rect::new(
+                start,
+                split.area.y,
+                split.pos.saturating_sub(start).saturating_add(1),
+                split.area.height,
+            )
+        }
+        (ratatui::layout::Direction::Horizontal, false, true) => Rect::new(
+            split.pos.checked_sub(1)?,
+            split.area.y,
+            1,
+            split.area.height,
+        ),
+        (ratatui::layout::Direction::Vertical, true, false) => {
+            Rect::new(split.area.x, split.pos, split.area.width, 1)
+        }
+        (ratatui::layout::Direction::Vertical, true, true) => {
+            let start = split.pos.saturating_sub(1);
+            Rect::new(
+                split.area.x,
+                start,
+                split.area.width,
+                split.pos.saturating_sub(start).saturating_add(1),
+            )
+        }
+        (ratatui::layout::Direction::Vertical, false, true) => {
+            Rect::new(split.area.x, split.pos.checked_sub(1)?, split.area.width, 1)
+        }
+        (_, false, false) => return None,
+    };
+    if !pane_borders
+        && pane_frames.iter().any(|pane| {
+            hit.x < pane.right()
+                && hit.right() > pane.x
+                && hit.y < pane.bottom()
+                && hit.bottom() > pane.y
+        })
+    {
+        return None;
+    }
+    Some(hit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_hits_follow_released_border_and_gap_geometry() {
+        let horizontal = crate::layout::SplitBorder {
+            pos: 20,
+            direction: ratatui::layout::Direction::Horizontal,
+            ratio: 0.5,
+            area: Rect::new(2, 3, 40, 12),
+            path: vec![false],
+        };
+        assert_eq!(
+            split_hit_rect(&horizontal, true, false, &[]),
+            Some(Rect::new(20, 3, 1, 12))
+        );
+        assert_eq!(
+            split_hit_rect(&horizontal, true, true, &[]),
+            Some(Rect::new(19, 3, 2, 12))
+        );
+        assert_eq!(
+            split_hit_rect(&horizontal, false, true, &[]),
+            Some(Rect::new(19, 3, 1, 12))
+        );
+        assert_eq!(split_hit_rect(&horizontal, false, false, &[]), None);
+
+        let vertical = crate::layout::SplitBorder {
+            pos: 9,
+            direction: ratatui::layout::Direction::Vertical,
+            ratio: 0.5,
+            area: Rect::new(2, 3, 40, 12),
+            path: vec![true],
+        };
+        assert_eq!(
+            split_hit_rect(&vertical, true, true, &[]),
+            Some(Rect::new(2, 8, 40, 2))
+        );
+
+        let edge = crate::layout::SplitBorder {
+            pos: 0,
+            direction: ratatui::layout::Direction::Horizontal,
+            ratio: 0.5,
+            area: Rect::new(0, 0, 1, 4),
+            path: Vec::new(),
+        };
+        assert_eq!(
+            split_hit_rect(&edge, true, true, &[]),
+            Some(Rect::new(0, 0, 1, 4))
+        );
+        assert_eq!(split_hit_rect(&edge, false, true, &[]), None);
+        assert_eq!(
+            split_hit_rect(&horizontal, false, true, &[Rect::new(19, 3, 1, 12)]),
+            None
+        );
+    }
 }

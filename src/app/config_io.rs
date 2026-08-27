@@ -41,88 +41,41 @@ impl App {
         });
     }
 
-    pub(super) fn save_theme(&mut self, name: &str) {
-        if self.update_config_file("theme", |content| {
-            let content = crate::config::upsert_section_value(
-                content,
-                "theme",
-                "name",
-                &format!("\"{name}\""),
-            );
-            crate::config::upsert_section_bool(&content, "theme", "auto_switch", false)
-        }) {
+    fn save_config_edit(&mut self, edit: crate::config::ConfigEdit<'_>) {
+        if self.update_config_file(edit.description(), |content| edit.apply(content)) {
             self.apply_config_from_disk(false);
         }
+    }
+
+    pub(super) fn save_theme(&mut self, name: &str) {
+        self.save_config_edit(crate::config::ConfigEdit::Theme(name));
     }
 
     pub(super) fn save_status_indicators(&mut self, style: crate::config::StatusIndicatorStyle) {
-        if self.update_config_file("status indicators", |content| {
-            crate::config::upsert_section_value(
-                content,
-                "ui",
-                "status_indicators",
-                &format!("\"{}\"", style.as_str()),
-            )
-        }) {
-            self.apply_config_from_disk(false);
-        }
+        self.save_config_edit(crate::config::ConfigEdit::StatusIndicators(style));
     }
 
     pub(super) fn save_sound(&mut self, enabled: bool) {
-        if self.update_config_file("sound setting", |content| {
-            crate::config::upsert_section_bool(content, "ui.sound", "enabled", enabled)
-        }) {
-            self.apply_config_from_disk(false);
-        }
+        self.save_config_edit(crate::config::ConfigEdit::Sound(enabled));
     }
 
     pub(super) fn save_toast_delivery(&mut self, delivery: crate::config::ToastDelivery) {
-        let value = match delivery {
-            crate::config::ToastDelivery::Off => "\"off\"",
-            crate::config::ToastDelivery::Herdr => "\"herdr\"",
-            crate::config::ToastDelivery::Terminal => "\"terminal\"",
-            crate::config::ToastDelivery::System => "\"system\"",
-        };
-        if self.update_config_file("toast setting", |content| {
-            let content =
-                crate::config::upsert_section_value(content, "ui.toast", "delivery", value);
-            crate::config::remove_section_key(&content, "ui.toast", "enabled")
-        }) {
-            self.apply_config_from_disk(false);
-        }
+        self.save_config_edit(crate::config::ConfigEdit::ToastDelivery(delivery));
     }
 
     pub(super) fn save_agent_border_labels(&mut self, enabled: bool) {
-        if self.update_config_file("agent border labels", |content| {
-            crate::config::upsert_section_bool(
-                content,
-                "ui",
-                "show_agent_labels_on_pane_borders",
-                enabled,
-            )
-        }) {
-            self.apply_config_from_disk(false);
-        }
+        self.save_config_edit(crate::config::ConfigEdit::AgentBorderLabels(enabled));
     }
 
     pub(super) fn save_agent_panel_sort(&mut self, sort: crate::app::state::AgentPanelSort) {
-        let value = match sort {
+        let sort = match sort {
             crate::app::state::AgentPanelSort::Spaces => {
-                crate::config::AgentPanelSortConfig::Spaces.as_str()
+                crate::config::AgentPanelSortConfig::Spaces
             }
             crate::app::state::AgentPanelSort::Priority => {
-                crate::config::AgentPanelSortConfig::Priority.as_str()
+                crate::config::AgentPanelSortConfig::Priority
             }
         };
-        if self.update_config_file("agent panel sort", |content| {
-            crate::config::upsert_section_value(
-                content,
-                "ui",
-                "agent_panel_sort",
-                &format!("\"{value}\""),
-            )
-        }) {
-            self.apply_config_from_disk(false);
-        }
+        self.save_config_edit(crate::config::ConfigEdit::AgentPanelSort(sort));
     }
 }

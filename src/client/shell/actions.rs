@@ -12,9 +12,11 @@ impl ClientShellState {
             }
             crate::input::KeybindMatch::Action(crate::input::KeybindAction::ToggleSidebar) => {
                 self.sidebar_collapsed = !self.sidebar_collapsed;
+                self.sidebar_collapsed_manual = true;
                 self.invalidate_pane_surface();
                 outcome.repaint = true;
                 outcome.resize = true;
+                self.persist_chrome_preferences(outcome);
             }
             crate::input::KeybindMatch::Action(action) => {
                 if matches!(
@@ -282,25 +284,36 @@ impl ClientShellState {
         };
 
         match action {
-            KeybindAction::FocusAgent(index) => Some(Method::PaneFocus(PaneTarget {
-                pane_id: snapshot.agents.get(index)?.pane_id.clone(),
-            })),
+            KeybindAction::FocusAgent(index) => {
+                let agents = super::agent_sidebar::ordered_agent_pane_ids(
+                    snapshot,
+                    self.config.agent_panel_sort,
+                );
+                Some(Method::PaneFocus(PaneTarget {
+                    pane_id: agents.get(index)?.clone(),
+                }))
+            }
             KeybindAction::PreviousAgent | KeybindAction::NextAgent => {
-                if snapshot.agents.is_empty() {
+                let agents = super::agent_sidebar::ordered_agent_pane_ids(
+                    snapshot,
+                    self.config.agent_panel_sort,
+                );
+                if agents.is_empty() {
                     return None;
                 }
-                let current = snapshot
-                    .agents
+                let current = agents
                     .iter()
-                    .position(|agent| agent.focused)
+                    .position(|pane_id| {
+                        Some(pane_id.as_str()) == snapshot.focused_pane_id.as_deref()
+                    })
                     .unwrap_or(0);
                 let next = if action == KeybindAction::PreviousAgent {
-                    (current + snapshot.agents.len() - 1) % snapshot.agents.len()
+                    (current + agents.len() - 1) % agents.len()
                 } else {
-                    (current + 1) % snapshot.agents.len()
+                    (current + 1) % agents.len()
                 };
                 Some(Method::PaneFocus(PaneTarget {
-                    pane_id: snapshot.agents[next].pane_id.clone(),
+                    pane_id: agents[next].clone(),
                 }))
             }
             KeybindAction::SwitchWorkspace(index) => {

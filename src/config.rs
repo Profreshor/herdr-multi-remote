@@ -8,6 +8,7 @@ mod sound;
 mod tab_bar;
 mod theme;
 mod window_title;
+mod write;
 
 pub use self::{
     io::{
@@ -38,6 +39,7 @@ pub use self::{
 };
 
 pub(crate) use self::keybinds::parse_key_combo;
+pub(crate) use self::write::ConfigEdit;
 pub(crate) use self::{
     io::upsert_top_level_bool,
     tab_bar::{

@@ -1,13 +1,16 @@
 use std::collections::{HashMap, HashSet};
 
 mod actions;
+mod agent_sidebar;
 mod composition;
 mod config;
 mod context_menu;
 mod input;
 mod mouse;
 mod overlay_input;
+mod preferences;
 mod render;
+mod scroll;
 mod state;
 mod worktrees;
 
@@ -23,7 +26,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::state::Palette;
 use crate::config::{
-    Config, LiveKeybindConfig, SidebarCollapsedModeConfig, SpaceSidebarToken, SpacesSidebarConfig,
+    Config, LiveKeybindConfig, SidebarCollapsedModeConfig, SpacesSidebarConfig,
     TabBarPositionConfig,
 };
 use crate::protocol::{
@@ -83,12 +86,84 @@ fn contains(rect: Rect, point: (u16, u16)) -> bool {
         && point.1 < rect.bottom()
 }
 
+fn pane_surface_topology_signature(surface: &PaneSurfaceFrame) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn write(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(PRIME);
+        }
+        *hash ^= 0xff;
+        *hash = hash.wrapping_mul(PRIME);
+    }
+
+    let mut pane_ids = surface
+        .panes
+        .iter()
+        .map(|pane| pane.pane_id.as_bytes())
+        .collect::<Vec<_>>();
+    pane_ids.sort_unstable();
+    let mut hash = OFFSET;
+    for pane_id in pane_ids {
+        write(&mut hash, pane_id);
+    }
+    let mut splits = surface.splits.iter().collect::<Vec<_>>();
+    splits.sort_by(|left, right| left.path.cmp(&right.path));
+    for split in splits {
+        write(
+            &mut hash,
+            &[match split.direction {
+                crate::protocol::PaneSurfaceSplitDirection::Horizontal => 0,
+                crate::protocol::PaneSurfaceSplitDirection::Vertical => 1,
+            }],
+        );
+        write(
+            &mut hash,
+            &split
+                .path
+                .iter()
+                .map(|right| u8::from(*right))
+                .collect::<Vec<_>>(),
+        );
+    }
+    hash
+}
+
+fn status_icon(
+    status: crate::api::schema::AgentStatus,
+    style: crate::config::StatusIndicatorStyle,
+) -> &'static str {
+    use crate::api::schema::AgentStatus;
+    use crate::config::StatusIndicatorStyle;
+    match (style, status) {
+        (
+            StatusIndicatorStyle::Dots,
+            AgentStatus::Working | AgentStatus::Blocked | AgentStatus::Done,
+        ) => "●",
+        (StatusIndicatorStyle::Dots, AgentStatus::Idle) => "○",
+        (StatusIndicatorStyle::Dots, AgentStatus::Unknown) => "·",
+        (StatusIndicatorStyle::Symbols, AgentStatus::Blocked) => "×",
+        (StatusIndicatorStyle::Symbols, AgentStatus::Working) => "◐",
+        (StatusIndicatorStyle::Symbols, AgentStatus::Done) => "✓",
+        (StatusIndicatorStyle::Symbols, AgentStatus::Idle) => "○",
+        (StatusIndicatorStyle::Symbols, AgentStatus::Unknown) => "·",
+    }
+}
+
 fn status_dot(status: crate::api::schema::AgentStatus) -> &'static str {
+    status_icon(status, crate::config::StatusIndicatorStyle::Dots)
+}
+
+fn status_priority(status: crate::api::schema::AgentStatus) -> u8 {
     use crate::api::schema::AgentStatus;
     match status {
-        AgentStatus::Working | AgentStatus::Blocked | AgentStatus::Done => "●",
-        AgentStatus::Idle => "○",
-        AgentStatus::Unknown => "·",
+        AgentStatus::Blocked => 4,
+        AgentStatus::Done => 3,
+        AgentStatus::Working => 2,
+        AgentStatus::Idle => 1,
+        AgentStatus::Unknown => 0,
     }
 }
 
@@ -111,7 +186,7 @@ fn status_color(
     match status {
         AgentStatus::Working => palette.yellow,
         AgentStatus::Blocked => palette.red,
-        AgentStatus::Done => palette.blue,
+        AgentStatus::Done => palette.teal,
         AgentStatus::Idle => palette.green,
         AgentStatus::Unknown => palette.overlay0,
     }
@@ -166,7 +241,7 @@ mod tests {
     use crate::api::schema::AgentStatus;
     use crate::protocol::{
         ClientShellAgent, ClientShellPane, ClientShellTab, ClientShellWorktree, PaneSurfacePane,
-        SurfaceRect,
+        PaneSurfaceSplit, PaneSurfaceSplitDirection, SurfaceRect,
     };
 
     fn snapshot() -> ClientShellSnapshot {
@@ -176,6 +251,10 @@ mod tests {
             focused_workspace_id: Some("ws_1".into()),
             focused_tab_id: Some("tab_1".into()),
             focused_pane_id: Some("pane_1".into()),
+            tab_bar_right: Vec::new(),
+            tab_bar_right_separator: " ".into(),
+            agent_view_label: None,
+            agent_order: Vec::new(),
             workspaces: vec![ClientShellWorkspace {
                 workspace_id: "ws_1".into(),
                 number: 1,
@@ -269,6 +348,7 @@ mod tests {
                 pixel_width: 0,
                 pixel_height: 0,
             }],
+            splits: Vec::new(),
         }
     }
 
@@ -334,9 +414,17 @@ mod tests {
         state.set_pane_surface(surface());
         state.compose(106, 20).expect("composed frame");
 
-        let workspace =
+        let workspace_down =
             state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 2,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(workspace_down.actions.is_empty());
+        let workspace =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
                 column: 2,
                 row: 2,
                 modifiers: KeyModifiers::empty(),
@@ -420,6 +508,151 @@ mod tests {
                     )
         ));
         assert!(state.pane_mouse_gesture.is_none());
+    }
+
+    #[test]
+    fn pane_split_drag_uses_projected_handle_and_stable_tab_path() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        let mut pane_surface = surface();
+        pane_surface.splits.push(PaneSurfaceSplit {
+            direction: PaneSurfaceSplitDirection::Horizontal,
+            pos: 40,
+            area: SurfaceRect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 19,
+            },
+            hit_rect: SurfaceRect {
+                x: 40,
+                y: 0,
+                width: 1,
+                height: 19,
+            },
+            path: vec![false, true],
+        });
+        state.set_pane_surface(pane_surface);
+        state.compose(106, 20).expect("split pane surface");
+        let split = state.hits.pane_splits[0].clone();
+
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: split.hit_rect.x,
+            row: split.hit_rect.y + 2,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        assert!(matches!(
+            state.chrome_drag,
+            Some(ClientChromeDrag::PaneSplit { .. })
+        ));
+        let mut replacement = snapshot();
+        replacement.revision = 2;
+        replacement
+            .tab_bar_right
+            .push(crate::protocol::ClientShellTabStatusSegment {
+                text: "updated".into(),
+                accent: false,
+            });
+        let mut replacement_surface = surface();
+        replacement_surface.projection_revision = 2;
+        replacement_surface.splits.push(PaneSurfaceSplit {
+            direction: PaneSurfaceSplitDirection::Horizontal,
+            pos: 40,
+            area: SurfaceRect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 19,
+            },
+            hit_rect: SurfaceRect {
+                x: 40,
+                y: 0,
+                width: 1,
+                height: 19,
+            },
+            path: vec![false, true],
+        });
+        state.set_snapshot(Box::new(replacement));
+        state.set_pane_surface(replacement_surface);
+        let drag =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: split.area.x + 48,
+                row: split.hit_rect.y + 2,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        let [ClientShellAction::Endpoint { request, .. }] = &drag.actions[..] else {
+            panic!("pane split drag should use endpoint API");
+        };
+        assert!(matches!(
+            &request.method,
+            crate::api::schema::Method::LayoutSetSplitRatio(params)
+                if params.tab_id.as_deref() == Some("tab_1")
+                    && params.path == vec![false, true]
+                    && (params.ratio - 0.6).abs() < f32::EPSILON
+        ));
+        let release =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: split.area.x + 48,
+                row: split.hit_rect.y + 2,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(release.actions.is_empty());
+        assert!(state.chrome_drag.is_none());
+    }
+
+    #[test]
+    fn disabled_mouse_chrome_keeps_tab_wheel_but_removes_split_drag_hits() {
+        let mut config = Config::default();
+        config.ui.mouse_capture = false;
+        let mut projected = snapshot();
+        let mut second_tab = projected.tabs[0].clone();
+        second_tab.tab_id = "tab_2".into();
+        second_tab.number = 2;
+        second_tab.label = "2".into();
+        second_tab.focused = false;
+        projected.tabs.push(second_tab);
+        let mut pane_surface = surface();
+        pane_surface.splits.push(PaneSurfaceSplit {
+            direction: PaneSurfaceSplitDirection::Horizontal,
+            pos: 40,
+            area: SurfaceRect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 19,
+            },
+            hit_rect: SurfaceRect {
+                x: 40,
+                y: 0,
+                width: 1,
+                height: 19,
+            },
+            path: Vec::new(),
+        });
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+        state.set_snapshot(Box::new(projected));
+        state.set_pane_surface(pane_surface);
+        state.compose(106, 20).expect("mouse-disabled shell");
+        assert!(state.hits.pane_splits.is_empty());
+        let first_tab = state.hits.tabs[0].0;
+        let wheel =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: first_tab.x,
+                row: first_tab.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(matches!(
+            &wheel.actions[..],
+            [ClientShellAction::Endpoint { request, .. }]
+                if matches!(
+                    &request.method,
+                    crate::api::schema::Method::TabFocus(target) if target.tab_id == "tab_2"
+                )
+        ));
     }
 
     #[test]
@@ -712,7 +945,239 @@ mod tests {
     }
 
     #[test]
-    fn tab_wheel_does_not_hide_tabs_without_overflow_controls() {
+    fn client_owned_sidebar_dividers_resize_live() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface());
+        state.compose(106, 30).expect("expanded sidebar");
+        let workspace_body = state.hits.workspace_body;
+        let needless_scroll =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: workspace_body.x,
+                row: workspace_body.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert_eq!(state.hits.workspace_max_scroll, 0);
+        assert_eq!(state.workspace_scroll, 0);
+        assert!(!needless_scroll.repaint);
+        let width_divider = state.hits.sidebar_divider;
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: width_divider.x,
+            row: width_divider.y + 2,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        let resize =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 31,
+                row: width_divider.y + 2,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert_eq!(state.sidebar_width, 32);
+        assert!(state.sidebar_width_manual);
+        assert!(resize.repaint);
+        assert!(resize.resize);
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 31,
+            row: width_divider.y + 2,
+            modifiers: KeyModifiers::empty(),
+        })]);
+
+        state.set_pane_surface(surface());
+        state.compose(106, 30).expect("resized sidebar");
+        let section_divider = state.hits.sidebar_section_divider;
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: section_divider.x + 2,
+            row: section_divider.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        let split =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: section_divider.x + 2,
+                row: 20,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(state.sidebar_section_split > 0.6);
+        assert!(split.repaint);
+        assert!(!split.resize);
+    }
+
+    #[test]
+    fn manual_client_chrome_preferences_round_trip_per_endpoint() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-client-shell-prefs-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let config =
+            ClientShellConfig::from_config(&Config::default()).with_preferences_path(path.clone());
+        let mut state = ClientShellState::new(config);
+        state.sidebar_width = 31;
+        state.sidebar_width_manual = true;
+        state.sidebar_section_split = 0.7;
+        state.sidebar_section_split_manual = true;
+        state.sidebar_collapsed = true;
+        state.sidebar_collapsed_manual = true;
+        state.persist_chrome_preferences(&mut ClientShellInput::default());
+
+        let reloaded_config =
+            ClientShellConfig::from_config(&Config::default()).with_preferences_path(path.clone());
+        let reloaded = ClientShellState::new(reloaded_config);
+        assert_eq!(reloaded.sidebar_width, 31);
+        assert!(reloaded.sidebar_width_manual);
+        assert_eq!(reloaded.sidebar_section_split, 0.7);
+        assert!(reloaded.sidebar_section_split_manual);
+        assert!(reloaded.sidebar_collapsed);
+        assert!(reloaded.sidebar_collapsed_manual);
+        std::fs::remove_file(path).expect("remove client chrome preferences");
+    }
+
+    #[test]
+    fn tab_click_waits_for_release_and_drag_reorders_by_stable_id() {
+        let mut projected = snapshot();
+        for index in 2..=3 {
+            let mut tab = projected.tabs[0].clone();
+            tab.tab_id = format!("tab_{index}");
+            tab.number = index;
+            tab.label = index.to_string();
+            tab.focused = false;
+            projected.tabs.push(tab);
+        }
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(projected));
+        state.set_pane_surface(surface());
+        state.compose(106, 20).expect("three tabs");
+        let first = state.hits.tabs[0].0;
+        let third = state.hits.tabs[2].0;
+
+        let down =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: first.x + 1,
+                row: first.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(down.actions.is_empty());
+        let drag =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: third.right().saturating_sub(1),
+                row: third.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(drag.repaint);
+        assert!(matches!(
+            state.chrome_drag,
+            Some(ClientChromeDrag::Tab {
+                ref tab_id,
+                insert_index: Some(3),
+                ..
+            }) if tab_id == "tab_1"
+        ));
+        let frame = state.compose(106, 20).expect("tab drop indicator");
+        assert!(frame
+            .cells
+            .iter()
+            .take(frame.width as usize)
+            .any(|cell| cell.symbol == "│"));
+
+        let release =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: third.right().saturating_sub(1),
+                row: third.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        let [ClientShellAction::Endpoint { request, .. }] = &release.actions[..] else {
+            panic!("tab drag should use endpoint API");
+        };
+        assert!(matches!(
+            &request.method,
+            crate::api::schema::Method::TabMove(params)
+                if params.tab_id == "tab_1" && params.insert_index == 3
+        ));
+
+        state.compose(106, 20).expect("tabs after drag");
+        let second = state.hits.tabs[1].0;
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: second.x + 1,
+            row: second.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        let click =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: second.x + 1,
+                row: second.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(matches!(
+            &click.actions[0],
+            ClientShellAction::Endpoint { request, .. }
+                if matches!(&request.method, crate::api::schema::Method::TabFocus(target) if target.tab_id == "tab_2")
+        ));
+    }
+
+    #[test]
+    fn tab_drag_clears_its_drop_target_after_leaving_the_tab_row() {
+        let mut projected = snapshot();
+        for index in 2..=3 {
+            let mut tab = projected.tabs[0].clone();
+            tab.tab_id = format!("tab_{index}");
+            tab.number = index;
+            tab.label = index.to_string();
+            tab.focused = false;
+            projected.tabs.push(tab);
+        }
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(projected));
+        state.set_pane_surface(surface());
+        state.compose(106, 20).expect("three tabs");
+        let first = state.hits.tabs[0].0;
+        let third = state.hits.tabs[2].0;
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: first.x + 1,
+            row: first.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: third.x,
+            row: third.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: third.x,
+            row: third.y + 1,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        assert!(matches!(
+            state.chrome_drag,
+            Some(ClientChromeDrag::Tab {
+                insert_index: None,
+                ..
+            })
+        ));
+        let release =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: third.x,
+                row: third.y + 1,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(release.actions.is_empty());
+    }
+
+    #[test]
+    fn tab_wheel_switches_tabs_without_changing_overflow_scroll() {
         let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
         state.set_snapshot(Box::new(snapshot()));
         state.set_pane_surface(surface());
@@ -726,10 +1191,201 @@ mod tests {
                 row: tab.y,
                 modifiers: KeyModifiers::empty(),
             })]);
-        assert!(!outcome.repaint);
+        assert!(matches!(
+            &outcome.actions[..],
+            [ClientShellAction::Endpoint { request, .. }]
+                if matches!(
+                    &request.method,
+                    crate::api::schema::Method::TabFocus(target) if target.tab_id == "tab_1"
+                )
+        ));
         assert_eq!(state.tab_scroll, 0);
         state.compose(106, 20).expect("tab bar after wheel");
         assert!(state.hits.tabs.iter().any(|(_, tab_id)| tab_id == "tab_1"));
+    }
+
+    #[test]
+    fn collapsed_workspace_jitter_remains_a_click() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.sidebar_collapsed = true;
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface());
+        state.compose(106, 20).expect("collapsed sidebar");
+        let workspace = state.hits.workspaces[0].rect;
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: workspace.x,
+            row: workspace.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: workspace.x + 1,
+            row: workspace.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        assert!(state.chrome_drag.is_none());
+        assert!(state.workspace_press.is_some());
+        let release =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: workspace.x + 1,
+                row: workspace.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(matches!(
+            &release.actions[..],
+            [ClientShellAction::Endpoint { request, .. }]
+                if matches!(
+                    &request.method,
+                    crate::api::schema::Method::WorkspaceFocus(target)
+                        if target.workspace_id == "ws_1"
+                )
+        ));
+    }
+
+    #[test]
+    fn sidebar_scrollbars_use_proportional_shared_geometry_and_drag() {
+        let mut projected = snapshot();
+        for index in 2..=10 {
+            let mut workspace = projected.workspaces[0].clone();
+            workspace.workspace_id = format!("ws_{index}");
+            workspace.number = index;
+            workspace.label = format!("workspace-{index}");
+            workspace.focused = false;
+            projected.workspaces.push(workspace);
+        }
+        for index in 1..=10 {
+            projected.agents.push(crate::protocol::ClientShellAgent {
+                pane_id: format!("agent-pane-{index}"),
+                workspace_id: "ws_1".into(),
+                tab_id: "tab_1".into(),
+                name: Some(format!("agent-{index}")),
+                display_agent: None,
+                agent: Some("codex".into()),
+                title: None,
+                terminal_title: None,
+                terminal_title_stripped: None,
+                agent_status: AgentStatus::Idle,
+                state_change_seq: index,
+                state_labels: Vec::new(),
+                tokens: Vec::new(),
+                focused: false,
+            });
+        }
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(projected));
+        state.set_pane_surface(surface());
+        state.compose(106, 20).expect("overflowing sidebars");
+
+        for agent in [false, true] {
+            let (track, metrics) = if agent {
+                (
+                    state.hits.agent_scrollbar,
+                    state.hits.agent_scroll_metrics.expect("agent metrics"),
+                )
+            } else {
+                (
+                    state.hits.workspace_scrollbar,
+                    state
+                        .hits
+                        .workspace_scroll_metrics
+                        .expect("workspace metrics"),
+                )
+            };
+            assert!(track.width > 0);
+            let thumb = crate::ui::scrollbar_thumb(metrics, track).expect("scrollbar thumb");
+            assert!(thumb.len > 1);
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: track.x,
+                row: thumb.top,
+                modifiers: KeyModifiers::empty(),
+            })]);
+            let dragged =
+                state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                    kind: MouseEventKind::Drag(MouseButton::Left),
+                    column: track.x,
+                    row: track.bottom().saturating_sub(1),
+                    modifiers: KeyModifiers::empty(),
+                })]);
+            assert!(dragged.repaint);
+            if agent {
+                assert_eq!(state.agent_scroll, metrics.max_offset_from_bottom);
+            } else {
+                assert_eq!(state.workspace_scroll, metrics.max_offset_from_bottom);
+            }
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: track.x,
+                row: track.bottom().saturating_sub(1),
+                modifiers: KeyModifiers::empty(),
+            })]);
+        }
+    }
+
+    #[test]
+    fn tab_bar_renders_endpoint_status_ellipses_and_clamps_to_useful_scroll() {
+        let mut projected = snapshot();
+        projected.tab_bar_right = vec![
+            crate::protocol::ClientShellTabStatusSegment {
+                text: "ZOOM".into(),
+                accent: true,
+            },
+            crate::protocol::ClientShellTabStatusSegment {
+                text: "host".into(),
+                accent: false,
+            },
+        ];
+        projected.tab_bar_right_separator = " · ".into();
+        for number in 2..=8 {
+            projected.tabs.push(ClientShellTab {
+                tab_id: format!("tab_{number}"),
+                workspace_id: "ws_1".into(),
+                number,
+                label: number.to_string(),
+                custom_label: false,
+                zoomed: false,
+                focused: false,
+                agent_status: AgentStatus::Idle,
+            });
+        }
+        let mut config = ClientShellConfig::from_config(&Config::default());
+        config.mobile_width_threshold = 0;
+        let mut state = ClientShellState::new(config);
+        state.set_snapshot(Box::new(projected));
+        state.set_pane_surface(surface());
+        let frame = state.compose(106, 20).expect("status and overflow tabs");
+        let top = frame.cells[..frame.width as usize]
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect::<String>();
+        assert!(top.contains("ZOOM · host"));
+        assert!(top.contains('…'));
+
+        state.tab_scroll = usize::MAX;
+        state.reveal_focused_tab = false;
+        state.compose(106, 20).expect("clamped tab scroll");
+        assert!(state.tab_scroll < 7);
+        let manual_scroll = state.tab_scroll;
+        let mut replacement = (**state.snapshot.as_ref().expect("snapshot")).clone();
+        replacement.revision = 2;
+        replacement.tab_bar_right[1].text = "tick".into();
+        let mut replacement_surface = surface();
+        replacement_surface.projection_revision = 2;
+        state.set_snapshot(Box::new(replacement));
+        state.set_pane_surface(replacement_surface);
+        assert!(!state.reveal_focused_tab);
+        state.compose(106, 20).expect("same-width status update");
+        assert_eq!(state.tab_scroll, manual_scroll);
+
+        state.compose(45, 20).expect("narrow tabs win over status");
+        let narrow = state.compose(45, 20).expect("narrow tab frame");
+        let top = narrow.cells[..narrow.width as usize]
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect::<String>();
+        assert!(!top.contains("ZOOM · host"));
     }
 
     #[test]
@@ -897,6 +1553,196 @@ mod tests {
         assert!(text.contains("main"));
         assert!(text.contains("└─"));
         assert!(text.contains("feature"));
+
+        let mut replacement = (**state.snapshot.as_ref().expect("snapshot")).clone();
+        replacement.revision = 2;
+        replacement.workspaces[1].agent_status = AgentStatus::Blocked;
+        let mut replacement_surface = surface();
+        replacement_surface.projection_revision = 2;
+        state.collapsed_groups.insert("repo".into());
+        state.set_snapshot(Box::new(replacement));
+        state.set_pane_surface(replacement_surface);
+        let collapsed = state.compose(106, 20).expect("collapsed worktree group");
+        let parent = state.hits.workspaces[0].rect;
+        let status_cell = usize::from(parent.y) * usize::from(collapsed.width)
+            + usize::from(parent.x.saturating_add(1));
+        assert_eq!(
+            collapsed.cells[status_cell].fg,
+            crate::protocol::color_to_u32(state.config.palette.red)
+        );
+    }
+
+    #[test]
+    fn workspace_click_waits_for_release_and_drag_reorders_by_stable_id() {
+        let mut projected = snapshot();
+        for index in 2..=3 {
+            let mut workspace = projected.workspaces[0].clone();
+            workspace.workspace_id = format!("ws_{index}");
+            workspace.number = index;
+            workspace.label = format!("workspace-{index}");
+            workspace.focused = false;
+            projected.workspaces.push(workspace);
+        }
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(projected));
+        state.set_pane_surface(surface());
+        state.compose(106, 24).expect("three workspaces");
+        let first = state.hits.workspaces[0].rect;
+        let third = state.hits.workspaces[2].rect;
+
+        let down =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: first.x + 2,
+                row: first.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(down.actions.is_empty());
+        let drag =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: third.x + 2,
+                row: third.bottom(),
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(drag.repaint);
+        assert!(matches!(
+            state.chrome_drag,
+            Some(ClientChromeDrag::Workspace {
+                ref source_workspace_id,
+                target: Some((None, _)),
+            }) if source_workspace_id == "ws_1"
+        ));
+        let frame = state.compose(106, 24).expect("workspace drop indicator");
+        assert!(frame
+            .cells
+            .chunks(frame.width as usize)
+            .any(|row| row.iter().take(20).any(|cell| cell.symbol == "─")));
+
+        let release =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: third.x + 2,
+                row: third.bottom(),
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(matches!(
+            &release.actions[..],
+            [ClientShellAction::Endpoint { request, .. }]
+                if matches!(
+                    &request.method,
+                    crate::api::schema::Method::WorkspaceMove(params)
+                        if params.workspace_id == "ws_1" && params.insert_index == 3
+                )
+        ));
+
+        state.compose(106, 24).expect("workspaces after drag");
+        let second = state.hits.workspaces[1].rect;
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: second.x + 2,
+            row: second.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        let click =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: second.x + 2,
+                row: second.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(matches!(
+            &click.actions[..],
+            [ClientShellAction::Endpoint { request, .. }]
+                if matches!(
+                    &request.method,
+                    crate::api::schema::Method::WorkspaceFocus(target)
+                        if target.workspace_id == "ws_2"
+                )
+        ));
+    }
+
+    #[test]
+    fn workspace_drag_moves_parent_worktree_as_one_block_and_rejects_child() {
+        let mut projected = snapshot();
+        projected.workspaces[0].worktree = Some(ClientShellWorktree {
+            key: "repo".into(),
+            label: "repo".into(),
+            is_linked_worktree: false,
+        });
+        let mut child = projected.workspaces[0].clone();
+        child.workspace_id = "ws_child".into();
+        child.number = 2;
+        child.label = "feature".into();
+        child.focused = false;
+        child.worktree = Some(ClientShellWorktree {
+            key: "repo".into(),
+            label: "repo".into(),
+            is_linked_worktree: true,
+        });
+        let mut other = projected.workspaces[0].clone();
+        other.workspace_id = "ws_other".into();
+        other.number = 3;
+        other.label = "other".into();
+        other.focused = false;
+        other.worktree = None;
+        projected.workspaces.extend([child, other]);
+
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(projected));
+        state.set_pane_surface(surface());
+        state.compose(106, 24).expect("worktree workspaces");
+        assert!(state.hits.workspaces[1].indented);
+        let parent = state.hits.workspaces[0].rect;
+        let child = state.hits.workspaces[1].rect;
+        let other = state.hits.workspaces[2].rect;
+
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: parent.x + 2,
+            row: parent.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: other.x + 2,
+            row: other.bottom(),
+            modifiers: KeyModifiers::empty(),
+        })]);
+        let moved =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: other.x + 2,
+                row: other.bottom(),
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(matches!(
+            &moved.actions[..],
+            [ClientShellAction::Endpoint { request, .. }]
+                if matches!(
+                    &request.method,
+                    crate::api::schema::Method::WorkspaceMoveBlock(params)
+                        if params.workspace_ids == ["ws_1", "ws_child"]
+                            && params.before_workspace_id.is_none()
+                )
+        ));
+
+        state.compose(106, 24).expect("worktree child");
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: child.x + 2,
+            row: child.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        let dragging_child =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: other.x + 2,
+                row: other.bottom(),
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(dragging_child.actions.is_empty());
+        assert!(state.chrome_drag.is_none());
     }
 
     #[test]
@@ -1117,7 +1963,12 @@ detach = "prefix+x"
                 display_agent: None,
                 agent: None,
                 title: None,
+                terminal_title: None,
+                terminal_title_stripped: None,
                 agent_status: AgentStatus::Idle,
+                state_change_seq: 1,
+                state_labels: Vec::new(),
+                tokens: Vec::new(),
                 focused: true,
             },
             ClientShellAgent {
@@ -1128,7 +1979,12 @@ detach = "prefix+x"
                 display_agent: None,
                 agent: None,
                 title: None,
+                terminal_title: None,
+                terminal_title_stripped: None,
                 agent_status: AgentStatus::Idle,
+                state_change_seq: 2,
+                state_labels: Vec::new(),
+                tokens: Vec::new(),
                 focused: false,
             },
         ];
@@ -1179,6 +2035,281 @@ detach = "prefix+x"
             &request.method,
             crate::api::schema::Method::PaneFocus(target) if target.pane_id == "pane_2"
         ));
+    }
+
+    #[test]
+    fn agent_sidebar_honors_priority_symbols_tokens_and_stable_hits() {
+        let mut projected = snapshot();
+        let mut second_pane = projected.panes[0].clone();
+        second_pane.pane_id = "pane_2".into();
+        second_pane.focused = false;
+        projected.panes.push(second_pane);
+        projected.agents = vec![
+            ClientShellAgent {
+                pane_id: "pane_1".into(),
+                workspace_id: "ws_1".into(),
+                tab_id: "tab_1".into(),
+                name: Some("pi one".into()),
+                display_agent: None,
+                agent: Some("pi".into()),
+                title: None,
+                terminal_title: Some("first title".into()),
+                terminal_title_stripped: Some("first".into()),
+                agent_status: AgentStatus::Done,
+                state_change_seq: 10,
+                state_labels: Vec::new(),
+                tokens: vec![("summary".into(), "review complete".into())],
+                focused: true,
+            },
+            ClientShellAgent {
+                pane_id: "pane_2".into(),
+                workspace_id: "ws_1".into(),
+                tab_id: "tab_1".into(),
+                name: Some("pi two".into()),
+                display_agent: None,
+                agent: Some("pi".into()),
+                title: None,
+                terminal_title: Some("second title".into()),
+                terminal_title_stripped: Some("second".into()),
+                agent_status: AgentStatus::Blocked,
+                state_change_seq: 20,
+                state_labels: vec![("blocked".into(), "needs input".into())],
+                tokens: vec![("summary".into(), "waiting for Can".into())],
+                focused: false,
+            },
+        ];
+        let mut config = Config::default();
+        config.ui.agent_panel_sort = crate::config::AgentPanelSortConfig::Priority;
+        config.ui.status_indicators = crate::config::StatusIndicatorStyle::Symbols;
+        config.ui.sidebar.agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+        config.ui.sidebar.agents.rows_by_agent.insert(
+            "pi".into(),
+            vec![
+                vec![
+                    crate::config::AgentSidebarToken::StateIcon,
+                    crate::config::AgentSidebarToken::StateText,
+                ],
+                vec![
+                    crate::config::AgentSidebarToken::Agent,
+                    crate::config::AgentSidebarToken::Custom("summary".into()),
+                ],
+            ],
+        );
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+        state.set_snapshot(Box::new(projected));
+        state.set_pane_surface(surface());
+
+        let frame = state.compose(106, 30).expect("agent sidebar frame");
+        let text = frame
+            .cells
+            .chunks(frame.width as usize)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("× needs input"), "frame: {text}");
+        assert!(text.contains("pi two"), "frame: {text}");
+        assert!(text.contains("waiting for"), "frame: {text}");
+        assert_eq!(
+            state
+                .hits
+                .agents
+                .first()
+                .map(|(_, pane_id)| pane_id.as_str()),
+            Some("pane_2")
+        );
+
+        let first = state.hits.agents[0].0;
+        let click =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: first.x,
+                row: first.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        let [ClientShellAction::Endpoint { request, .. }] = &click.actions[..] else {
+            panic!("agent row should focus through endpoint API");
+        };
+        assert!(matches!(
+            &request.method,
+            crate::api::schema::Method::PaneFocus(target) if target.pane_id == "pane_2"
+        ));
+
+        state.compose(106, 10).expect("short agent sidebar frame");
+        assert_eq!(
+            state
+                .hits
+                .agents
+                .first()
+                .map(|(_, pane_id)| pane_id.as_str()),
+            Some("pane_2")
+        );
+        let body = state.hits.agent_body;
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: body.x,
+            row: body.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        state
+            .compose(106, 10)
+            .expect("scrolled agent sidebar frame");
+        assert_eq!(
+            state
+                .hits
+                .agents
+                .first()
+                .map(|(_, pane_id)| pane_id.as_str()),
+            Some("pane_1")
+        );
+
+        state.sidebar_collapsed = true;
+        let compact = state.compose(106, 30).expect("compact agent sidebar frame");
+        let blocked = state
+            .hits
+            .agents
+            .iter()
+            .find(|(_, pane_id)| pane_id == "pane_2")
+            .expect("blocked compact agent")
+            .0;
+        let row_start = blocked.y as usize * compact.width as usize + blocked.x as usize;
+        assert_ne!(compact.cells[row_start].fg, compact.cells[row_start + 2].fg);
+        assert_eq!(compact.cells[row_start].bg, compact.cells[row_start + 2].bg);
+    }
+
+    #[test]
+    fn active_agent_view_controls_sidebar_order_and_focus_indices() {
+        let mut projected = snapshot();
+        let mut second_pane = projected.panes[0].clone();
+        second_pane.pane_id = "pane_2".into();
+        second_pane.focused = false;
+        projected.panes.push(second_pane);
+        projected.agents = vec![
+            ClientShellAgent {
+                pane_id: "pane_1".into(),
+                workspace_id: "ws_1".into(),
+                tab_id: "tab_1".into(),
+                name: Some("first".into()),
+                display_agent: None,
+                agent: Some("pi".into()),
+                title: None,
+                terminal_title: None,
+                terminal_title_stripped: None,
+                agent_status: AgentStatus::Idle,
+                state_change_seq: 1,
+                state_labels: Vec::new(),
+                tokens: Vec::new(),
+                focused: true,
+            },
+            ClientShellAgent {
+                pane_id: "pane_2".into(),
+                workspace_id: "ws_1".into(),
+                tab_id: "tab_1".into(),
+                name: Some("second".into()),
+                display_agent: None,
+                agent: Some("pi".into()),
+                title: None,
+                terminal_title: None,
+                terminal_title_stripped: None,
+                agent_status: AgentStatus::Blocked,
+                state_change_seq: 2,
+                state_labels: Vec::new(),
+                tokens: Vec::new(),
+                focused: false,
+            },
+        ];
+        projected.agent_view_label = Some("review".into());
+        projected.agent_order = vec!["pane_2".into()];
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(projected));
+        state.set_pane_surface(surface());
+        state.compose(106, 30).expect("filtered agent sidebar");
+        assert_eq!(
+            state
+                .hits
+                .agents
+                .iter()
+                .map(|(_, pane_id)| pane_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pane_2"]
+        );
+        assert_eq!(state.hits.agent_sort_toggle, Rect::default());
+
+        let mut focus = ClientShellInput::default();
+        state.record_binding(
+            crate::input::KeybindMatch::Action(crate::input::KeybindAction::FocusAgent(0)),
+            &mut focus,
+        );
+        assert!(matches!(
+            &focus.actions[..],
+            [ClientShellAction::Endpoint { request, .. }]
+                if matches!(
+                    &request.method,
+                    crate::api::schema::Method::PaneFocus(target) if target.pane_id == "pane_2"
+                )
+        ));
+    }
+
+    #[test]
+    fn agent_sort_toggle_is_client_local_and_persists_per_endpoint() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-shell-agent-sort-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let mut projected = snapshot();
+        projected.agents.push(ClientShellAgent {
+            pane_id: "pane_1".into(),
+            workspace_id: "ws_1".into(),
+            tab_id: "tab_1".into(),
+            name: Some("pi".into()),
+            display_agent: None,
+            agent: Some("pi".into()),
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            agent_status: AgentStatus::Working,
+            state_change_seq: 1,
+            state_labels: Vec::new(),
+            tokens: Vec::new(),
+            focused: true,
+        });
+        let config =
+            ClientShellConfig::from_config(&Config::default()).with_preferences_path(path.clone());
+        let mut state = ClientShellState::new(config);
+        state.set_snapshot(Box::new(projected));
+        state.set_pane_surface(surface());
+        state.compose(106, 30).expect("agent sidebar frame");
+        let toggle = state.hits.agent_sort_toggle;
+
+        let click =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: toggle.x,
+                row: toggle.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+
+        assert_eq!(
+            state.config.agent_panel_sort,
+            crate::config::AgentPanelSortConfig::Priority
+        );
+        assert!(click.actions.is_empty());
+        let reloaded_config =
+            ClientShellConfig::from_config(&Config::default()).with_preferences_path(path.clone());
+        let reloaded = ClientShellState::new(reloaded_config);
+        assert_eq!(
+            reloaded.config.agent_panel_sort,
+            crate::config::AgentPanelSortConfig::Priority
+        );
+        assert!(reloaded.agent_panel_sort_manual);
+        std::fs::remove_file(path).expect("remove agent sort preferences");
     }
 
     #[test]
@@ -1408,6 +2539,11 @@ detach = "prefix+x"
         assert_eq!(state.mode, ClientShellMode::Navigate);
         assert_eq!(state.navigate_workspace_id.as_deref(), Some("ws_1"));
 
+        let invalid = state.handle_input_bytes(b"9");
+        assert!(invalid.actions.is_empty());
+        assert_eq!(state.mode, ClientShellMode::Navigate);
+        assert_eq!(state.navigate_workspace_id.as_deref(), Some("ws_1"));
+
         let move_selection = state.handle_input_bytes(b"\x1b[B");
         assert!(move_selection.actions.is_empty());
         assert_eq!(state.navigate_workspace_id.as_deref(), Some("ws_2"));
@@ -1445,6 +2581,18 @@ detach = "prefix+x"
 
         assert!(state.handle_input_bytes(&[0x02]).actions.is_empty());
         assert!(state.handle_input_bytes(b"r").actions.is_empty());
+        assert_eq!(state.mode, ClientShellMode::Resize);
+
+        let modified = state.handle_input_bytes(b"\x1b[1;2D");
+        assert!(matches!(
+            &modified.actions[..],
+            [ClientShellAction::Endpoint { request, .. }]
+                if matches!(
+                    &request.method,
+                    crate::api::schema::Method::PaneResize(params)
+                        if params.direction == crate::api::schema::PaneDirection::Left
+                )
+        ));
         assert_eq!(state.mode, ClientShellMode::Resize);
 
         let resize = state.handle_input_bytes(b"h");

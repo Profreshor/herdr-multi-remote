@@ -766,10 +766,20 @@ pub struct ClientShellSnapshot {
     pub focused_workspace_id: Option<String>,
     pub focused_tab_id: Option<String>,
     pub focused_pane_id: Option<String>,
+    pub tab_bar_right: Vec<ClientShellTabStatusSegment>,
+    pub tab_bar_right_separator: String,
+    pub agent_view_label: Option<String>,
+    pub agent_order: Vec<String>,
     pub workspaces: Vec<ClientShellWorkspace>,
     pub tabs: Vec<ClientShellTab>,
     pub panes: Vec<ClientShellPane>,
     pub agents: Vec<ClientShellAgent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientShellTabStatusSegment {
+    pub text: String,
+    pub accent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -826,7 +836,12 @@ pub struct ClientShellAgent {
     pub display_agent: Option<String>,
     pub agent: Option<String>,
     pub title: Option<String>,
+    pub terminal_title: Option<String>,
+    pub terminal_title_stripped: Option<String>,
     pub agent_status: crate::api::schema::AgentStatus,
+    pub state_change_seq: u64,
+    pub state_labels: Vec<(String, String)>,
+    pub tokens: Vec<(String, String)>,
     pub focused: bool,
 }
 
@@ -842,6 +857,22 @@ pub struct PaneSurfacePane {
     pub sgr_pixel_mouse: bool,
     pub pixel_width: u32,
     pub pixel_height: u32,
+}
+
+/// One draggable BSP split handle relative to a pane surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSurfaceSplit {
+    pub direction: PaneSurfaceSplitDirection,
+    pub pos: u16,
+    pub area: SurfaceRect,
+    pub hit_rect: SurfaceRect,
+    pub path: Vec<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaneSurfaceSplitDirection {
+    Horizontal,
+    Vertical,
 }
 
 /// Wire-safe rectangle relative to a pane surface.
@@ -871,6 +902,7 @@ pub struct PaneSurfaceFrame {
     pub projection_revision: u64,
     pub frame: FrameData,
     pub panes: Vec<PaneSurfacePane>,
+    pub splits: Vec<PaneSurfaceSplit>,
 }
 
 /// Terminal ANSI bytes encoded by the server for network-efficient clients.
@@ -1765,6 +1797,13 @@ mod tests {
             focused_workspace_id: Some("w1".into()),
             focused_tab_id: Some("w1:t1".into()),
             focused_pane_id: Some("w1:p1".into()),
+            tab_bar_right: vec![ClientShellTabStatusSegment {
+                text: "host".into(),
+                accent: false,
+            }],
+            tab_bar_right_separator: " · ".into(),
+            agent_view_label: None,
+            agent_order: Vec::new(),
             workspaces: vec![ClientShellWorkspace {
                 workspace_id: "w1".into(),
                 number: 1,

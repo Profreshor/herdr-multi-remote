@@ -14,14 +14,20 @@ pub(crate) struct ClientShellConfig {
     pub(super) tab_bar_position: TabBarPositionConfig,
     pub(super) hide_tab_bar_when_single_tab: bool,
     pub(super) spaces: SpacesSidebarConfig,
+    pub(super) agents: crate::config::AgentsSidebarConfig,
+    pub(super) agent_panel_sort: crate::config::AgentPanelSortConfig,
+    pub(super) status_indicators: crate::config::StatusIndicatorStyle,
     pub(super) palette: Palette,
     pub(super) keybinds: LiveKeybindConfig,
     pub(super) prompt_new_tab_name: bool,
     pub(super) prompt_new_workspace_name: bool,
     pub(super) confirm_close: bool,
+    pub(super) mouse_capture: bool,
     pub(super) mouse_scroll_lines: usize,
     pub(super) right_click_passthrough_modifiers: Option<crossterm::event::KeyModifiers>,
     pub(super) worktree_directory: std::path::PathBuf,
+    pub(super) preferences_path: Option<std::path::PathBuf>,
+    pub(super) preferences: preferences::ClientChromePreferences,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,9 +41,21 @@ pub(super) struct ClientShellLayout {
 #[derive(Default)]
 pub(super) struct ShellHitMap {
     pub(super) workspaces: Vec<WorkspaceHit>,
+    pub(super) workspace_body: Rect,
+    pub(super) workspace_scrollbar: Rect,
+    pub(super) workspace_scroll_metrics: Option<crate::pane::ScrollMetrics>,
+    pub(super) workspace_max_scroll: usize,
     pub(super) tabs: Vec<(Rect, String)>,
     pub(super) panes: Vec<PaneHit>,
+    pub(super) pane_splits: Vec<PaneSplitHit>,
     pub(super) agents: Vec<(Rect, String)>,
+    pub(super) agent_body: Rect,
+    pub(super) agent_scrollbar: Rect,
+    pub(super) agent_scroll_metrics: Option<crate::pane::ScrollMetrics>,
+    pub(super) agent_max_scroll: usize,
+    pub(super) agent_sort_toggle: Rect,
+    pub(super) sidebar_divider: Rect,
+    pub(super) sidebar_section_divider: Rect,
     pub(super) sidebar_toggle: Rect,
     pub(super) new_workspace: Rect,
     pub(super) new_tab: Rect,
@@ -65,15 +83,66 @@ pub(super) struct PaneHit {
     pub(super) pixel_height: u32,
 }
 
+#[derive(Clone)]
+pub(super) struct PaneSplitHit {
+    pub(super) direction: crate::protocol::PaneSurfaceSplitDirection,
+    pub(super) pos: u16,
+    pub(super) area: Rect,
+    pub(super) hit_rect: Rect,
+    pub(super) path: Vec<bool>,
+    pub(super) topology_signature: u64,
+}
+
 pub(super) struct ClientPaneMouseGesture {
     pub(super) hit: PaneHit,
     pub(super) button: crossterm::event::MouseButton,
     pub(super) stripped_modifiers: crossterm::event::KeyModifiers,
 }
 
+pub(super) struct ClientWorkspacePress {
+    pub(super) workspace_id: String,
+    pub(super) start_column: u16,
+    pub(super) start_row: u16,
+}
+
+pub(super) struct ClientTabPress {
+    pub(super) tab_id: String,
+    pub(super) workspace_id: String,
+    pub(super) start_column: u16,
+    pub(super) start_row: u16,
+}
+
+pub(super) enum ClientChromeDrag {
+    SidebarWidth,
+    SidebarSection,
+    WorkspaceScrollbar {
+        grab_row_offset: u16,
+    },
+    AgentScrollbar {
+        grab_row_offset: u16,
+    },
+    Tab {
+        tab_id: String,
+        workspace_id: String,
+        insert_index: Option<usize>,
+    },
+    Workspace {
+        source_workspace_id: String,
+        target: Option<(Option<String>, u16)>,
+    },
+    PaneSplit {
+        hit: PaneSplitHit,
+        tab_id: String,
+        grab_offset: i32,
+        last_sent_ratio: Option<f32>,
+        last_sent_at: Option<std::time::Instant>,
+    },
+}
+
 pub(super) struct WorkspaceHit {
     pub(super) rect: Rect,
     pub(super) workspace_id: String,
+    pub(super) indented: bool,
     pub(super) group_toggle: Option<(Rect, String)>,
 }
 
@@ -400,8 +469,19 @@ pub(crate) struct ClientShellState {
     pub(super) snapshot: Option<Box<ClientShellSnapshot>>,
     pub(super) pane_surface: Option<PaneSurfaceFrame>,
     pub(super) sidebar_collapsed: bool,
+    pub(super) sidebar_collapsed_manual: bool,
+    pub(super) sidebar_width: u16,
+    pub(super) sidebar_width_manual: bool,
+    pub(super) sidebar_section_split: f32,
+    pub(super) sidebar_section_split_manual: bool,
+    pub(super) agent_panel_sort_manual: bool,
+    pub(super) last_sidebar_divider_click: Option<std::time::Instant>,
+    pub(super) chrome_drag: Option<ClientChromeDrag>,
+    pub(super) workspace_press: Option<ClientWorkspacePress>,
+    pub(super) tab_press: Option<ClientTabPress>,
     pub(super) collapsed_groups: HashSet<String>,
     pub(super) workspace_scroll: usize,
+    pub(super) agent_scroll: usize,
     pub(super) tab_scroll: usize,
     pub(super) reveal_focused_tab: bool,
     pub(super) last_tab_bar_width: Option<u16>,
@@ -426,15 +506,46 @@ pub(super) struct WorkspaceEntry {
 }
 
 impl ClientShellState {
-    pub(crate) fn new(config: ClientShellConfig) -> Self {
-        let sidebar_collapsed = config.sidebar_start_collapsed;
+    pub(crate) fn new(mut config: ClientShellConfig) -> Self {
+        let preferences = config.preferences;
+        let sidebar_collapsed = preferences
+            .sidebar_collapsed
+            .unwrap_or(config.sidebar_start_collapsed);
+        let (min_width, max_width) = crate::config::validated_sidebar_bounds(
+            config.sidebar_min_width,
+            config.sidebar_max_width,
+        )
+        .unwrap_or((18, 36));
+        let sidebar_width = preferences
+            .sidebar_width
+            .unwrap_or(config.sidebar_width)
+            .clamp(min_width, max_width);
+        let sidebar_section_split = preferences
+            .sidebar_section_split
+            .filter(|split| split.is_finite())
+            .map(|split| split.clamp(0.1, 0.9))
+            .unwrap_or(0.5);
+        if let Some(sort) = preferences.agent_panel_sort {
+            config.agent_panel_sort = sort;
+        }
         Self {
             config,
             snapshot: None,
             pane_surface: None,
             sidebar_collapsed,
+            sidebar_collapsed_manual: preferences.sidebar_collapsed.is_some(),
+            sidebar_width,
+            sidebar_width_manual: preferences.sidebar_width.is_some(),
+            sidebar_section_split,
+            sidebar_section_split_manual: preferences.sidebar_section_split.is_some(),
+            agent_panel_sort_manual: preferences.agent_panel_sort.is_some(),
+            last_sidebar_divider_click: None,
+            chrome_drag: None,
+            workspace_press: None,
+            tab_press: None,
             collapsed_groups: HashSet::new(),
             workspace_scroll: 0,
+            agent_scroll: 0,
             tab_scroll: 0,
             reveal_focused_tab: true,
             last_tab_bar_width: None,
@@ -466,8 +577,13 @@ impl ClientShellState {
     }
 
     pub(super) fn layout(&self, cols: u16, rows: u16) -> ClientShellLayout {
-        self.config
-            .layout(cols, rows, self.sidebar_collapsed, self.focused_tab_count())
+        self.config.layout(
+            cols,
+            rows,
+            self.sidebar_collapsed,
+            self.focused_tab_count(),
+            self.sidebar_width,
+        )
     }
 
     pub(crate) fn surface_size(&self, cols: u16, rows: u16) -> ClientSurfaceSize {
@@ -492,8 +608,12 @@ impl ClientShellState {
             .is_some_and(|current| current.boot_id != snapshot.boot_id)
         {
             self.pane_surface = None;
+            self.chrome_drag = None;
+            self.workspace_press = None;
+            self.tab_press = None;
             self.collapsed_groups.clear();
             self.workspace_scroll = 0;
+            self.agent_scroll = 0;
             self.tab_scroll = 0;
             self.reveal_focused_tab = true;
             self.last_tab_bar_width = None;
@@ -524,6 +644,7 @@ impl ClientShellState {
                             || left.label != right.label
                             || left.zoomed != right.zoomed
                     })
+                || render::tab_bar_status_width(current) != render::tab_bar_status_width(&snapshot)
         });
         if tab_layout_changed
             || self

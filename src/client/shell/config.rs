@@ -1,14 +1,43 @@
 use super::*;
 
 impl ClientShellState {
+    pub(super) fn persist_chrome_preferences(&mut self, outcome: &mut ClientShellInput) {
+        let Some(path) = self.config.preferences_path.as_deref() else {
+            return;
+        };
+        let preferences = preferences::ClientChromePreferences {
+            sidebar_width: self.sidebar_width_manual.then_some(self.sidebar_width),
+            sidebar_section_split: self
+                .sidebar_section_split_manual
+                .then_some(self.sidebar_section_split),
+            sidebar_collapsed: self
+                .sidebar_collapsed_manual
+                .then_some(self.sidebar_collapsed),
+            agent_panel_sort: self
+                .agent_panel_sort_manual
+                .then_some(self.config.agent_panel_sort),
+        };
+        if let Err(error) = preferences::store(path, preferences) {
+            self.endpoint_error = Some(error);
+            outcome.repaint = true;
+        }
+    }
+
     pub(super) fn reload_client_config(&mut self) {
         match crate::config::load_live_config() {
             Ok(loaded) => {
+                let agent_panel_sort = self.config.agent_panel_sort;
                 let diagnostics = self.config.apply_live_config(
                     &loaded.config,
                     &loaded.diagnostics,
                     &loaded.invalid_sections,
                 );
+                if !self.sidebar_width_manual {
+                    self.sidebar_width = self.config.sidebar_width;
+                }
+                if self.agent_panel_sort_manual {
+                    self.config.agent_panel_sort = agent_panel_sort;
+                }
                 self.endpoint_error = crate::config::config_diagnostic_summary(&diagnostics);
             }
             Err(diagnostics) => {
@@ -30,6 +59,9 @@ impl ClientShellConfig {
             tab_bar_position: config.ui.tab_bar_position,
             hide_tab_bar_when_single_tab: config.ui.hide_tab_bar_when_single_tab,
             spaces: config.ui.sidebar.spaces.clone(),
+            agents: config.ui.sidebar.agents.clone(),
+            agent_panel_sort: config.ui.agent_panel_sort,
+            status_indicators: config.ui.status_indicators,
             palette: crate::app::client_palette_from_config(config),
             keybinds: config
                 .live_keybinds_with_diagnostics()
@@ -41,12 +73,25 @@ impl ClientShellConfig {
             prompt_new_tab_name: config.ui.prompt_new_tab_name,
             prompt_new_workspace_name: config.ui.prompt_new_workspace_name,
             confirm_close: config.ui.confirm_close,
+            mouse_capture: config.ui.mouse_capture,
             mouse_scroll_lines: config.ui.mouse_scroll_lines(),
             right_click_passthrough_modifiers: config.ui.right_click_passthrough_modifiers(),
             worktree_directory: crate::worktree::expand_tilde_absolute_path(
                 &config.worktrees.directory,
             ),
+            preferences_path: None,
+            preferences: preferences::ClientChromePreferences::default(),
         }
+    }
+
+    pub(crate) fn with_local_endpoint(self, socket_path: &std::path::Path) -> Self {
+        self.with_preferences_path(preferences::path_for_local_endpoint(socket_path))
+    }
+
+    pub(super) fn with_preferences_path(mut self, path: std::path::PathBuf) -> Self {
+        self.preferences = preferences::load(&path).unwrap_or_default();
+        self.preferences_path = Some(path);
+        self
     }
 
     pub(super) fn apply_live_config(
@@ -86,9 +131,13 @@ impl ClientShellConfig {
                 self.tab_bar_position = ui.tab_bar_position;
                 self.hide_tab_bar_when_single_tab = ui.hide_tab_bar_when_single_tab;
                 self.spaces = ui.sidebar.spaces.clone();
+                self.agents = ui.sidebar.agents.clone();
+                self.agent_panel_sort = ui.agent_panel_sort;
+                self.status_indicators = ui.status_indicators;
                 self.prompt_new_tab_name = ui.prompt_new_tab_name;
                 self.prompt_new_workspace_name = ui.prompt_new_workspace_name;
                 self.confirm_close = ui.confirm_close;
+                self.mouse_capture = ui.mouse_capture;
                 self.mouse_scroll_lines = ui.mouse_scroll_lines();
                 self.right_click_passthrough_modifiers = ui.right_click_passthrough_modifiers();
             }
@@ -111,6 +160,7 @@ impl ClientShellConfig {
         rows: u16,
         sidebar_collapsed: bool,
         tab_count: usize,
+        sidebar_width: u16,
     ) -> ClientShellLayout {
         if cols <= self.mobile_width_threshold {
             let header_height = rows.min(2);
@@ -133,7 +183,7 @@ impl ClientShellConfig {
                 self.sidebar_max_width,
             )
             .unwrap_or((18, 36));
-            self.sidebar_width.clamp(min, max)
+            sidebar_width.clamp(min, max)
         }
         .min(cols.saturating_sub(1));
         let main = Rect::new(sidebar_width, 0, cols.saturating_sub(sidebar_width), rows);
@@ -169,8 +219,20 @@ impl ClientShellConfig {
     }
 
     pub(crate) fn initial_surface_size(&self, cols: u16, rows: u16) -> ClientSurfaceSize {
+        let sidebar_collapsed = self
+            .preferences
+            .sidebar_collapsed
+            .unwrap_or(self.sidebar_start_collapsed);
+        let (min_width, max_width) =
+            crate::config::validated_sidebar_bounds(self.sidebar_min_width, self.sidebar_max_width)
+                .unwrap_or((18, 36));
+        let sidebar_width = self
+            .preferences
+            .sidebar_width
+            .unwrap_or(self.sidebar_width)
+            .clamp(min_width, max_width);
         let surface = self
-            .layout(cols, rows, self.sidebar_start_collapsed, 0)
+            .layout(cols, rows, sidebar_collapsed, 0, sidebar_width)
             .pane_surface;
         ClientSurfaceSize {
             cols: surface.width.max(1),
@@ -191,6 +253,9 @@ mod tests {
         let mut next = Config::default();
         next.ui.sidebar_width = 31;
         next.ui.tab_bar_position = TabBarPositionConfig::Bottom;
+        next.ui.agent_panel_sort = crate::config::AgentPanelSortConfig::Priority;
+        next.ui.status_indicators = crate::config::StatusIndicatorStyle::Symbols;
+        next.ui.sidebar.agents.row_gap = 2;
         next.keys.prefix = "ctrl+a".to_owned();
         next.worktrees.directory = "/var/tmp/herdr-reloaded-worktrees".to_owned();
 
@@ -200,6 +265,15 @@ mod tests {
         assert_eq!(shell.sidebar_width, 31);
         assert_eq!(shell.tab_bar_position, TabBarPositionConfig::Bottom);
         assert_eq!(
+            shell.agent_panel_sort,
+            crate::config::AgentPanelSortConfig::Priority
+        );
+        assert_eq!(
+            shell.status_indicators,
+            crate::config::StatusIndicatorStyle::Symbols
+        );
+        assert_eq!(shell.agents.row_gap, 2);
+        assert_eq!(
             shell.keybinds.prefix,
             (KeyCode::Char('a'), KeyModifiers::CONTROL)
         );
@@ -207,6 +281,30 @@ mod tests {
             shell.worktree_directory,
             std::path::PathBuf::from("/var/tmp/herdr-reloaded-worktrees")
         );
+    }
+
+    #[test]
+    fn initial_surface_size_uses_persisted_endpoint_chrome() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-initial-shell-preferences-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        preferences::store(
+            &path,
+            preferences::ClientChromePreferences {
+                sidebar_width: Some(31),
+                sidebar_collapsed: Some(true),
+                ..preferences::ClientChromePreferences::default()
+            },
+        )
+        .expect("persist endpoint chrome");
+        let config =
+            ClientShellConfig::from_config(&Config::default()).with_preferences_path(path.clone());
+        let initial = config.initial_surface_size(100, 30);
+        let state = ClientShellState::new(config);
+        assert_eq!(initial, state.surface_size(100, 30));
+        std::fs::remove_file(path).expect("remove endpoint chrome");
     }
 
     #[test]

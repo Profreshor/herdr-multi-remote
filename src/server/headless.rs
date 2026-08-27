@@ -4593,7 +4593,7 @@ impl HeadlessServer {
                 }
                 shell_projection_revision = client.shell_projection_revision;
             }
-            let mut surface_panes = None;
+            let mut surface_parts = None;
             let mut frame = match mode {
                 ClientConnectionMode::App => {
                     let render_started = crate::render_prof::timer();
@@ -4652,7 +4652,7 @@ impl HeadlessServer {
                     } else {
                         crate::kitty_graphics::HostCellSize::default()
                     };
-                    let (frame, panes) = render_client_shell_pane_surface(
+                    let (frame, panes, splits) = render_client_shell_pane_surface(
                         &mut self.app,
                         area,
                         is_foreground,
@@ -4662,7 +4662,7 @@ impl HeadlessServer {
                         "full_render.render_tab_surface_virtual",
                         render_started,
                     );
-                    surface_panes = Some(panes);
+                    surface_parts = Some((panes, splits));
                     frame
                 }
                 ClientConnectionMode::TerminalAttach { terminal_id }
@@ -4762,13 +4762,14 @@ impl HeadlessServer {
                 encoded.incomplete = false;
             }
             let has_graphics = !frame.graphics.is_empty();
-            let prepared = if let Some(panes) = surface_panes {
+            let prepared = if let Some((panes, splits)) = surface_parts {
                 client
                     .render_state
                     .prepare_pane_surface(protocol::PaneSurfaceFrame {
                         projection_revision: shell_projection_revision,
                         frame,
                         panes,
+                        splits,
                     })
             } else {
                 client.render_state.prepare_frame(frame)

@@ -275,13 +275,20 @@ impl ClientShellState {
                 (KeyCode::Char(digit), KeyModifiers::empty()),
             )
         }) {
-            self.mode = ClientShellMode::Terminal;
-            self.navigate_workspace_id = None;
-            self.record_binding(
-                KeybindMatch::Action(KeybindAction::SwitchWorkspace(index)),
-                outcome,
-            );
-            outcome.repaint = true;
+            let valid = self.snapshot.as_deref().is_some_and(|snapshot| {
+                render::workspace_entries(snapshot, &self.collapsed_groups)
+                    .get(index)
+                    .is_some()
+            });
+            if valid {
+                self.mode = ClientShellMode::Terminal;
+                self.navigate_workspace_id = None;
+                self.record_binding(
+                    KeybindMatch::Action(KeybindAction::SwitchWorkspace(index)),
+                    outcome,
+                );
+                outcome.repaint = true;
+            }
             return;
         }
 
@@ -408,6 +415,42 @@ impl ClientShellState {
     ) {
         use crate::input::{KeybindAction, KeybindMatch};
 
+        let indexed_target_exists = match &binding {
+            KeybindMatch::Action(KeybindAction::SwitchWorkspace(index)) => {
+                self.snapshot.as_deref().is_some_and(|snapshot| {
+                    render::workspace_entries(snapshot, &self.collapsed_groups)
+                        .get(*index)
+                        .is_some()
+                })
+            }
+            KeybindMatch::Action(KeybindAction::SwitchTab(index)) => self
+                .snapshot
+                .as_deref()
+                .and_then(|snapshot| {
+                    let workspace_id = snapshot.focused_workspace_id.as_deref()?;
+                    snapshot
+                        .tabs
+                        .iter()
+                        .filter(|tab| tab.workspace_id == workspace_id)
+                        .nth(*index)
+                })
+                .is_some(),
+            KeybindMatch::Action(KeybindAction::FocusAgent(index)) => {
+                self.snapshot.as_deref().is_some_and(|snapshot| {
+                    super::agent_sidebar::ordered_agent_pane_ids(
+                        snapshot,
+                        self.config.agent_panel_sort,
+                    )
+                    .get(*index)
+                    .is_some()
+                })
+            }
+            _ => true,
+        };
+        if !indexed_target_exists {
+            return;
+        }
+
         if let KeybindMatch::Action(KeybindAction::CyclePaneNext) = binding {
             self.cycle_pane(false, outcome);
         } else if let KeybindMatch::Action(KeybindAction::CyclePanePrevious) = binding {
@@ -501,11 +544,7 @@ impl ClientShellState {
             return;
         }
 
-        let (code, modifiers) = crate::config::normalize_key_combo((key.code, key.modifiers));
-        if !modifiers.is_empty() {
-            return;
-        }
-        let action = match code {
+        let action = match key.code {
             KeyCode::Char('h') | KeyCode::Left => Some(crate::input::KeybindAction::ResizePaneLeft),
             KeyCode::Char('j') | KeyCode::Down => Some(crate::input::KeybindAction::ResizePaneDown),
             KeyCode::Char('k') | KeyCode::Up => Some(crate::input::KeybindAction::ResizePaneUp),

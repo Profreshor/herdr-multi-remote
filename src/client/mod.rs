@@ -1284,8 +1284,11 @@ fn run_client_with_mode(
     crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
     let client_rendered_shell =
         attach_request.is_none() && std::env::var_os("HERDR_CLIENT_RENDERED_SHELL").is_some();
-    let shell_config =
-        client_rendered_shell.then(|| shell::ClientShellConfig::from_config(&loaded_config.config));
+    let socket_path = client_socket_path();
+    let shell_config = client_rendered_shell.then(|| {
+        shell::ClientShellConfig::from_config(&loaded_config.config)
+            .with_local_endpoint(&socket_path)
+    });
     let mouse_capture = loaded_config.config.ui.mouse_capture;
     let mouse_scroll_lines = loaded_config.config.ui.mouse_scroll_lines();
     let redraw_on_focus_gained = loaded_config.config.ui.redraw_on_focus_gained;
@@ -1306,7 +1309,6 @@ fn run_client_with_mode(
         shell_config,
     };
 
-    let socket_path = client_socket_path();
     crate::logging::startup("client");
     info!(path = %socket_path.display(), "{log_message}");
 

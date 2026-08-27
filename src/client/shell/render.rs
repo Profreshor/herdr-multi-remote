@@ -7,9 +7,10 @@ mod sidebar;
 #[path = "../shell/tabs.rs"]
 mod tabs;
 
+pub(super) use super::agent_sidebar::{ordered_agent_pane_ids, render_agent_panel};
 pub(super) use overlays::{client_navigator_rows, render_client_overlay, render_context_menu};
 pub(super) use sidebar::{render_collapsed_sidebar, render_sidebar, workspace_entries};
-pub(super) use tabs::render_tab_bar;
+pub(super) use tabs::{render_tab_bar, tab_bar_status_width};
 pub(super) fn render_mode_bar(
     buffer: &mut Buffer,
     pane_area: Rect,
@@ -122,30 +123,39 @@ pub(super) fn render_mode_bar(
     Some(bar)
 }
 
+pub(super) struct ShellRenderState<'a> {
+    pub(super) collapsed_groups: &'a HashSet<String>,
+    pub(super) workspace_scroll: &'a mut usize,
+    pub(super) agent_scroll: &'a mut usize,
+    pub(super) tab_scroll: &'a mut usize,
+    pub(super) reveal_focused_tab: &'a mut bool,
+    pub(super) sidebar_collapsed: bool,
+    pub(super) sidebar_section_split: f32,
+    pub(super) tab_drag_insert_index: Option<usize>,
+    pub(super) selected_workspace_id: Option<&'a str>,
+    pub(super) dragged_workspace_id: Option<&'a str>,
+    pub(super) workspace_drop_indicator_row: Option<u16>,
+}
+
 pub(super) fn render_shell(
     buffer: &mut Buffer,
     layout: ClientShellLayout,
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
-    collapsed_groups: &HashSet<String>,
-    workspace_scroll: &mut usize,
-    tab_scroll: &mut usize,
-    reveal_focused_tab: &mut bool,
-    sidebar_collapsed: bool,
-    selected_workspace_id: Option<&str>,
+    mut state: ShellRenderState<'_>,
 ) -> ShellHitMap {
     let mut hits = ShellHitMap::default();
     if layout.mobile_header.height > 0 {
         render_mobile_header(buffer, layout.mobile_header, snapshot, &config.palette);
     }
     if layout.sidebar.width > 0 {
-        if sidebar_collapsed {
+        if state.sidebar_collapsed {
             render_collapsed_sidebar(
                 buffer,
                 layout.sidebar,
                 snapshot,
-                &config.palette,
-                selected_workspace_id,
+                config,
+                state.selected_workspace_id,
                 &mut hits,
             );
         } else {
@@ -154,9 +164,7 @@ pub(super) fn render_shell(
                 layout.sidebar,
                 snapshot,
                 config,
-                collapsed_groups,
-                workspace_scroll,
-                selected_workspace_id,
+                &mut state,
                 &mut hits,
             );
         }
@@ -166,11 +174,26 @@ pub(super) fn render_shell(
             buffer,
             layout.tab_bar,
             snapshot,
-            &config.palette,
-            tab_scroll,
-            reveal_focused_tab,
+            config,
+            state.tab_scroll,
+            state.reveal_focused_tab,
+            state.tab_drag_insert_index,
             &mut hits,
         );
+    }
+    if !config.mouse_capture {
+        hits.sidebar_divider = Rect::default();
+        hits.sidebar_section_divider = Rect::default();
+        hits.workspace_scrollbar = Rect::default();
+        hits.agent_scrollbar = Rect::default();
+        hits.agent_sort_toggle = Rect::default();
+        hits.new_workspace = Rect::default();
+        hits.workspaces.clear();
+        hits.agents.clear();
+        hits.tab_scroll_left = Rect::default();
+        hits.tab_scroll_right = Rect::default();
+        hits.new_tab = Rect::default();
+        hits.pane_splits.clear();
     }
     hits
 }

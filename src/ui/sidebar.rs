@@ -8,7 +8,10 @@ use ratatui::{
     Frame,
 };
 
-use self::tokens::{ResolvedToken, ResolvedTokenKind, SpaceTokenContext};
+pub(crate) use self::tokens::{
+    agent_rows as sidebar_agent_rows, space_rows as sidebar_space_rows, AgentTokenContext,
+    ResolvedToken, ResolvedTokenKind, SpaceTokenContext,
+};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{state_icon, state_label, state_label_color};
 use super::text::{display_width, display_width_u16, truncate_end};
@@ -548,7 +551,20 @@ fn resolved_agent_rows(app: &AppState, entry: &AgentPanelEntry) -> Vec<Vec<Resol
         .get(agent_panel_status_key(entry.state, entry.seen))
         .map(String::as_str)
         .unwrap_or_else(|| state_label(entry.state, entry.seen));
-    tokens::agent_rows(&app.sidebar_agents, entry, label)
+    tokens::agent_rows(
+        &app.sidebar_agents,
+        AgentTokenContext {
+            workspace: &entry.primary_label,
+            tab: entry.primary_tab_label.as_deref(),
+            pane: entry.pane_label.as_deref(),
+            agent_label: entry.agent_label.as_deref(),
+            terminal_title: entry.terminal_title.as_deref(),
+            terminal_title_stripped: entry.terminal_title_stripped.as_deref(),
+            canonical_agent: entry.agent,
+            tokens: &entry.tokens,
+        },
+        label,
+    )
 }
 
 pub(crate) fn agent_entry_height_in_body(
@@ -1009,7 +1025,7 @@ pub(super) fn render_sidebar(
     render_sidebar_toggle(app, frame, area, false, p);
 }
 
-fn resolved_token_spans(
+pub(crate) fn resolved_token_spans(
     resolved: &[ResolvedToken],
     state_icon: (&str, Style),
     state_text_style: Style,

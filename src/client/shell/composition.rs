@@ -12,20 +12,41 @@ impl ClientShellState {
             self.last_tab_bar_width = Some(layout.tab_bar.width);
             self.reveal_focused_tab = true;
         }
+        let tab_drag_insert_index = match &self.chrome_drag {
+            Some(ClientChromeDrag::Tab { insert_index, .. }) => *insert_index,
+            _ => None,
+        };
+        let (dragged_workspace_id, workspace_drop_indicator_row) = match &self.chrome_drag {
+            Some(ClientChromeDrag::Workspace {
+                source_workspace_id,
+                target,
+            }) => (
+                Some(source_workspace_id.as_str()),
+                target.as_ref().map(|(_, row)| *row),
+            ),
+            _ => (None, None),
+        };
         let mut buffer = Buffer::empty(Rect::new(0, 0, cols, rows));
         self.hits = render::render_shell(
             &mut buffer,
             layout,
             snapshot,
             &self.config,
-            &self.collapsed_groups,
-            &mut self.workspace_scroll,
-            &mut self.tab_scroll,
-            &mut self.reveal_focused_tab,
-            self.sidebar_collapsed,
-            (self.mode == ClientShellMode::Navigate)
-                .then_some(self.navigate_workspace_id.as_deref())
-                .flatten(),
+            render::ShellRenderState {
+                collapsed_groups: &self.collapsed_groups,
+                workspace_scroll: &mut self.workspace_scroll,
+                agent_scroll: &mut self.agent_scroll,
+                tab_scroll: &mut self.tab_scroll,
+                reveal_focused_tab: &mut self.reveal_focused_tab,
+                sidebar_collapsed: self.sidebar_collapsed,
+                sidebar_section_split: self.sidebar_section_split,
+                tab_drag_insert_index,
+                selected_workspace_id: (self.mode == ClientShellMode::Navigate)
+                    .then_some(self.navigate_workspace_id.as_deref())
+                    .flatten(),
+                dragged_workspace_id,
+                workspace_drop_indicator_row,
+            },
         );
         self.hits.panes = surface
             .panes
@@ -50,6 +71,39 @@ impl ClientShellState {
                 pixel_height: pane.pixel_height,
             })
             .collect();
+        let topology_signature = pane_surface_topology_signature(surface);
+        self.hits.pane_splits = surface
+            .splits
+            .iter()
+            .map(|split| PaneSplitHit {
+                direction: split.direction,
+                pos: match split.direction {
+                    crate::protocol::PaneSurfaceSplitDirection::Horizontal => {
+                        layout.pane_surface.x.saturating_add(split.pos)
+                    }
+                    crate::protocol::PaneSurfaceSplitDirection::Vertical => {
+                        layout.pane_surface.y.saturating_add(split.pos)
+                    }
+                },
+                area: Rect::new(
+                    layout.pane_surface.x.saturating_add(split.area.x),
+                    layout.pane_surface.y.saturating_add(split.area.y),
+                    split.area.width,
+                    split.area.height,
+                ),
+                hit_rect: Rect::new(
+                    layout.pane_surface.x.saturating_add(split.hit_rect.x),
+                    layout.pane_surface.y.saturating_add(split.hit_rect.y),
+                    split.hit_rect.width,
+                    split.hit_rect.height,
+                ),
+                path: split.path.clone(),
+                topology_signature,
+            })
+            .collect();
+        if !self.config.mouse_capture {
+            self.hits.pane_splits.clear();
+        }
         let mode_bar = render::render_mode_bar(
             &mut buffer,
             layout.pane_surface,
