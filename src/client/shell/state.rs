@@ -19,6 +19,8 @@ pub(crate) struct ClientShellConfig {
     pub(super) prompt_new_tab_name: bool,
     pub(super) prompt_new_workspace_name: bool,
     pub(super) confirm_close: bool,
+    pub(super) mouse_scroll_lines: usize,
+    pub(super) right_click_passthrough_modifiers: Option<crossterm::event::KeyModifiers>,
     pub(super) worktree_directory: std::path::PathBuf,
 }
 
@@ -34,8 +36,14 @@ pub(super) struct ClientShellLayout {
 pub(super) struct ShellHitMap {
     pub(super) workspaces: Vec<WorkspaceHit>,
     pub(super) tabs: Vec<(Rect, String)>,
-    pub(super) panes: Vec<(Rect, String)>,
+    pub(super) panes: Vec<PaneHit>,
+    pub(super) agents: Vec<(Rect, String)>,
     pub(super) sidebar_toggle: Rect,
+    pub(super) new_workspace: Rect,
+    pub(super) new_tab: Rect,
+    pub(super) tab_scroll_left: Rect,
+    pub(super) tab_scroll_right: Rect,
+    pub(super) context_menu_rows: Vec<(Rect, usize)>,
     pub(super) overlay_primary: Rect,
     pub(super) overlay_clear: Rect,
     pub(super) overlay_cancel: Rect,
@@ -44,6 +52,23 @@ pub(super) struct ShellHitMap {
     pub(super) navigator_rows: Vec<(Rect, usize)>,
     pub(super) worktree_search: Rect,
     pub(super) worktree_rows: Vec<(Rect, usize)>,
+}
+
+#[derive(Clone)]
+pub(super) struct PaneHit {
+    pub(super) rect: Rect,
+    pub(super) inner_rect: Rect,
+    pub(super) pane_id: String,
+    pub(super) mouse_reporting: bool,
+    pub(super) sgr_pixel_mouse: bool,
+    pub(super) pixel_width: u32,
+    pub(super) pixel_height: u32,
+}
+
+pub(super) struct ClientPaneMouseGesture {
+    pub(super) hit: PaneHit,
+    pub(super) button: crossterm::event::MouseButton,
+    pub(super) stripped_modifiers: crossterm::event::KeyModifiers,
 }
 
 pub(super) struct WorkspaceHit {
@@ -88,6 +113,7 @@ pub(super) enum ClientShellOverlayKind {
     WorktreeCreate,
     WorktreeOpen,
     WorktreeRemove,
+    ContextMenu,
 }
 
 #[derive(Debug)]
@@ -250,6 +276,60 @@ pub(super) struct ClientWorktreeRemoveOverlay {
     pub(super) force_confirmation: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ClientContextMenuAction {
+    Rename,
+    Close,
+    NewWorktree,
+    OpenWorktree,
+    RemoveWorktree,
+    ToggleGroup,
+    NewTab,
+    RenamePane,
+    ClearPaneName,
+    SwapWithFocusedPane,
+    SplitRight,
+    SplitDown,
+    Zoom,
+    ToggleRightClickPassthrough,
+    ClosePane,
+}
+
+#[derive(Debug)]
+pub(super) enum ClientContextMenuTarget {
+    Workspace {
+        workspace_id: String,
+        is_git: bool,
+        is_linked_worktree: bool,
+        has_worktree_children: bool,
+        collapsed: bool,
+    },
+    Tab {
+        tab_id: String,
+        workspace_id: String,
+    },
+    Pane {
+        pane_id: String,
+        workspace_id: String,
+        source_pane_id: Option<String>,
+        has_manual_label: bool,
+        right_click_passthrough: bool,
+    },
+}
+
+#[derive(Debug)]
+pub(super) struct ClientContextMenuOverlay {
+    pub(super) target: ClientContextMenuTarget,
+    pub(super) x: u16,
+    pub(super) y: u16,
+    pub(super) highlighted: usize,
+}
+
+pub(super) struct ClientContextMenuItem {
+    pub(super) label: &'static str,
+    pub(super) action: ClientContextMenuAction,
+}
+
 #[derive(Debug)]
 pub(super) struct ClientConfirmCloseOverlay {
     pub(super) workspace_id: String,
@@ -266,6 +346,7 @@ pub(super) enum ClientShellOverlay {
     WorktreeCreate(ClientWorktreeCreateOverlay),
     WorktreeOpen(ClientWorktreeOpenOverlay),
     WorktreeRemove(ClientWorktreeRemoveOverlay),
+    ContextMenu(ClientContextMenuOverlay),
 }
 
 impl ClientShellOverlay {
@@ -278,6 +359,7 @@ impl ClientShellOverlay {
             Self::WorktreeCreate(_) => ClientShellOverlayKind::WorktreeCreate,
             Self::WorktreeOpen(_) => ClientShellOverlayKind::WorktreeOpen,
             Self::WorktreeRemove(_) => ClientShellOverlayKind::WorktreeRemove,
+            Self::ContextMenu(_) => ClientShellOverlayKind::ContextMenu,
         }
     }
 }
@@ -321,11 +403,15 @@ pub(crate) struct ClientShellState {
     pub(super) collapsed_groups: HashSet<String>,
     pub(super) workspace_scroll: usize,
     pub(super) tab_scroll: usize,
+    pub(super) reveal_focused_tab: bool,
+    pub(super) last_tab_bar_width: Option<u16>,
     pub(super) hits: ShellHitMap,
     pub(super) mode: ClientShellMode,
     pub(super) navigate_workspace_id: Option<String>,
     pub(super) overlay: Option<ClientShellOverlay>,
     pub(super) previous_pane_id: Option<String>,
+    pub(super) pane_mouse_gesture: Option<ClientPaneMouseGesture>,
+    pub(super) host_mouse_pixels: Option<crate::input::mouse::HostPixels>,
     pub(super) input_leases: ClientInputLeases,
     pub(super) next_request_id: u64,
     pub(super) pending_requests: HashMap<String, PendingEndpointRequest>,
@@ -350,11 +436,15 @@ impl ClientShellState {
             collapsed_groups: HashSet::new(),
             workspace_scroll: 0,
             tab_scroll: 0,
+            reveal_focused_tab: true,
+            last_tab_bar_width: None,
             hits: ShellHitMap::default(),
             mode: ClientShellMode::Terminal,
             navigate_workspace_id: None,
             overlay: None,
             previous_pane_id: None,
+            pane_mouse_gesture: None,
+            host_mouse_pixels: None,
             input_leases: ClientInputLeases::default(),
             next_request_id: 1,
             pending_requests: HashMap::new(),
@@ -390,6 +480,13 @@ impl ClientShellState {
 
     pub(crate) fn set_snapshot(&mut self, snapshot: Box<ClientShellSnapshot>) {
         if self
+            .pane_surface
+            .as_ref()
+            .is_none_or(|surface| surface.projection_revision != snapshot.revision)
+        {
+            self.hits = ShellHitMap::default();
+        }
+        if self
             .snapshot
             .as_ref()
             .is_some_and(|current| current.boot_id != snapshot.boot_id)
@@ -398,11 +495,15 @@ impl ClientShellState {
             self.collapsed_groups.clear();
             self.workspace_scroll = 0;
             self.tab_scroll = 0;
+            self.reveal_focused_tab = true;
+            self.last_tab_bar_width = None;
             self.pending_requests.clear();
             self.endpoint_error = None;
             self.navigate_workspace_id = None;
             self.overlay = None;
             self.previous_pane_id = None;
+            self.pane_mouse_gesture = None;
+            self.host_mouse_pixels = None;
         } else if let Some(previous) = self
             .snapshot
             .as_deref()
@@ -410,6 +511,28 @@ impl ClientShellState {
             .filter(|previous| Some(previous.as_str()) != snapshot.focused_pane_id.as_deref())
         {
             self.previous_pane_id = Some(previous.clone());
+        }
+        let tab_layout_changed = self.snapshot.as_deref().is_none_or(|current| {
+            current.tabs.len() != snapshot.tabs.len()
+                || current
+                    .tabs
+                    .iter()
+                    .zip(&snapshot.tabs)
+                    .any(|(left, right)| {
+                        left.tab_id != right.tab_id
+                            || left.workspace_id != right.workspace_id
+                            || left.label != right.label
+                            || left.zoomed != right.zoomed
+                    })
+        });
+        if tab_layout_changed
+            || self
+                .snapshot
+                .as_deref()
+                .and_then(|current| current.focused_tab_id.as_deref())
+                != snapshot.focused_tab_id.as_deref()
+        {
+            self.reveal_focused_tab = true;
         }
         if self.mode == ClientShellMode::Navigate
             && self.navigate_workspace_id.as_ref().is_none_or(|selected| {
@@ -425,6 +548,19 @@ impl ClientShellState {
     }
 
     pub(crate) fn set_pane_surface(&mut self, surface: PaneSurfaceFrame) {
+        if self
+            .snapshot
+            .as_ref()
+            .is_none_or(|snapshot| snapshot.revision != surface.projection_revision)
+        {
+            self.hits = ShellHitMap::default();
+        }
         self.pane_surface = Some(surface);
+    }
+
+    pub(crate) fn invalidate_pane_surface(&mut self) {
+        self.pane_surface = None;
+        self.hits = ShellHitMap::default();
+        self.host_mouse_pixels = None;
     }
 }

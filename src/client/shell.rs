@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 mod actions;
 mod composition;
 mod config;
+mod context_menu;
 mod input;
 mod mouse;
 mod overlay_input;
@@ -26,8 +27,8 @@ use crate::config::{
     TabBarPositionConfig,
 };
 use crate::protocol::{
-    ClientMessage, ClientPaneInputEvent, ClientShellSnapshot, ClientShellWorkspace,
-    ClientSurfaceSize, FrameData, PaneSurfaceFrame,
+    ClientMessage, ClientMousePosition, ClientPaneInputEvent, ClientShellSnapshot, ClientShellTab,
+    ClientShellWorkspace, ClientSurfaceSize, FrameData, PaneSurfaceFrame,
 };
 #[cfg(test)]
 use crate::raw_input::RawInputEvent;
@@ -205,6 +206,7 @@ mod tests {
                 cwd: Some("/repo".into()),
                 foreground_cwd: Some("/repo".into()),
                 focused: true,
+                right_click_passthrough: false,
             }],
             agents: Vec::new(),
         }
@@ -262,6 +264,10 @@ mod tests {
                 },
                 scrollbar_rect: None,
                 focused: true,
+                mouse_reporting: false,
+                sgr_pixel_mouse: false,
+                pixel_width: 0,
+                pixel_height: 0,
             }],
         }
     }
@@ -296,13 +302,27 @@ mod tests {
     }
 
     #[test]
-    fn shell_refuses_to_compose_mismatched_projection_and_surface() {
+    fn shell_refuses_mismatched_projection_and_clears_stale_hits_in_either_order() {
         let config = ClientShellConfig::from_config(&Config::default());
         let mut state = ClientShellState::new(config);
-        let mut snapshot = snapshot();
-        snapshot.revision = 2;
-        state.set_snapshot(Box::new(snapshot));
+        state.set_snapshot(Box::new(snapshot()));
         state.set_pane_surface(surface());
+        state.compose(106, 20).expect("initial frame");
+        assert!(!state.hits.panes.is_empty());
+
+        let mut replacement = snapshot();
+        replacement.revision = 2;
+        state.set_snapshot(Box::new(replacement));
+        assert!(state.hits.panes.is_empty());
+        assert!(state.compose(106, 20).is_none());
+
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface());
+        state.compose(106, 20).expect("restored frame");
+        let mut replacement_surface = surface();
+        replacement_surface.projection_revision = 2;
+        state.set_pane_surface(replacement_surface);
+        assert!(state.hits.panes.is_empty());
         assert!(state.compose(106, 20).is_none());
     }
 
@@ -346,6 +366,493 @@ mod tests {
             &request.method,
             crate::api::schema::Method::PaneFocus(target) if target.pane_id == "pane_1"
         ));
+    }
+
+    #[test]
+    fn resize_invalidation_drops_stale_hits_but_preserves_gesture_release() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        let mut pane_surface = surface();
+        pane_surface.panes[0].mouse_reporting = true;
+        state.set_pane_surface(pane_surface);
+        state.compose(106, 20).expect("composed frame");
+        let pane = state.hits.panes[0].clone();
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: pane.inner_rect.x + 1,
+            row: pane.inner_rect.y + 1,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        assert!(state.pane_mouse_gesture.is_some());
+
+        state.invalidate_pane_surface();
+        assert!(state.pane_surface.is_none());
+        assert!(state.hits.panes.is_empty());
+        let stale_click =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: 27,
+                row: 1,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(stale_click.requests.is_empty());
+        assert!(stale_click.actions.is_empty());
+
+        let release =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: pane.inner_rect.x + 1,
+                row: pane.inner_rect.y + 1,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(matches!(
+            &release.requests[..],
+            [ClientMessage::ClientShellPaneInput { pane_id, events }]
+                if pane_id == "pane_1"
+                    && matches!(
+                        &events[..],
+                        [ClientPaneInputEvent::Mouse {
+                            kind: crate::protocol::ClientMouseKind::Up(
+                                crate::protocol::ClientMouseButton::Left
+                            ),
+                            ..
+                        }]
+                    )
+        ));
+        assert!(state.pane_mouse_gesture.is_none());
+    }
+
+    #[test]
+    fn pane_mouse_input_keeps_stable_target_and_endpoint_encoding() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        let mut pane_surface = surface();
+        pane_surface.panes[0].mouse_reporting = true;
+        state.set_pane_surface(pane_surface);
+        state.compose(106, 20).expect("composed frame");
+        let pane = state.hits.panes[0].clone();
+
+        let click =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: pane.inner_rect.x + 2,
+                row: pane.inner_rect.y + 1,
+                modifiers: KeyModifiers::ALT,
+            })]);
+        let [ClientMessage::ClientShellPaneInput { pane_id, events }] = &click.requests[..] else {
+            panic!("pane application click should use targeted canonical input");
+        };
+        assert_eq!(pane_id, "pane_1");
+        assert!(matches!(
+            &events[..],
+            [ClientPaneInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Down(
+                    crate::protocol::ClientMouseButton::Left
+                ),
+                position: ClientMousePosition::Cell { column: 2, row: 1 },
+                modifiers,
+                ..
+            }] if *modifiers == KeyModifiers::ALT.bits()
+        ));
+        let moved =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::ALT,
+            })]);
+        assert!(moved.requests.is_empty());
+        assert!(state.pane_mouse_gesture.is_some());
+        state.hits.panes.clear();
+        let release =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::ALT,
+            })]);
+        assert!(matches!(
+            &release.requests[..],
+            [ClientMessage::ClientShellPaneInput { pane_id, events }]
+                if pane_id == "pane_1"
+                    && matches!(
+                        &events[..],
+                        [ClientPaneInputEvent::Mouse {
+                            kind: crate::protocol::ClientMouseKind::Up(
+                                crate::protocol::ClientMouseButton::Left
+                            ),
+                            ..
+                        }]
+                    )
+        ));
+        assert!(state.pane_mouse_gesture.is_none());
+    }
+
+    #[test]
+    fn pane_pixel_mouse_preserves_pane_relative_pixel_coordinates() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        let mut pane_surface = surface();
+        pane_surface.panes[0].mouse_reporting = true;
+        pane_surface.panes[0].sgr_pixel_mouse = true;
+        pane_surface.panes[0].pixel_width = 39;
+        pane_surface.panes[0].pixel_height = 38;
+        state.set_pane_surface(pane_surface);
+        state.compose(106, 20).expect("composed frame");
+        let pane = state.hits.panes[0].clone();
+        let geometry =
+            crate::input::mouse::HostGeometry::new(106, 20, 1060, 400).expect("host geometry");
+        let x = u32::from(pane.inner_rect.x) * 10 + 21;
+        let y = u32::from(pane.inner_rect.y) * 20 + 21;
+        let report = format!("\x1b[<0;{x};{y}M");
+
+        let outcome = state.handle_pixel_mouse(report.as_bytes(), geometry);
+        assert!(matches!(
+            &outcome.requests[..],
+            [ClientMessage::ClientShellPaneInput { pane_id, events }]
+                if pane_id == "pane_1"
+                    && matches!(
+                        &events[..],
+                        [ClientPaneInputEvent::Mouse {
+                            kind: crate::protocol::ClientMouseKind::Down(
+                                crate::protocol::ClientMouseButton::Left
+                            ),
+                            position: ClientMousePosition::Pixels { x: 20, y: 20, .. },
+                            ..
+                        }]
+                    )
+        ));
+    }
+
+    #[test]
+    fn pixel_host_reports_use_cells_without_target_pixel_mode_and_release_outside() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        let mut pane_surface = surface();
+        pane_surface.panes[0].mouse_reporting = true;
+        state.set_pane_surface(pane_surface);
+        state.compose(106, 20).expect("composed frame");
+        let pane = state.hits.panes[0].clone();
+        let geometry =
+            crate::input::mouse::HostGeometry::new(106, 20, 1060, 400).expect("host geometry");
+        let x = u32::from(pane.inner_rect.x) * 10 + 21;
+        let y = u32::from(pane.inner_rect.y) * 20 + 21;
+
+        let down = state.handle_pixel_mouse(format!("\x1b[<0;{x};{y}M").as_bytes(), geometry);
+        assert!(matches!(
+            &down.requests[..],
+            [ClientMessage::ClientShellPaneInput { events, .. }]
+                if matches!(
+                    &events[..],
+                    [ClientPaneInputEvent::Mouse {
+                        position: ClientMousePosition::Cell { column: 2, row: 1 },
+                        ..
+                    }]
+                )
+        ));
+
+        state.hits.panes.clear();
+        let release = state.handle_pixel_mouse(b"\x1b[<0;1;1m", geometry);
+        assert!(matches!(
+            &release.requests[..],
+            [ClientMessage::ClientShellPaneInput { pane_id, events }]
+                if pane_id == "pane_1"
+                    && matches!(
+                        &events[..],
+                        [ClientPaneInputEvent::Mouse {
+                            kind: crate::protocol::ClientMouseKind::Up(
+                                crate::protocol::ClientMouseButton::Left
+                            ),
+                            position: ClientMousePosition::Cell { .. },
+                            ..
+                        }]
+                    )
+        ));
+        assert!(state.pane_mouse_gesture.is_none());
+    }
+
+    #[test]
+    fn pane_owned_right_click_forwards_the_complete_gesture() {
+        let mut snapshot = snapshot();
+        snapshot.panes[0].right_click_passthrough = true;
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot));
+        let mut pane_surface = surface();
+        pane_surface.panes[0].mouse_reporting = true;
+        state.set_pane_surface(pane_surface);
+        state.compose(106, 20).expect("composed frame");
+        let pane = state.hits.panes[0].clone();
+
+        let down =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: pane.inner_rect.x + 1,
+                row: pane.inner_rect.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(matches!(
+            &down.requests[..],
+            [ClientMessage::ClientShellPaneInput { pane_id, .. }] if pane_id == "pane_1"
+        ));
+        assert!(state.overlay.is_none());
+        assert!(state.pane_mouse_gesture.is_some());
+
+        let up =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Right),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(matches!(
+            &up.requests[..],
+            [ClientMessage::ClientShellPaneInput { pane_id, events }]
+                if pane_id == "pane_1"
+                    && matches!(
+                        &events[..],
+                        [ClientPaneInputEvent::Mouse {
+                            kind: crate::protocol::ClientMouseKind::Up(
+                                crate::protocol::ClientMouseButton::Right
+                            ),
+                            ..
+                        }]
+                    )
+        ));
+        assert!(state.pane_mouse_gesture.is_none());
+    }
+
+    #[test]
+    fn shell_new_controls_use_the_same_client_action_routes_as_keybinds() {
+        let mut config = Config::default();
+        config.ui.prompt_new_workspace_name = false;
+        config.ui.prompt_new_tab_name = true;
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface());
+        state.compose(106, 20).expect("composed frame");
+
+        let new_workspace = state.hits.new_workspace;
+        let create_workspace =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: new_workspace.x + 1,
+                row: new_workspace.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        let [ClientShellAction::Endpoint { request, .. }] = &create_workspace.actions[..] else {
+            panic!("new workspace click should use the endpoint API");
+        };
+        assert!(matches!(
+            request.method,
+            crate::api::schema::Method::WorkspaceCreate(_)
+        ));
+
+        let new_tab = state.hits.new_tab;
+        let open_new_tab =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: new_tab.x + 1,
+                row: new_tab.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(open_new_tab.actions.is_empty());
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::Rename(ClientRenameOverlay {
+                target: ClientRenameTarget::NewTab { .. },
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn tab_overflow_controls_scroll_the_client_owned_tab_bar() {
+        let mut snapshot = snapshot();
+        snapshot.tabs.extend((2..=8).map(|number| ClientShellTab {
+            tab_id: format!("tab_{number}"),
+            workspace_id: "ws_1".into(),
+            number,
+            label: number.to_string(),
+            custom_label: false,
+            zoomed: false,
+            focused: false,
+            agent_status: AgentStatus::Idle,
+        }));
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot));
+        state.set_pane_surface(surface());
+        state.compose(80, 20).expect("overflow tab bar");
+
+        assert!(state.hits.tab_scroll_right.width > 0);
+        let scroll_right = state.hits.tab_scroll_right;
+        let outcome =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: scroll_right.x + 1,
+                row: scroll_right.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(outcome.repaint);
+        assert_eq!(state.tab_scroll, 1);
+
+        let mut update = state.snapshot.as_deref().expect("snapshot").clone();
+        update.focused_tab_id = Some("tab_8".into());
+        for tab in &mut update.tabs {
+            tab.focused = tab.tab_id == "tab_8";
+        }
+        state.set_snapshot(Box::new(update));
+        state.compose(80, 20).expect("focused overflow tab");
+        assert!(state.hits.tabs.iter().any(|(_, tab_id)| tab_id == "tab_8"));
+
+        state.compose(300, 20).expect("tabs without overflow");
+        assert_eq!(state.tab_scroll, 0);
+        assert_eq!(state.hits.tabs.len(), 8);
+        state.compose(80, 20).expect("focused tab after narrowing");
+        assert!(state.hits.tabs.iter().any(|(_, tab_id)| tab_id == "tab_8"));
+    }
+
+    #[test]
+    fn tab_wheel_does_not_hide_tabs_without_overflow_controls() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface());
+        state.compose(106, 20).expect("tab bar");
+        let tab = state.hits.tabs[0].0;
+
+        let outcome =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: tab.x,
+                row: tab.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(!outcome.repaint);
+        assert_eq!(state.tab_scroll, 0);
+        state.compose(106, 20).expect("tab bar after wheel");
+        assert!(state.hits.tabs.iter().any(|(_, tab_id)| tab_id == "tab_1"));
+    }
+
+    #[test]
+    fn context_menus_capture_stable_targets_and_route_actions() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface());
+        state.compose(106, 20).expect("composed frame");
+
+        let workspace = state.hits.workspaces[0].rect;
+        let open_workspace_menu =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: workspace.x + 2,
+                row: workspace.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(open_workspace_menu.actions.is_empty());
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::ContextMenu(ClientContextMenuOverlay {
+                target: ClientContextMenuTarget::Workspace { ref workspace_id, .. },
+                ..
+            })) if workspace_id == "ws_1"
+        ));
+        let workspace_items = match state.overlay.as_ref() {
+            Some(ClientShellOverlay::ContextMenu(menu)) => menu.items(),
+            _ => panic!("workspace context menu"),
+        };
+        assert!(workspace_items
+            .iter()
+            .any(|item| item.action == ClientContextMenuAction::NewWorktree));
+        state.compose(106, 20).expect("workspace context menu");
+        let rename = state.hits.context_menu_rows[0].0;
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rename.x + 1,
+            row: rename.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::Rename(ClientRenameOverlay {
+                target: ClientRenameTarget::Workspace { ref workspace_id },
+                ..
+            })) if workspace_id == "ws_1"
+        ));
+
+        state.overlay = None;
+        state.compose(106, 20).expect("composed frame");
+        let pane = state.hits.panes[0].rect;
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: pane.x + 1,
+            row: pane.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        state.compose(106, 20).expect("pane context menu");
+        let split_index = match state.overlay.as_ref() {
+            Some(ClientShellOverlay::ContextMenu(menu)) => menu
+                .items()
+                .iter()
+                .position(|item| item.action == ClientContextMenuAction::SplitRight)
+                .expect("split right item"),
+            _ => panic!("pane context menu"),
+        };
+        let split = state.hits.context_menu_rows[split_index].0;
+        let outcome =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: split.x + 1,
+                row: split.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        let [ClientShellAction::Endpoint { request, .. }] = &outcome.actions[..] else {
+            panic!("pane split context action should use endpoint API");
+        };
+        assert!(matches!(
+            &request.method,
+            crate::api::schema::Method::PaneSplit(params)
+                if params.target_pane_id.as_deref() == Some("pane_1")
+                    && params.direction == crate::api::schema::SplitDirection::Right
+        ));
+    }
+
+    #[test]
+    fn context_menu_keyboard_and_outside_click_are_client_owned() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface());
+        state.compose(106, 20).expect("composed frame");
+        let tab = state.hits.tabs[0].0;
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: tab.x + 1,
+            row: tab.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        state.compose(106, 20).expect("tab context menu");
+        let moved = state.handle_input_bytes(b"\x1b[B");
+        assert!(moved.repaint);
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::ContextMenu(ClientContextMenuOverlay {
+                highlighted: 1,
+                ..
+            }))
+        ));
+        let text = state.handle_raw_events(vec![RawInputEvent::Text(
+            crate::input::TextCommit::new("not pane input"),
+        )]);
+        assert!(text.requests.is_empty());
+        let paste = state.handle_raw_events(vec![RawInputEvent::Paste("not pane input".into())]);
+        assert!(paste.requests.is_empty());
+        let outside =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 105,
+                row: 19,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(outside.repaint);
+        assert!(state.overlay.is_none());
     }
 
     #[test]
@@ -790,6 +1297,12 @@ detach = "prefix+x"
             .join("\n");
         assert!(text.contains("new tab"));
         assert!(text.contains("save"));
+        let restored = frame.to_ratatui_buffer().expect("overlay frame");
+        assert!(!restored
+            .cell((26, 7))
+            .expect("overlay title cell")
+            .modifier
+            .contains(Modifier::DIM));
         assert!(frame.cursor.as_ref().is_some_and(|cursor| cursor.visible));
 
         assert!(state.handle_input_bytes(b"logs").actions.is_empty());

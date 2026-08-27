@@ -7,7 +7,7 @@ mod sidebar;
 #[path = "../shell/tabs.rs"]
 mod tabs;
 
-pub(super) use overlays::{client_navigator_rows, render_client_overlay};
+pub(super) use overlays::{client_navigator_rows, render_client_overlay, render_context_menu};
 pub(super) use sidebar::{render_collapsed_sidebar, render_sidebar, workspace_entries};
 pub(super) use tabs::render_tab_bar;
 pub(super) fn render_mode_bar(
@@ -130,6 +130,7 @@ pub(super) fn render_shell(
     collapsed_groups: &HashSet<String>,
     workspace_scroll: &mut usize,
     tab_scroll: &mut usize,
+    reveal_focused_tab: &mut bool,
     sidebar_collapsed: bool,
     selected_workspace_id: Option<&str>,
 ) -> ShellHitMap {
@@ -167,6 +168,7 @@ pub(super) fn render_shell(
             snapshot,
             &config.palette,
             tab_scroll,
+            reveal_focused_tab,
             &mut hits,
         );
     }

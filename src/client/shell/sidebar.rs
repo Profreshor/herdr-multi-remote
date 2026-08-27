@@ -142,6 +142,12 @@ pub(crate) fn render_sidebar(
     }
 
     let footer_y = workspace_area.bottom().saturating_sub(1);
+    hits.new_workspace = Rect::new(
+        workspace_area.x,
+        footer_y,
+        5.min(workspace_area.width),
+        u16::from(workspace_area.height > 0),
+    );
     put_text(
         buffer,
         workspace_area.x,
@@ -207,6 +213,8 @@ pub(crate) fn render_sidebar(
             .or(agent.agent.as_deref())
             .or(agent.title.as_deref())
             .unwrap_or("terminal");
+        let rect = Rect::new(detail_area.x, y, detail_area.width, 1);
+        hits.agents.push((rect, agent.pane_id.clone()));
         put_text(
             buffer,
             detail_area.x,

@@ -8,6 +8,10 @@ impl ClientShellState {
             return None;
         }
         let layout = self.layout(cols, rows);
+        if self.last_tab_bar_width != Some(layout.tab_bar.width) {
+            self.last_tab_bar_width = Some(layout.tab_bar.width);
+            self.reveal_focused_tab = true;
+        }
         let mut buffer = Buffer::empty(Rect::new(0, 0, cols, rows));
         self.hits = render::render_shell(
             &mut buffer,
@@ -17,6 +21,7 @@ impl ClientShellState {
             &self.collapsed_groups,
             &mut self.workspace_scroll,
             &mut self.tab_scroll,
+            &mut self.reveal_focused_tab,
             self.sidebar_collapsed,
             (self.mode == ClientShellMode::Navigate)
                 .then_some(self.navigate_workspace_id.as_deref())
@@ -25,16 +30,24 @@ impl ClientShellState {
         self.hits.panes = surface
             .panes
             .iter()
-            .map(|pane| {
-                (
-                    Rect::new(
-                        layout.pane_surface.x.saturating_add(pane.rect.x),
-                        layout.pane_surface.y.saturating_add(pane.rect.y),
-                        pane.rect.width,
-                        pane.rect.height,
-                    ),
-                    pane.pane_id.clone(),
-                )
+            .map(|pane| PaneHit {
+                rect: Rect::new(
+                    layout.pane_surface.x.saturating_add(pane.rect.x),
+                    layout.pane_surface.y.saturating_add(pane.rect.y),
+                    pane.rect.width,
+                    pane.rect.height,
+                ),
+                inner_rect: Rect::new(
+                    layout.pane_surface.x.saturating_add(pane.inner_rect.x),
+                    layout.pane_surface.y.saturating_add(pane.inner_rect.y),
+                    pane.inner_rect.width,
+                    pane.inner_rect.height,
+                ),
+                pane_id: pane.pane_id.clone(),
+                mouse_reporting: pane.mouse_reporting,
+                sgr_pixel_mouse: pane.sgr_pixel_mouse,
+                pixel_width: pane.pixel_width,
+                pixel_height: pane.pixel_height,
             })
             .collect();
         let mode_bar = render::render_mode_bar(
@@ -65,22 +78,29 @@ impl ClientShellState {
         if let Some(overlay) = self.overlay.as_ref() {
             let graphics = std::mem::take(&mut frame.graphics);
             let mut composed = frame.to_ratatui_buffer()?;
-            let rendered = render::render_client_overlay(
-                &mut composed,
-                overlay,
-                snapshot,
-                &self.config.keybinds,
-                &self.config.palette,
-            )?;
-            self.hits.overlay_primary = rendered.primary;
-            self.hits.overlay_clear = rendered.clear;
-            self.hits.overlay_cancel = rendered.cancel;
-            self.hits.navigator_popup = rendered.navigator_popup;
-            self.hits.navigator_search = rendered.navigator_search;
-            self.hits.navigator_rows = rendered.navigator_rows;
-            self.hits.worktree_search = rendered.worktree_search;
-            self.hits.worktree_rows = rendered.worktree_rows;
-            frame = FrameData::from_ratatui_buffer_with_hyperlinks(&composed, rendered.cursor, &[]);
+            let cursor = if let ClientShellOverlay::ContextMenu(menu) = overlay {
+                self.hits.context_menu_rows =
+                    render::render_context_menu(&mut composed, menu, &self.config.palette)?;
+                None
+            } else {
+                let rendered = render::render_client_overlay(
+                    &mut composed,
+                    overlay,
+                    snapshot,
+                    &self.config.keybinds,
+                    &self.config.palette,
+                )?;
+                self.hits.overlay_primary = rendered.primary;
+                self.hits.overlay_clear = rendered.clear;
+                self.hits.overlay_cancel = rendered.cancel;
+                self.hits.navigator_popup = rendered.navigator_popup;
+                self.hits.navigator_search = rendered.navigator_search;
+                self.hits.navigator_rows = rendered.navigator_rows;
+                self.hits.worktree_search = rendered.worktree_search;
+                self.hits.worktree_rows = rendered.worktree_rows;
+                rendered.cursor
+            };
+            frame = FrameData::from_ratatui_buffer_with_hyperlinks(&composed, cursor, &[]);
             frame.graphics = graphics;
         }
         Some(frame)

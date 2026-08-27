@@ -325,6 +325,7 @@ pub(crate) enum ServerEvent {
         surface_rows: u16,
         cell_width_px: u32,
         cell_height_px: u32,
+        pixel_mouse: bool,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -459,7 +460,16 @@ fn pane_input_event_limit(events: &[ClientPaneInputEvent]) -> InputEventLimit {
     for event in events {
         expanded_events = expanded_events.saturating_add(match event {
             ClientPaneInputEvent::Key { repeat_count, .. } => usize::from((*repeat_count).max(1)),
-            ClientPaneInputEvent::TextCommit(_) | ClientPaneInputEvent::Paste(_) => 1,
+            ClientPaneInputEvent::Mouse {
+                kind:
+                    crate::protocol::ClientMouseKind::ScrollUp
+                    | crate::protocol::ClientMouseKind::ScrollDown,
+                lines,
+                ..
+            } => usize::from((*lines).max(1)),
+            ClientPaneInputEvent::TextCommit(_)
+            | ClientPaneInputEvent::Mouse { .. }
+            | ClientPaneInputEvent::Paste(_) => 1,
         });
         match event {
             ClientPaneInputEvent::Key {
@@ -477,6 +487,7 @@ fn pane_input_event_limit(events: &[ClientPaneInputEvent]) -> InputEventLimit {
             ClientPaneInputEvent::TextCommit(text) => {
                 input_bytes = input_bytes.saturating_add(text.len());
             }
+            ClientPaneInputEvent::Mouse { .. } => {}
             ClientPaneInputEvent::Paste(text) => {
                 paste_bytes = paste_bytes.saturating_add(text.len());
             }
@@ -628,6 +639,7 @@ pub(crate) fn handle_client_handshake(
         keybindings,
         direct_attach_requested,
         direct_graphics,
+        pixel_mouse,
         client_rendered_shell,
     ) = match hello {
         ClientMessage::Hello {
@@ -673,6 +685,7 @@ pub(crate) fn handle_client_handshake(
                 keybindings,
                 launch_mode == ClientLaunchMode::TerminalAttach,
                 launch_mode == ClientLaunchMode::AppDirectGraphics,
+                launch_mode == ClientLaunchMode::AppDirectGraphics,
                 false,
             )
         }
@@ -684,6 +697,7 @@ pub(crate) fn handle_client_handshake(
             cell_height_px,
             requested_encoding,
             surface_size,
+            pixel_mouse,
         } => {
             if let protocol::VersionCheck::Incompatible(reason) =
                 protocol::check_client_version(version)
@@ -720,6 +734,7 @@ pub(crate) fn handle_client_handshake(
                 None,
                 false,
                 false,
+                pixel_mouse,
                 true,
             )
         }
@@ -781,6 +796,7 @@ pub(crate) fn handle_client_handshake(
             surface_rows: client_rows,
             cell_width_px,
             cell_height_px,
+            pixel_mouse,
             writer,
         }
     } else {
@@ -1583,6 +1599,7 @@ new_tab = "ctrl+notakey"
                 cell_height_px: 16,
                 requested_encoding: RenderEncoding::SemanticFrame,
                 surface_size: crate::protocol::ClientSurfaceSize { cols: 80, rows: 29 },
+                pixel_mouse: true,
             },
         )
         .expect("write shell hello");
@@ -1607,11 +1624,13 @@ new_tab = "ctrl+notakey"
                 surface_rows,
                 cell_width_px,
                 cell_height_px,
+                pixel_mouse,
                 writer,
             } => {
                 assert_eq!(client_id, 43);
                 assert_eq!((surface_cols, surface_rows), (80, 29));
                 assert_eq!((cell_width_px, cell_height_px), (8, 16));
+                assert!(pixel_mouse);
                 drop(writer);
             }
             other => panic!("expected ClientShellConnected, got {other:?}"),
@@ -2085,6 +2104,16 @@ new_tab = "ctrl+notakey"
         };
         assert_eq!(
             input_event_limit(&[grouped]),
+            InputEventLimit::TooManyEvents
+        );
+        let oversized_scroll = ClientPaneInputEvent::Mouse {
+            kind: crate::protocol::ClientMouseKind::ScrollUp,
+            position: crate::protocol::ClientMousePosition::Cell { column: 0, row: 0 },
+            modifiers: 0,
+            lines: (MAX_INPUT_EVENT_BATCH + 1) as u16,
+        };
+        assert_eq!(
+            pane_input_event_limit(&[oversized_scroll]),
             InputEventLimit::TooManyEvents
         );
 

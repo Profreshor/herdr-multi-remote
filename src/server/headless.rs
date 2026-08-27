@@ -21,7 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crossterm::event::{KeyModifiers, MouseEventKind};
+#[cfg(test)]
+use crossterm::event::KeyModifiers;
+use crossterm::event::MouseEventKind;
 use interprocess::local_socket::traits::Listener as _;
 #[cfg(windows)]
 use interprocess::local_socket::traits::Stream as _;
@@ -49,6 +51,9 @@ use crate::protocol::{
 use crate::server::client_accept::{
     accept_pending_client_connections, reject_pending_client_connections,
 };
+use crate::server::client_shell::{
+    render_pane_surface as render_client_shell_pane_surface, snapshot as client_shell_snapshot,
+};
 use crate::server::client_transport::ServerEvent;
 use crate::server::clients::{
     events_include_interaction, latest_app_client, render_targets, terminal_stream_client_ids,
@@ -57,6 +62,9 @@ use crate::server::clients::{
 use crate::server::keybindings::{app_keybindings, apply_keybindings};
 use crate::server::notifications::{
     should_forward_toast_to_clients, toast_message_from_state_change, toast_notify_kind,
+};
+use crate::server::pane_input::{
+    apply_client_pane_input_events, apply_terminal_attach_input, apply_terminal_attach_scroll,
 };
 use crate::server::socket_paths::{
     client_socket_path, prepare_socket_path, restrict_socket_permissions,
@@ -344,126 +352,6 @@ pub struct HeadlessServer {
     server_event_tx: mpsc::Sender<ServerEvent>,
 }
 
-fn apply_terminal_attach_scroll(
-    runtime: &crate::terminal::TerminalRuntime,
-    source: AttachScrollSource,
-    direction: AttachScrollDirection,
-    lines: u16,
-    column: Option<u16>,
-    row: Option<u16>,
-    modifiers: u8,
-) -> Result<(), String> {
-    let wheel_kind = match direction {
-        AttachScrollDirection::Up => MouseEventKind::ScrollUp,
-        AttachScrollDirection::Down => MouseEventKind::ScrollDown,
-    };
-    if let AttachScrollSource::PageKey { input } = source {
-        let host_scroll = runtime
-            .plain_page_keys_use_host_scrollback()
-            .unwrap_or(false);
-        if host_scroll {
-            match direction {
-                AttachScrollDirection::Up => runtime.scroll_up(lines.max(1) as usize),
-                AttachScrollDirection::Down => runtime.scroll_down(lines.max(1) as usize),
-            }
-            return Ok(());
-        }
-        return apply_terminal_attach_input(runtime, input);
-    }
-
-    match runtime.wheel_routing() {
-        Some(crate::pane::WheelRouting::MouseReport) => {
-            runtime.scroll_reset();
-            let position = crate::input::mouse::Position::Cell {
-                column: column.unwrap_or(0),
-                row: row.unwrap_or(0),
-            };
-            let Some(bytes) = runtime.encode_mouse_wheel(
-                wheel_kind,
-                position,
-                KeyModifiers::from_bits_truncate(modifiers),
-            ) else {
-                return Err(format!(
-                    "failed to encode terminal attach mouse wheel event: {wheel_kind:?}"
-                ));
-            };
-            runtime
-                .try_send_bytes(Bytes::from(bytes))
-                .map_err(|err| format!("terminal attach mouse wheel input failed: {err}"))?;
-        }
-        Some(crate::pane::WheelRouting::AlternateScroll) => {
-            runtime.scroll_reset();
-            let Some(bytes) = runtime.encode_alternate_scroll(wheel_kind) else {
-                return Ok(());
-            };
-            runtime
-                .try_send_bytes(Bytes::from(bytes))
-                .map_err(|err| format!("terminal attach alternate scroll input failed: {err}"))?;
-        }
-        Some(crate::pane::WheelRouting::HostScroll) | None => match direction {
-            AttachScrollDirection::Up => runtime.scroll_up(lines.max(1) as usize),
-            AttachScrollDirection::Down => runtime.scroll_down(lines.max(1) as usize),
-        },
-    }
-    Ok(())
-}
-
-fn apply_terminal_attach_input(
-    runtime: &crate::terminal::TerminalRuntime,
-    data: Vec<u8>,
-) -> Result<(), String> {
-    runtime.scroll_reset();
-    if let Some(text) = crate::raw_input::complete_text_bracketed_paste(&data) {
-        runtime
-            .try_send_paste(text.to_owned())
-            .map_err(|err| format!("terminal attach paste failed: {err}"))
-    } else {
-        runtime
-            .try_send_bytes(Bytes::from(data))
-            .map_err(|err| format!("terminal attach input failed: {err}"))
-    }
-}
-
-fn apply_client_pane_input_events(
-    runtime: &crate::terminal::TerminalRuntime,
-    events: &[crate::protocol::ClientPaneInputEvent],
-) -> Result<(), String> {
-    runtime.scroll_reset();
-    for event in events {
-        match event.to_raw_input_event() {
-            crate::raw_input::RawInputEvent::Key(key) => {
-                let bytes = runtime.encode_terminal_key(key);
-                if !bytes.is_empty() {
-                    runtime
-                        .try_send_bytes(Bytes::from(bytes))
-                        .map_err(|err| format!("targeted pane key input failed: {err}"))?;
-                }
-            }
-            crate::raw_input::RawInputEvent::Text(text) => {
-                runtime
-                    .try_send_bytes(Bytes::copy_from_slice(text.as_str().as_bytes()))
-                    .map_err(|err| format!("targeted pane text input failed: {err}"))?;
-            }
-            crate::raw_input::RawInputEvent::Paste(text) => {
-                runtime
-                    .try_send_paste(text)
-                    .map_err(|err| format!("targeted pane paste failed: {err}"))?;
-            }
-            crate::raw_input::RawInputEvent::Mouse(_)
-            | crate::raw_input::RawInputEvent::OuterFocusGained
-            | crate::raw_input::RawInputEvent::OuterFocusLost
-            | crate::raw_input::RawInputEvent::HostDefaultColor { .. }
-            | crate::raw_input::RawInputEvent::HostPaletteColors { .. }
-            | crate::raw_input::RawInputEvent::HostColorSchemeChanged(_)
-            | crate::raw_input::RawInputEvent::HostCellSizeReport { .. }
-            | crate::raw_input::RawInputEvent::Unsupported => {
-                return Err("non-pane input reached targeted pane input".to_owned());
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(windows)]
 fn spawn_windows_client_accept_thread(
     listener: LocalListener,
@@ -507,101 +395,6 @@ fn spawn_windows_client_accept_thread(
             });
         }
     });
-}
-
-fn client_shell_snapshot(
-    app: &app::App,
-    boot_id: &str,
-    revision: u64,
-) -> protocol::ClientShellSnapshot {
-    let snapshot = app.session_snapshot();
-    let workspaces = snapshot
-        .workspaces
-        .into_iter()
-        .zip(&app.state.workspaces)
-        .map(|(workspace, state)| {
-            let mut tokens = workspace.tokens.into_iter().collect::<Vec<_>>();
-            tokens.sort_by(|left, right| left.0.cmp(&right.0));
-            protocol::ClientShellWorkspace {
-                workspace_id: workspace.workspace_id,
-                number: workspace.number,
-                label: workspace.label,
-                custom_label: state.custom_name.is_some(),
-                branch: state.branch(),
-                git_ahead_behind: state.git_ahead_behind(),
-                tokens,
-                worktree: workspace
-                    .worktree
-                    .map(|worktree| protocol::ClientShellWorktree {
-                        key: worktree.repo_key,
-                        label: worktree.repo_name,
-                        is_linked_worktree: worktree.is_linked_worktree,
-                    }),
-                focused: workspace.focused,
-                agent_status: workspace.agent_status,
-            }
-        })
-        .collect();
-    let tabs = snapshot
-        .tabs
-        .into_iter()
-        .zip(
-            app.state
-                .workspaces
-                .iter()
-                .flat_map(|workspace| workspace.tabs.iter()),
-        )
-        .map(|(tab, state)| protocol::ClientShellTab {
-            tab_id: tab.tab_id,
-            workspace_id: tab.workspace_id,
-            number: tab.number,
-            label: tab.label,
-            custom_label: !state.is_auto_named(),
-            zoomed: state.zoomed,
-            focused: tab.focused,
-            agent_status: tab.agent_status,
-        })
-        .collect();
-    let panes = snapshot
-        .panes
-        .into_iter()
-        .map(|pane| protocol::ClientShellPane {
-            pane_id: pane.pane_id,
-            workspace_id: pane.workspace_id,
-            tab_id: pane.tab_id,
-            label: pane.label,
-            cwd: pane.cwd,
-            foreground_cwd: pane.foreground_cwd,
-            focused: pane.focused,
-        })
-        .collect();
-    let agents = snapshot
-        .agents
-        .into_iter()
-        .map(|agent| protocol::ClientShellAgent {
-            pane_id: agent.pane_id,
-            workspace_id: agent.workspace_id,
-            tab_id: agent.tab_id,
-            name: agent.name,
-            display_agent: agent.display_agent,
-            agent: agent.agent,
-            title: agent.title,
-            agent_status: agent.agent_status,
-            focused: agent.focused,
-        })
-        .collect();
-
-    protocol::ClientShellSnapshot {
-        boot_id: boot_id.to_owned(),
-        revision,
-        focused_workspace_id: snapshot.focused_workspace_id,
-        focused_tab_id: snapshot.focused_tab_id,
-        focused_pane_id: snapshot.focused_pane_id,
-        workspaces,
-        tabs,
-        panes,
-        agents,
-    }
 }
 
 impl HeadlessServer {
@@ -1267,14 +1060,29 @@ impl HeadlessServer {
         let Some(client) = self.clients.get(&client_id) else {
             return;
         };
+        let client_shell = matches!(client.mode, ClientConnectionMode::ClientShell);
+        let cell_size = client.cell_size;
         let (cols, rows) = self.effective_size;
         let area = Rect::new(0, 0, cols, rows);
-        if self.app.state.kitty_graphics_enabled && client.cell_size.is_known() {
+        if client_shell {
+            let cell_size = if cell_size.is_known() {
+                cell_size
+            } else {
+                Default::default()
+            };
+            crate::ui::compute_tab_surface(
+                &self.app.state,
+                &self.app.terminal_runtimes,
+                area,
+                true,
+                cell_size,
+            );
+        } else if self.app.state.kitty_graphics_enabled && cell_size.is_known() {
             crate::ui::compute_view_with_cell_size(
                 &mut self.app.state,
                 &self.app.terminal_runtimes,
                 area,
-                client.cell_size,
+                cell_size,
             );
         } else {
             crate::ui::compute_view_with_runtime_registry(
@@ -3220,6 +3028,7 @@ impl HeadlessServer {
                 surface_rows,
                 cell_width_px,
                 cell_height_px,
+                pixel_mouse,
                 writer,
             } => {
                 if self.handoff_in_progress {
@@ -3252,6 +3061,7 @@ impl HeadlessServer {
                     false,
                     Some(writer),
                 );
+                connection.pixel_mouse = pixel_mouse;
                 connection.shell_projection_revision = 1;
                 let snapshot = client_shell_snapshot(
                     &self.app,
@@ -3569,16 +3379,20 @@ impl HeadlessServer {
                 {
                     return false;
                 }
+                let foreground_changed = self.promote_client_to_foreground(client_id);
+                if foreground_changed {
+                    self.resize_shared_runtime_to_effective_size_before_input();
+                }
                 let Some((workspace_index, runtime_pane_id)) = self.app.parse_pane_id(&pane_id)
                 else {
-                    return false;
+                    return foreground_changed;
                 };
                 let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
                     &self.app.terminal_runtimes,
                     workspace_index,
                     runtime_pane_id,
                 ) else {
-                    return false;
+                    return foreground_changed;
                 };
                 if let Err(err) = apply_client_pane_input_events(runtime, &events) {
                     warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
@@ -4263,7 +4077,7 @@ impl HeadlessServer {
         let pixel_mouse_requested = self
             .clients
             .values()
-            .any(|client| client.is_full_app_client() && client.pixel_mouse);
+            .any(|client| client.is_app_surface_client() && client.pixel_mouse);
         let sgr_pixels = pixel_mouse_requested
             && self.focused_pane_graphics_demand()
             && self
@@ -4287,7 +4101,7 @@ impl HeadlessServer {
                 .is_some_and(crate::terminal::TerminalRuntime::sgr_pixel_mouse_enabled);
         let mut broken_clients: Vec<u64> = Vec::new();
         for (&client_id, client) in &mut self.clients {
-            if !client.is_full_app_client() {
+            if !client.is_app_surface_client() {
                 continue;
             }
             let client_sgr_pixels = sgr_pixels && client.pixel_mouse;
@@ -4833,36 +4647,23 @@ impl HeadlessServer {
                 }
                 ClientConnectionMode::ClientShell => {
                     let render_started = crate::render_prof::timer();
-                    let (buffer, cursor, hyperlinks, layout) =
-                        crate::server::render_stream::render_tab_surface_virtual(
-                            &self.app.state,
-                            &self.app.terminal_runtimes,
-                            area,
-                            is_foreground,
-                            crate::kitty_graphics::HostCellSize::default(),
-                        );
+                    let render_cell_size = if cell_size.is_known() {
+                        cell_size
+                    } else {
+                        crate::kitty_graphics::HostCellSize::default()
+                    };
+                    let (frame, panes) = render_client_shell_pane_surface(
+                        &mut self.app,
+                        area,
+                        is_foreground,
+                        render_cell_size,
+                    );
                     crate::render_prof::duration_since(
                         "full_render.render_tab_surface_virtual",
                         render_started,
                     );
-                    surface_panes = self.app.state.active.map(|ws_idx| {
-                        layout
-                            .pane_infos
-                            .iter()
-                            .filter_map(|pane| {
-                                self.app.public_pane_id(ws_idx, pane.id).map(|pane_id| {
-                                    protocol::PaneSurfacePane {
-                                        pane_id,
-                                        rect: pane.rect.into(),
-                                        inner_rect: pane.inner_rect.into(),
-                                        scrollbar_rect: pane.scrollbar_rect.map(Into::into),
-                                        focused: pane.is_focused,
-                                    }
-                                })
-                            })
-                            .collect()
-                    });
-                    FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, cursor, &hyperlinks)
+                    surface_panes = Some(panes);
+                    frame
                 }
                 ClientConnectionMode::TerminalAttach { terminal_id }
                 | ClientConnectionMode::TerminalObserve { terminal_id } => {
@@ -6375,7 +6176,11 @@ mod tests {
         let pane_id = workspace.focused_pane_id().expect("focused pane");
         workspace.insert_test_runtime(
             pane_id,
-            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 23, b"CLIENT_SHELL_LIVE"),
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(
+                80,
+                23,
+                b"\x1b[?1003h\x1b[?1006h\x1b[?1016hCLIENT_SHELL_LIVE",
+            ),
         );
         server.app.state.workspaces = vec![workspace];
         server.app.state.active = Some(0);
@@ -6388,8 +6193,9 @@ mod tests {
                 client_id: 7,
                 surface_cols: 80,
                 surface_rows: 23,
-                cell_width_px: 0,
-                cell_height_px: 0,
+                cell_width_px: 10,
+                cell_height_px: 20,
+                pixel_mouse: true,
                 writer,
             })
         );
@@ -6411,6 +6217,15 @@ mod tests {
                 assert_eq!(surface.panes.len(), 1);
                 assert_eq!(surface.panes[0].rect.x, 0);
                 assert_eq!(surface.panes[0].rect.y, 0);
+                assert!(surface.panes[0].sgr_pixel_mouse);
+                assert_eq!(
+                    surface.panes[0].pixel_width,
+                    u32::from(surface.panes[0].inner_rect.width) * 10
+                );
+                assert_eq!(
+                    surface.panes[0].pixel_height,
+                    u32::from(surface.panes[0].inner_rect.height) * 20
+                );
             }
             other => panic!("expected pane surface, got {other:?}"),
         }
@@ -6439,6 +6254,7 @@ mod tests {
                 surface_rows: 23,
                 cell_width_px: 0,
                 cell_height_px: 0,
+                pixel_mouse: false,
                 writer,
             })
         );
@@ -6476,7 +6292,7 @@ mod tests {
     #[tokio::test]
     async fn client_shell_input_targets_runtime_without_server_shell_classification() {
         let mut server = test_headless_server();
-        let mut input_rx = install_focused_test_runtime(&mut server, b"");
+        let mut input_rx = install_focused_test_runtime(&mut server, b"\x1b[?1000h\x1b[?1006h");
         let pane_id = server.app.session_snapshot().focused_pane_id.unwrap();
         server.clients.insert(
             11,
@@ -6523,6 +6339,14 @@ mod tests {
                         shifted_codepoint: None,
                         generated_text: None,
                     },
+                    crate::protocol::ClientPaneInputEvent::Mouse {
+                        kind: crate::protocol::ClientMouseKind::Down(
+                            crate::protocol::ClientMouseButton::Left,
+                        ),
+                        position: crate::protocol::ClientMousePosition::Cell { column: 2, row: 1 },
+                        modifiers: 0,
+                        lines: 3,
+                    },
                 ],
             })
         );
@@ -6534,6 +6358,32 @@ mod tests {
             input_rx.try_recv().expect("targeted pane alt key"),
             Bytes::from_static(b"\x1bx")
         );
+        assert_eq!(
+            input_rx.try_recv().expect("targeted pane mouse click"),
+            Bytes::from_static(b"\x1b[<0;3;2M")
+        );
+        assert_eq!(server.foreground_client_id, Some(11));
+        let (workspace_index, runtime_pane_id) = server
+            .app
+            .parse_pane_id(
+                server
+                    .app
+                    .session_snapshot()
+                    .focused_pane_id
+                    .as_deref()
+                    .expect("focused pane id"),
+            )
+            .expect("runtime pane target");
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(
+                &server.app.terminal_runtimes,
+                workspace_index,
+                runtime_pane_id,
+            )
+            .expect("focused runtime");
+        assert_eq!(runtime.current_size(), (24, 79));
         assert!(input_rx.try_recv().is_err(), "legacy release emitted bytes");
         shutdown_test_runtimes(&mut server);
     }
@@ -7729,6 +7579,192 @@ next_tab = ""
         .expect("scroll down");
         let metrics = runtime.scroll_metrics().expect("scroll metrics");
         assert_eq!(metrics.offset_from_bottom, 1);
+        drop(runtime);
+        drop(_runtime_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn client_pane_pixel_mouse_uses_runtime_pixel_encoding() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = rt.enter();
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                20,
+                5,
+                0,
+                b"\x1b[?1003h\x1b[?1006h\x1b[?1016h",
+                4,
+            );
+        runtime.resize(5, 20, 10, 20);
+
+        apply_client_pane_input_events(
+            &runtime,
+            &[crate::protocol::ClientPaneInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                position: crate::protocol::ClientMousePosition::Pixels {
+                    x: 21,
+                    y: 22,
+                    column: 2,
+                    row: 1,
+                },
+                modifiers: 0,
+                lines: 3,
+            }],
+        )
+        .expect("pixel mouse input");
+        assert_eq!(
+            input_rx.try_recv().expect("encoded pixel mouse"),
+            Bytes::from_static(b"\x1b[<35;21;22M")
+        );
+        drop(runtime);
+        drop(_runtime_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn client_pane_pixel_mouse_falls_back_to_canonical_cell_position() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = rt.enter();
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                20,
+                5,
+                0,
+                b"\x1b[?1003h\x1b[?1006h",
+                4,
+            );
+        runtime.resize(5, 20, 10, 20);
+
+        apply_client_pane_input_events(
+            &runtime,
+            &[crate::protocol::ClientPaneInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                position: crate::protocol::ClientMousePosition::Pixels {
+                    x: 21,
+                    y: 22,
+                    column: 2,
+                    row: 1,
+                },
+                modifiers: 0,
+                lines: 3,
+            }],
+        )
+        .expect("cell mouse fallback");
+        assert_eq!(
+            input_rx.try_recv().expect("encoded cell mouse"),
+            Bytes::from_static(b"\x1b[<35;3;2M")
+        );
+        drop(runtime);
+        drop(_runtime_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn client_pane_wheel_input_accumulates_scrollback_offset() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = rt.enter();
+        let mut bytes = Vec::new();
+        for line in 0..80 {
+            bytes.extend_from_slice(format!("line {line:02}\r\n").as_bytes());
+        }
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                20, 5, 4096, &bytes, 4,
+            );
+        let scroll = |kind| crate::protocol::ClientPaneInputEvent::Mouse {
+            kind,
+            position: crate::protocol::ClientMousePosition::Cell { column: 2, row: 1 },
+            modifiers: 0,
+            lines: 3,
+        };
+
+        apply_client_pane_input_events(
+            &runtime,
+            &[scroll(crate::protocol::ClientMouseKind::ScrollUp)],
+        )
+        .expect("first scroll up");
+        apply_client_pane_input_events(
+            &runtime,
+            &[scroll(crate::protocol::ClientMouseKind::ScrollUp)],
+        )
+        .expect("second scroll up");
+        assert_eq!(
+            runtime
+                .scroll_metrics()
+                .expect("scroll metrics")
+                .offset_from_bottom,
+            6
+        );
+
+        apply_client_pane_input_events(
+            &runtime,
+            &[scroll(crate::protocol::ClientMouseKind::ScrollDown)],
+        )
+        .expect("scroll down");
+        assert_eq!(
+            runtime
+                .scroll_metrics()
+                .expect("scroll metrics")
+                .offset_from_bottom,
+            3
+        );
+
+        runtime.test_process_pty_bytes(b"\x1b[?1003h\x1b[?1006h");
+        apply_client_pane_input_events(
+            &runtime,
+            &[crate::protocol::ClientPaneInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                position: crate::protocol::ClientMousePosition::Cell { column: 2, row: 1 },
+                modifiers: 0,
+                lines: 3,
+            }],
+        )
+        .expect("reported mouse motion");
+        assert_eq!(
+            runtime
+                .scroll_metrics()
+                .expect("scroll metrics")
+                .offset_from_bottom,
+            3
+        );
+        assert_eq!(
+            input_rx.try_recv().expect("reported mouse motion"),
+            Bytes::from_static(b"\x1b[<35;3;2M")
+        );
+
+        apply_client_pane_input_events(
+            &runtime,
+            &[crate::protocol::ClientPaneInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Down(
+                    crate::protocol::ClientMouseButton::Left,
+                ),
+                position: crate::protocol::ClientMousePosition::Cell { column: 2, row: 1 },
+                modifiers: 0,
+                lines: 3,
+            }],
+        )
+        .expect("mouse button");
+        assert_eq!(
+            runtime
+                .scroll_metrics()
+                .expect("scroll metrics")
+                .offset_from_bottom,
+            0
+        );
+        assert_eq!(
+            input_rx.try_recv().expect("reported mouse button"),
+            Bytes::from_static(b"\x1b[<0;3;2M")
+        );
         drop(runtime);
         drop(_runtime_guard);
         rt.shutdown_timeout(Duration::from_millis(100));

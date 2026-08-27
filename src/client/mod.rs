@@ -893,6 +893,7 @@ fn do_handshake(
             cell_height_px,
             requested_encoding,
             surface_size,
+            pixel_mouse: exact_cell_size && cfg!(unix),
         }
     } else {
         ClientMessage::Hello {
@@ -1493,6 +1494,33 @@ fn client_shell_resize_message(
     }
 }
 
+fn finish_client_shell_input(
+    state: &mut ClientState,
+    outcome: shell::ClientShellInput,
+    frame: Option<FrameData>,
+    write_stream: &mut LocalStream,
+    endpoint_tx: Option<&std::sync::mpsc::Sender<(String, crate::api::schema::Request)>>,
+) -> Result<bool, ClientError> {
+    if outcome.detach {
+        let _ = write_to_server(write_stream, &ClientMessage::Detach);
+        return Ok(true);
+    }
+    if outcome.resize {
+        let shell = state.shell.as_ref().expect("shell mode remains active");
+        let resize =
+            client_shell_resize_message(shell, state.reported_size.0, state.reported_size.1, 0, 0);
+        write_to_server(write_stream, &resize).map_err(ClientError::ConnectionLost)?;
+    }
+    dispatch_client_shell_actions(outcome.actions, endpoint_tx);
+    for request in outcome.requests {
+        write_to_server(write_stream, &request).map_err(ClientError::ConnectionLost)?;
+    }
+    if let Some(frame) = frame {
+        state.present_frame(frame);
+    }
+    Ok(false)
+}
+
 /// The main client event loop.
 ///
 /// Uses a threaded architecture:
@@ -1713,31 +1741,14 @@ async fn run_client_loop(
                             .flatten();
                         (outcome, frame)
                     };
-                    if outcome.detach {
-                        let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
+                    if finish_client_shell_input(
+                        &mut state,
+                        outcome,
+                        frame,
+                        &mut write_stream,
+                        shell_endpoint_tx.as_ref(),
+                    )? {
                         return Ok(());
-                    }
-                    if outcome.resize {
-                        let shell = state.shell.as_ref().expect("shell mode remains active");
-                        let resize = client_shell_resize_message(
-                            shell,
-                            state.reported_size.0,
-                            state.reported_size.1,
-                            0,
-                            0,
-                        );
-                        if let Err(err) = write_to_server(&mut write_stream, &resize) {
-                            return Err(ClientError::ConnectionLost(err));
-                        }
-                    }
-                    dispatch_client_shell_actions(outcome.actions, shell_endpoint_tx.as_ref());
-                    for request in outcome.requests {
-                        if let Err(err) = write_to_server(&mut write_stream, &request) {
-                            return Err(ClientError::ConnectionLost(err));
-                        }
-                    }
-                    if let Some(frame) = frame {
-                        state.present_frame(frame);
                     }
                     continue;
                 }
@@ -1836,6 +1847,27 @@ async fn run_client_loop(
             }
             #[cfg(unix)]
             ClientLoopEvent::PixelMouse(data, geometry) => {
+                if state.shell.is_some() {
+                    let (outcome, frame) = {
+                        let shell = state.shell.as_mut().expect("checked shell mode");
+                        let outcome = shell.handle_pixel_mouse(&data, geometry);
+                        let frame = outcome
+                            .repaint
+                            .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
+                            .flatten();
+                        (outcome, frame)
+                    };
+                    if finish_client_shell_input(
+                        &mut state,
+                        outcome,
+                        frame,
+                        &mut write_stream,
+                        shell_endpoint_tx.as_ref(),
+                    )? {
+                        return Ok(());
+                    }
+                    continue;
+                }
                 let message = ClientMessage::InputPixels {
                     data,
                     cols: geometry.cols,
@@ -1859,31 +1891,14 @@ async fn run_client_loop(
                             .flatten();
                         (outcome, frame)
                     };
-                    if outcome.detach {
-                        let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
+                    if finish_client_shell_input(
+                        &mut state,
+                        outcome,
+                        frame,
+                        &mut write_stream,
+                        shell_endpoint_tx.as_ref(),
+                    )? {
                         return Ok(());
-                    }
-                    if outcome.resize {
-                        let shell = state.shell.as_ref().expect("shell mode remains active");
-                        let resize = client_shell_resize_message(
-                            shell,
-                            state.reported_size.0,
-                            state.reported_size.1,
-                            0,
-                            0,
-                        );
-                        if let Err(err) = write_to_server(&mut write_stream, &resize) {
-                            return Err(ClientError::ConnectionLost(err));
-                        }
-                    }
-                    dispatch_client_shell_actions(outcome.actions, shell_endpoint_tx.as_ref());
-                    for request in outcome.requests {
-                        if let Err(err) = write_to_server(&mut write_stream, &request) {
-                            return Err(ClientError::ConnectionLost(err));
-                        }
-                    }
-                    if let Some(frame) = frame {
-                        state.present_frame(frame);
                     }
                     continue;
                 }
@@ -1940,8 +1955,11 @@ async fn run_client_loop(
             }
             ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
                 state.reported_size = (new_cols, new_rows);
-                // Resizing invalidates the host-side blit baseline.
+                // Resizing invalidates both the host-side blit baseline and pane hit geometry.
                 state.request_repaint();
+                if let Some(shell) = state.shell.as_mut() {
+                    shell.invalidate_pane_surface();
+                }
                 let msg = if let Some(shell) = &state.shell {
                     client_shell_resize_message(
                         shell,

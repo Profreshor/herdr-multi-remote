@@ -118,6 +118,20 @@ pub enum ClientMouseKind {
     ScrollRight,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClientMousePosition {
+    Cell {
+        column: u16,
+        row: u16,
+    },
+    Pixels {
+        x: u32,
+        y: u32,
+        column: u16,
+        row: u16,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientInputEvent {
     Key {
@@ -157,6 +171,12 @@ pub enum ClientPaneInputEvent {
         generated_text: Option<String>,
     },
     TextCommit(String),
+    Mouse {
+        kind: ClientMouseKind,
+        position: ClientMousePosition,
+        modifiers: u8,
+        lines: u16,
+    },
     Paste(String),
 }
 
@@ -241,7 +261,6 @@ impl ClientKeyCode {
 }
 
 impl ClientMouseButton {
-    #[cfg(any(windows, test))]
     pub(crate) fn from_crossterm(button: crossterm::event::MouseButton) -> Self {
         match button {
             crossterm::event::MouseButton::Left => Self::Left,
@@ -260,7 +279,6 @@ impl ClientMouseButton {
 }
 
 impl ClientMouseKind {
-    #[cfg(any(windows, test))]
     pub(crate) fn from_crossterm(kind: crossterm::event::MouseEventKind) -> Option<Self> {
         use crossterm::event::MouseEventKind;
         Some(match kind {
@@ -326,6 +344,23 @@ impl ClientPaneInputEvent {
             }
             Self::TextCommit(text) => {
                 crate::raw_input::RawInputEvent::Text(crate::input::TextCommit::new(text.clone()))
+            }
+            Self::Mouse {
+                kind,
+                position,
+                modifiers,
+                ..
+            } => {
+                let (column, row) = match position {
+                    ClientMousePosition::Cell { column, row }
+                    | ClientMousePosition::Pixels { column, row, .. } => (*column, *row),
+                };
+                crate::raw_input::RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                    kind: kind.to_crossterm(),
+                    column,
+                    row,
+                    modifiers: crossterm::event::KeyModifiers::from_bits_truncate(*modifiers),
+                })
             }
             Self::Paste(text) => crate::raw_input::RawInputEvent::Paste(text.clone()),
         }
@@ -524,6 +559,7 @@ pub enum ClientMessage {
         cell_height_px: u32,
         requested_encoding: RenderEncoding,
         surface_size: ClientSurfaceSize,
+        pixel_mouse: bool,
     },
 
     /// Resize the outer terminal and pane viewport of a client-owned shell.
@@ -778,6 +814,7 @@ pub struct ClientShellPane {
     pub cwd: Option<String>,
     pub foreground_cwd: Option<String>,
     pub focused: bool,
+    pub right_click_passthrough: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -801,6 +838,10 @@ pub struct PaneSurfacePane {
     pub inner_rect: SurfaceRect,
     pub scrollbar_rect: Option<SurfaceRect>,
     pub focused: bool,
+    pub mouse_reporting: bool,
+    pub sgr_pixel_mouse: bool,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
 }
 
 /// Wire-safe rectangle relative to a pane surface.
@@ -1754,6 +1795,7 @@ mod tests {
                 cwd: Some("/repo".into()),
                 foreground_cwd: Some("/repo".into()),
                 focused: true,
+                right_click_passthrough: false,
             }],
             agents: Vec::new(),
         }));

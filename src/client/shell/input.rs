@@ -9,6 +9,31 @@ impl ClientShellState {
         self.handle_raw_events(crate::raw_input::parse_raw_input_bytes_sync(data))
     }
 
+    #[cfg(any(unix, test))]
+    pub(crate) fn handle_pixel_mouse(
+        &mut self,
+        data: &[u8],
+        geometry: crate::input::mouse::HostGeometry,
+    ) -> ClientShellInput {
+        let Some((x, y)) = crate::input::mouse::parse_report(data) else {
+            return ClientShellInput::default();
+        };
+        let Some((column, row)) = geometry.cell(x, y) else {
+            return ClientShellInput::default();
+        };
+        let Some(cell_report) = crate::input::mouse::report_at_cell(data, column, row) else {
+            return ClientShellInput::default();
+        };
+        let events = crate::raw_input::parse_raw_input_bytes_sync(&cell_report);
+        if events.len() != 1 || !matches!(events[0], RawInputEvent::Mouse(_)) {
+            return ClientShellInput::default();
+        }
+        self.host_mouse_pixels = Some(crate::input::mouse::HostPixels { x, y, geometry });
+        let outcome = self.handle_raw_events(events);
+        self.host_mouse_pixels = None;
+        outcome
+    }
+
     #[cfg(windows)]
     pub(crate) fn handle_client_events(
         &mut self,
@@ -34,7 +59,7 @@ impl ClientShellState {
                     let text = text.into_string();
                     if self.insert_overlay_text(&text) {
                         outcome.repaint = true;
-                    } else if self.mode == ClientShellMode::Terminal {
+                    } else if self.overlay.is_none() && self.mode == ClientShellMode::Terminal {
                         self.push_focused_pane_event(
                             ClientPaneInputEvent::TextCommit(text),
                             &mut outcome,
@@ -44,7 +69,7 @@ impl ClientShellState {
                 RawInputEvent::Paste(text) => {
                     if self.insert_overlay_text(&text) {
                         outcome.repaint = true;
-                    } else if self.mode == ClientShellMode::Terminal {
+                    } else if self.overlay.is_none() && self.mode == ClientShellMode::Terminal {
                         self.push_focused_pane_event(
                             ClientPaneInputEvent::Paste(text),
                             &mut outcome,

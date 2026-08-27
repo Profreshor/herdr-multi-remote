@@ -252,6 +252,32 @@ impl ClientShellState {
     ) {
         use crossterm::event::KeyModifiers;
 
+        if matches!(self.overlay, Some(ClientShellOverlay::ContextMenu(_))) {
+            match key.code {
+                KeyCode::Esc => {
+                    self.overlay = None;
+                    outcome.repaint = true;
+                }
+                KeyCode::Up => {
+                    self.move_context_menu_selection(-1);
+                    outcome.repaint = true;
+                }
+                KeyCode::Down => {
+                    self.move_context_menu_selection(1);
+                    outcome.repaint = true;
+                }
+                KeyCode::Enter => {
+                    let highlighted = match self.overlay.as_ref() {
+                        Some(ClientShellOverlay::ContextMenu(menu)) => menu.highlighted,
+                        _ => return,
+                    };
+                    self.activate_context_menu_item(highlighted, outcome);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if self.route_worktree_overlay_key(key, outcome) {
             return;
         }

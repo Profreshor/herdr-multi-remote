@@ -12,7 +12,7 @@ impl ClientShellState {
             }
             crate::input::KeybindMatch::Action(crate::input::KeybindAction::ToggleSidebar) => {
                 self.sidebar_collapsed = !self.sidebar_collapsed;
-                self.pane_surface = None;
+                self.invalidate_pane_surface();
                 outcome.repaint = true;
                 outcome.resize = true;
             }
@@ -49,7 +49,7 @@ impl ClientShellState {
                         outcome,
                     );
                     self.reload_client_config();
-                    self.pane_surface = None;
+                    self.invalidate_pane_surface();
                     outcome.repaint = true;
                     outcome.resize = true;
                     return;

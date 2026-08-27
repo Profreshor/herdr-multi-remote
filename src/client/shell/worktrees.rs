@@ -167,12 +167,21 @@ impl ClientShellState {
         action: crate::input::KeybindAction,
         outcome: &mut ClientShellInput,
     ) {
-        use crate::api::schema::{Method, WorktreeListParams};
-        use crate::input::KeybindAction;
-
         let Some(workspace_id) = self.workspace_action_id() else {
             return;
         };
+        self.begin_worktree_action_for(action, workspace_id, outcome);
+    }
+
+    pub(super) fn begin_worktree_action_for(
+        &mut self,
+        action: crate::input::KeybindAction,
+        workspace_id: String,
+        outcome: &mut ClientShellInput,
+    ) {
+        use crate::api::schema::{Method, WorktreeListParams};
+        use crate::input::KeybindAction;
+
         let workspace = self.snapshot.as_deref().and_then(|snapshot| {
             snapshot
                 .workspaces
