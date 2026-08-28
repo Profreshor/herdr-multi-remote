@@ -174,6 +174,29 @@ pub(super) fn render_pane_surface(
     Vec<protocol::PaneSurfaceSplit>,
     Option<Box<protocol::ClientShellPopupSurface>>,
 ) {
+    let content_revisions_before = app
+        .state
+        .active
+        .and_then(|workspace_index| {
+            let workspace = app.state.workspaces.get(workspace_index)?;
+            let tab = workspace.tabs.get(workspace.active_tab)?;
+            Some(
+                tab.layout
+                    .pane_ids()
+                    .into_iter()
+                    .filter_map(|pane_id| {
+                        app.state
+                            .runtime_for_pane_in_workspace(
+                                &app.terminal_runtimes,
+                                workspace_index,
+                                pane_id,
+                            )
+                            .map(|runtime| (pane_id, runtime.content_seq()))
+                    })
+                    .collect::<std::collections::HashMap<_, _>>(),
+            )
+        })
+        .unwrap_or_default();
     let (buffer, cursor, hyperlinks, layout) =
         crate::server::render_stream::render_tab_surface_virtual(
             &app.state,
@@ -208,11 +231,29 @@ pub(super) fn render_pane_surface(
                         } else {
                             (0, 0)
                         };
+                        let content_revision = runtime.map_or(0, |runtime| {
+                            let after = runtime.content_seq();
+                            if content_revisions_before.get(&pane.id).copied() == Some(after)
+                                && after.is_multiple_of(2)
+                            {
+                                after
+                            } else {
+                                after | 1
+                            }
+                        });
                         protocol::PaneSurfacePane {
                             pane_id,
+                            content_revision,
                             rect: pane.rect.into(),
                             inner_rect: pane.inner_rect.into(),
                             scrollbar_rect: pane.scrollbar_rect.map(Into::into),
+                            scroll: runtime.and_then(|runtime| runtime.scroll_metrics()).map(
+                                |metrics| protocol::PaneSurfaceScrollMetrics {
+                                    offset_from_bottom: metrics.offset_from_bottom as u64,
+                                    max_offset_from_bottom: metrics.max_offset_from_bottom as u64,
+                                    viewport_rows: metrics.viewport_rows as u64,
+                                },
+                            ),
                             focused: pane.is_focused,
                             mouse_reporting,
                             sgr_pixel_mouse,

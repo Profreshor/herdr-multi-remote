@@ -65,7 +65,8 @@ use crate::server::notifications::{
     should_forward_toast_to_clients, toast_message_from_state_change, toast_notify_kind,
 };
 use crate::server::pane_input::{
-    apply_client_pane_input_events, apply_terminal_attach_input, apply_terminal_attach_scroll,
+    apply_client_pane_input_events, apply_client_popup_input_events, apply_terminal_attach_input,
+    apply_terminal_attach_scroll,
 };
 use crate::server::socket_paths::{
     client_socket_path, prepare_socket_path, restrict_socket_permissions,
@@ -3689,7 +3690,7 @@ impl HeadlessServer {
                 let Some(runtime) = self.app.terminal_runtimes.get(&popup_terminal_id) else {
                     return foreground_changed;
                 };
-                if let Err(err) = apply_client_pane_input_events(runtime, &events) {
+                if let Err(err) = apply_client_popup_input_events(runtime, &events) {
                     warn!(client_id, terminal_id, err = %err, "targeted client popup input failed");
                 }
                 true
@@ -8283,6 +8284,153 @@ next_tab = ""
             0,
         )
         .expect("page key");
+    }
+
+    fn client_page_key(
+        code: crate::protocol::ClientKeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+        kind: crate::protocol::ClientKeyKind,
+    ) -> crate::protocol::ClientPaneInputEvent {
+        crate::protocol::ClientPaneInputEvent::Key {
+            code,
+            modifiers: modifiers.bits(),
+            kind,
+            repeat_count: 1,
+            shifted_codepoint: None,
+            generated_text: None,
+        }
+    }
+
+    #[test]
+    fn client_plain_page_keys_scroll_shell_transcript_by_pane_height() {
+        with_terminal_attach_runtime(b"", 0, |runtime, input_rx| {
+            apply_client_pane_input_events(
+                runtime,
+                &[client_page_key(
+                    crate::protocol::ClientKeyCode::PageUp,
+                    crossterm::event::KeyModifiers::empty(),
+                    crate::protocol::ClientKeyKind::Press,
+                )],
+            )
+            .expect("pane PageUp");
+            assert_eq!(
+                runtime
+                    .scroll_metrics()
+                    .expect("scroll metrics")
+                    .offset_from_bottom,
+                5
+            );
+
+            apply_client_pane_input_events(
+                runtime,
+                &[client_page_key(
+                    crate::protocol::ClientKeyCode::PageUp,
+                    crossterm::event::KeyModifiers::empty(),
+                    crate::protocol::ClientKeyKind::Release,
+                )],
+            )
+            .expect("pane PageUp release");
+            assert_eq!(
+                runtime
+                    .scroll_metrics()
+                    .expect("scroll metrics")
+                    .offset_from_bottom,
+                5
+            );
+
+            apply_client_pane_input_events(
+                runtime,
+                &[client_page_key(
+                    crate::protocol::ClientKeyCode::PageDown,
+                    crossterm::event::KeyModifiers::empty(),
+                    crate::protocol::ClientKeyKind::Press,
+                )],
+            )
+            .expect("pane PageDown");
+            assert_eq!(
+                runtime
+                    .scroll_metrics()
+                    .expect("scroll metrics")
+                    .offset_from_bottom,
+                0
+            );
+            assert!(input_rx.try_recv().is_err(), "page keys reached the shell");
+        });
+    }
+
+    #[test]
+    fn client_page_keys_forward_when_modified_or_owned_by_application() {
+        with_terminal_attach_runtime(b"", 0, |runtime, input_rx| {
+            apply_client_pane_input_events(
+                runtime,
+                &[client_page_key(
+                    crate::protocol::ClientKeyCode::PageUp,
+                    crossterm::event::KeyModifiers::CONTROL,
+                    crate::protocol::ClientKeyKind::Press,
+                )],
+            )
+            .expect("modified pane PageUp");
+            assert!(
+                input_rx.try_recv().is_ok(),
+                "modified PageUp was not forwarded"
+            );
+            assert_eq!(
+                runtime
+                    .scroll_metrics()
+                    .expect("scroll metrics")
+                    .offset_from_bottom,
+                0
+            );
+        });
+
+        with_terminal_attach_runtime(b"\x1b[?1h", 0, |runtime, input_rx| {
+            apply_client_pane_input_events(
+                runtime,
+                &[client_page_key(
+                    crate::protocol::ClientKeyCode::PageUp,
+                    crossterm::event::KeyModifiers::empty(),
+                    crate::protocol::ClientKeyKind::Press,
+                )],
+            )
+            .expect("application PageUp");
+            assert_eq!(
+                input_rx.try_recv().expect("forwarded application PageUp"),
+                Bytes::from_static(b"\x1b[5~")
+            );
+            assert_eq!(
+                runtime
+                    .scroll_metrics()
+                    .expect("scroll metrics")
+                    .offset_from_bottom,
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn client_popup_plain_page_key_remains_popup_input() {
+        with_terminal_attach_runtime(b"", 0, |runtime, input_rx| {
+            apply_client_popup_input_events(
+                runtime,
+                &[client_page_key(
+                    crate::protocol::ClientKeyCode::PageUp,
+                    crossterm::event::KeyModifiers::empty(),
+                    crate::protocol::ClientKeyKind::Press,
+                )],
+            )
+            .expect("popup PageUp");
+            assert_eq!(
+                input_rx.try_recv().expect("forwarded popup PageUp"),
+                Bytes::from_static(b"\x1b[5~")
+            );
+            assert_eq!(
+                runtime
+                    .scroll_metrics()
+                    .expect("scroll metrics")
+                    .offset_from_bottom,
+                0
+            );
+        });
     }
 
     #[test]

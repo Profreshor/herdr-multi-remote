@@ -437,7 +437,7 @@ impl AppState {
         };
         let end_col = info.inner_rect.width.saturating_sub(1);
         let metrics = self.pane_scroll_metrics(terminal_runtimes, pane_id);
-        let anchor_row = Selection::absolute_row_for_viewport(cursor_row, metrics);
+        let anchor_row = crate::selection::absolute_row_for_viewport(cursor_row, metrics);
         self.selection = Some(Selection::line_range(
             pane_id, anchor_row, anchor_row, end_col,
         ));
@@ -861,7 +861,7 @@ impl AppState {
             CopyModeSelection::Linewise { anchor_row } => {
                 let metrics = self.pane_scroll_metrics(terminal_runtimes, copy_mode.pane_id);
                 let cursor_row =
-                    Selection::absolute_row_for_viewport(copy_mode.cursor_row, metrics);
+                    crate::selection::absolute_row_for_viewport(copy_mode.cursor_row, metrics);
                 self.selection = Some(Selection::line_range(
                     copy_mode.pane_id,
                     anchor_row,
@@ -889,7 +889,7 @@ fn viewport_top_row(metrics: crate::pane::ScrollMetrics) -> u32 {
         .min(u32::MAX as usize) as u32
 }
 
-fn search_match_index(
+pub(crate) fn search_match_index(
     matches: &[crate::pane::TerminalTextMatch],
     direction: CopyModeSearchDirection,
     cursor: crate::pane::TerminalTextPoint,
@@ -926,7 +926,7 @@ enum WordMotion {
     NextBigEnd,
 }
 
-fn first_non_blank_col(text: &str) -> Option<u16> {
+pub(crate) fn first_non_blank_col(text: &str) -> Option<u16> {
     let mut col = 0u16;
     for ch in text.chars() {
         if !ch.is_whitespace() {
@@ -937,7 +937,7 @@ fn first_non_blank_col(text: &str) -> Option<u16> {
     None
 }
 
-fn last_character_col(text: &str) -> Option<u16> {
+pub(crate) fn last_character_col(text: &str) -> Option<u16> {
     let mut col = 0u16;
     let mut last_col = None;
     for ch in text.chars() {
@@ -954,7 +954,7 @@ fn char_cell_width(ch: char) -> u16 {
     u16::from(crate::ghostty::unicode_codepoint_width(ch as u32)).max(1)
 }
 
-fn copy_mode_page_lines(height: u16, half_page: bool) -> usize {
+pub(crate) fn copy_mode_page_lines(height: u16, half_page: bool) -> usize {
     if height <= 2 {
         1
     } else if half_page {
@@ -964,7 +964,7 @@ fn copy_mode_page_lines(height: u16, half_page: bool) -> usize {
     }
 }
 
-fn copy_mode_command_char(key: TerminalKey) -> Option<char> {
+pub(crate) fn copy_mode_command_char(key: TerminalKey) -> Option<char> {
     if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
         return None;
     }

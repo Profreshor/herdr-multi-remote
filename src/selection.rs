@@ -32,9 +32,9 @@ enum Phase {
 
 /// A text selection within a terminal pane.
 #[derive(Debug, Clone)]
-pub struct Selection {
+pub struct Selection<P = PaneId> {
     /// Which pane the selection belongs to.
-    pub pane_id: PaneId,
+    pub pane_id: P,
     /// Anchor position in screen-buffer coordinates (row, col).
     anchor: (u32, u16),
     /// Current/final position in screen-buffer coordinates (row, col).
@@ -43,15 +43,10 @@ pub struct Selection {
     phase: Phase,
 }
 
-impl Selection {
+impl<P> Selection<P> {
     /// Start a potential selection. This records the anchor but doesn't
     /// make anything visible yet — the user might just be clicking.
-    pub fn anchor(
-        pane_id: PaneId,
-        viewport_row: u16,
-        col: u16,
-        metrics: Option<ScrollMetrics>,
-    ) -> Self {
+    pub fn anchor(pane_id: P, viewport_row: u16, col: u16, metrics: Option<ScrollMetrics>) -> Self {
         let anchor = (absolute_row_for_viewport_row(viewport_row, metrics), col);
         Self {
             pane_id,
@@ -63,7 +58,7 @@ impl Selection {
 
     /// Create an active selection from an explicit viewport-row range.
     pub(crate) fn range(
-        pane_id: PaneId,
+        pane_id: P,
         viewport_row: u16,
         start_col: u16,
         end_col: u16,
@@ -78,12 +73,25 @@ impl Selection {
         }
     }
 
-    pub(crate) fn line_range(
-        pane_id: PaneId,
-        anchor_row: u32,
-        cursor_row: u32,
-        end_col: u16,
-    ) -> Self {
+    pub(crate) fn absolute_anchor(pane_id: P, anchor: (u32, u16)) -> Self {
+        Self {
+            pane_id,
+            anchor,
+            cursor: anchor,
+            phase: Phase::Anchored,
+        }
+    }
+
+    pub(crate) fn absolute_range(pane_id: P, anchor: (u32, u16), cursor: (u32, u16)) -> Self {
+        Self {
+            pane_id,
+            anchor,
+            cursor,
+            phase: Phase::Dragging,
+        }
+    }
+
+    pub(crate) fn line_range(pane_id: P, anchor_row: u32, cursor_row: u32, end_col: u16) -> Self {
         let (anchor_col, cursor_col) = if anchor_row <= cursor_row {
             (0, end_col)
         } else {
@@ -95,13 +103,6 @@ impl Selection {
             cursor: (cursor_row, cursor_col),
             phase: Phase::Dragging,
         }
-    }
-
-    pub(crate) fn absolute_row_for_viewport(
-        viewport_row: u16,
-        metrics: Option<ScrollMetrics>,
-    ) -> u32 {
-        absolute_row_for_viewport_row(viewport_row, metrics)
     }
 
     /// Convert the anchor's absolute row and pane-relative column back to
@@ -238,6 +239,10 @@ fn viewport_top_row(metrics: Option<ScrollMetrics>) -> u32 {
                 .saturating_sub(metrics.offset_from_bottom)
         })
         .unwrap_or(0) as u32
+}
+
+pub(crate) fn absolute_row_for_viewport(viewport_row: u16, metrics: Option<ScrollMetrics>) -> u32 {
+    absolute_row_for_viewport_row(viewport_row, metrics)
 }
 
 fn absolute_row_for_viewport_row(viewport_row: u16, metrics: Option<ScrollMetrics>) -> u32 {

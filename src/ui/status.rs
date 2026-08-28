@@ -1,4 +1,5 @@
 use ratatui::{
+    buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -136,18 +137,29 @@ pub(super) fn render_copy_feedback(
     position: ToastClipboardPosition,
     p: &Palette,
 ) {
+    render_copy_feedback_buffer(frame.buffer_mut(), area, feedback, offset_rows, position, p);
+}
+
+pub(crate) fn render_copy_feedback_buffer(
+    buffer: &mut Buffer,
+    area: Rect,
+    feedback: &CopyFeedback,
+    offset_rows: u16,
+    position: ToastClipboardPosition,
+    p: &Palette,
+) {
     let feedback_area = copy_feedback_rect(area, feedback, offset_rows, position);
     if feedback_area.is_empty() {
         return;
     }
 
-    frame.render_widget(Clear, feedback_area);
+    ratatui::widgets::Widget::render(Clear, feedback_area, buffer);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.green))
         .style(Style::default().bg(p.panel_bg));
     let inner = block.inner(feedback_area);
-    frame.render_widget(block, feedback_area);
+    ratatui::widgets::Widget::render(block, feedback_area, buffer);
 
     if inner.height == 0 {
         return;
@@ -164,7 +176,7 @@ pub(super) fn render_copy_feedback(
                 .add_modifier(Modifier::BOLD),
         ),
     ]);
-    frame.render_widget(Paragraph::new(text), inner);
+    ratatui::widgets::Widget::render(Paragraph::new(text), inner, buffer);
 }
 
 pub(super) fn render_config_diagnostic(frame: &mut Frame, area: Rect, message: &str, p: &Palette) {

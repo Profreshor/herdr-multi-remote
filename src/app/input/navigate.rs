@@ -955,7 +955,7 @@ impl App {
         }
     }
 
-    fn open_focused_scrollback_in_editor(&mut self) -> std::io::Result<()> {
+    pub(crate) fn open_focused_scrollback_in_editor(&mut self) -> std::io::Result<()> {
         let ws_idx = self
             .state
             .active

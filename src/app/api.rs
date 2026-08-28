@@ -1102,6 +1102,19 @@ impl App {
                 return self.handle_pane_focus_direction(request.id, params);
             }
             Method::PaneResize(params) => return self.handle_pane_resize(request.id, params),
+            Method::PaneScroll(params) => return self.handle_pane_scroll(request.id, params),
+            Method::PaneEditScrollback(target) => {
+                return self.handle_pane_edit_scrollback(request.id, target);
+            }
+            Method::PaneSelectionRead(params) => {
+                return self.handle_pane_selection_read(request.id, params);
+            }
+            Method::PaneCopyMotion(params) => {
+                return self.handle_pane_copy_motion(request.id, params);
+            }
+            Method::PaneCopySearch(params) => {
+                return self.handle_pane_copy_search(request.id, params);
+            }
             Method::PaneList(params) => return self.handle_pane_list(request.id, params),
             Method::PaneCurrent(params) => return self.handle_pane_current(request.id, params),
             Method::PaneGet(target) => return self.handle_pane_get(request.id, target),

@@ -1,4 +1,5 @@
 use ratatui::{
+    buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -388,9 +389,9 @@ pub(super) fn render_panes(
                 false,
             );
             render_selection_highlight(
-                &app.selection,
-                frame,
-                info.id,
+                app.selection.as_ref(),
+                frame.buffer_mut(),
+                &info.id,
                 info.inner_rect,
                 rt.scroll_metrics(),
                 &app.palette,
@@ -839,26 +840,25 @@ fn render_copy_mode_search_highlights(
     }
 }
 
-fn render_selection_highlight(
-    selection: &Option<crate::selection::Selection>,
-    frame: &mut Frame,
-    pane_id: crate::layout::PaneId,
+pub(crate) fn render_selection_highlight<P: PartialEq>(
+    selection: Option<&crate::selection::Selection<P>>,
+    buffer: &mut Buffer,
+    pane_id: &P,
     inner: Rect,
     scroll_metrics: Option<crate::pane::ScrollMetrics>,
     p: &Palette,
     host_theme: crate::terminal_theme::TerminalTheme,
 ) {
-    if let Some(sel) = selection {
-        if sel.is_visible() && sel.pane_id == pane_id {
-            let buf = frame.buffer_mut();
-            let style = automatic_selection_style(p, host_theme);
-            for y in 0..inner.height {
-                for x in 0..inner.width {
-                    if sel.contains(y, x, scroll_metrics) {
-                        let cell = &mut buf[(inner.x + x, inner.y + y)];
-                        cell.set_style(style);
-                    }
-                }
+    let Some(selection) =
+        selection.filter(|selection| selection.is_visible() && &selection.pane_id == pane_id)
+    else {
+        return;
+    };
+    let style = automatic_selection_style(p, host_theme);
+    for y in 0..inner.height {
+        for x in 0..inner.width {
+            if selection.contains(y, x, scroll_metrics) {
+                buffer[(inner.x + x, inner.y + y)].set_style(style);
             }
         }
     }
@@ -1552,9 +1552,9 @@ mod tests {
                 );
                 buf[(2, 0)].set_style(Style::default().fg(Color::Blue).bg(Color::Reset));
                 render_selection_highlight(
-                    &selection,
-                    frame,
-                    PaneId::from_raw(1),
+                    selection.as_ref(),
+                    frame.buffer_mut(),
+                    &PaneId::from_raw(1),
                     Rect::new(0, 0, 4, 1),
                     None,
                     &palette,

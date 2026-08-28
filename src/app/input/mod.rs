@@ -37,7 +37,7 @@ fn modified_url_click_modifier_matches_terminal_mouse_reporting() {
 }
 
 mod clipboard;
-mod copy_mode;
+pub(crate) mod copy_mode;
 mod modal;
 mod mouse;
 mod navigate;

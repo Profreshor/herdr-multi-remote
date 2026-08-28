@@ -138,6 +138,12 @@ impl ClientShellState {
                     outcome.repaint = true;
                     return;
                 }
+                if action == crate::input::KeybindAction::CopyMode {
+                    if self.enter_copy_mode(outcome) {
+                        outcome.repaint = true;
+                    }
+                    return;
+                }
                 if let Some(method) = self.endpoint_method_for_action(action) {
                     self.push_endpoint_method(method, outcome);
                     return;
@@ -188,6 +194,83 @@ impl ClientShellState {
                 }
             }
         }
+    }
+
+    pub(super) fn request_selection_copy(&mut self, outcome: &mut ClientShellInput) {
+        let Some(selection) = self.selection.as_ref() else {
+            return;
+        };
+        let pane_id = selection.pane_id.clone();
+        let content_revision = self
+            .pane_surface
+            .as_ref()
+            .and_then(|surface| surface.panes.iter().find(|pane| pane.pane_id == pane_id))
+            .map(|pane| pane.content_revision);
+        let (anchor, cursor) = selection.ordered_cells();
+        self.push_endpoint_method_with_kind(
+            crate::api::schema::Method::PaneSelectionRead(
+                crate::api::schema::PaneSelectionReadParams {
+                    pane_id,
+                    anchor: crate::api::schema::PaneTextPoint {
+                        row: anchor.0,
+                        col: anchor.1,
+                    },
+                    cursor: crate::api::schema::PaneTextPoint {
+                        row: cursor.0,
+                        col: cursor.1,
+                    },
+                    content_revision,
+                },
+            ),
+            PendingEndpointKind::SelectionCopy,
+            outcome,
+        );
+    }
+
+    pub(super) fn request_word_selection(
+        &mut self,
+        hit: &PaneHit,
+        viewport_row: u16,
+        col: u16,
+        outcome: &mut ClientShellInput,
+    ) {
+        let absolute_row = crate::selection::absolute_row_for_viewport(viewport_row, hit.scroll);
+        let content_revision = self
+            .pane_surface
+            .as_ref()
+            .and_then(|surface| {
+                surface
+                    .panes
+                    .iter()
+                    .find(|pane| pane.pane_id == hit.pane_id)
+            })
+            .map(|pane| pane.content_revision);
+        self.word_selection_generation = self.word_selection_generation.saturating_add(1);
+        let generation = self.word_selection_generation;
+        self.pending_word_selection = Some(generation);
+        self.push_endpoint_method_with_kind(
+            crate::api::schema::Method::PaneSelectionRead(
+                crate::api::schema::PaneSelectionReadParams {
+                    pane_id: hit.pane_id.clone(),
+                    anchor: crate::api::schema::PaneTextPoint {
+                        row: absolute_row,
+                        col: 0,
+                    },
+                    cursor: crate::api::schema::PaneTextPoint {
+                        row: absolute_row,
+                        col: hit.inner_rect.width.saturating_sub(1),
+                    },
+                    content_revision,
+                },
+            ),
+            PendingEndpointKind::WordSelection {
+                pane_id: hit.pane_id.clone(),
+                absolute_row,
+                col,
+                generation,
+            },
+            outcome,
+        );
     }
 
     pub(super) fn push_endpoint_method(
@@ -273,6 +356,195 @@ impl ClientShellState {
                         (true, Vec::new())
                     }
                 };
+            }
+            PendingEndpointKind::PaneScroll { pane_id, serial } => {
+                let mut outcome = ClientShellInput::default();
+                let repaint = self.complete_pane_scroll(pane_id, serial, result, &mut outcome);
+                return (repaint, outcome.actions);
+            }
+            PendingEndpointKind::SelectionCopy => {
+                return match result {
+                    Ok(crate::api::schema::ResponseResult::PaneSelection { text, .. })
+                        if !text.is_empty() =>
+                    {
+                        if self.config.clipboard_toast_enabled {
+                            self.copy_feedback = Some(crate::app::state::CopyFeedback {
+                                message: "copied to clipboard".to_owned(),
+                            });
+                            self.copy_feedback_deadline =
+                                Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                        }
+                        (
+                            self.config.clipboard_toast_enabled,
+                            vec![ClientShellAction::ClipboardWrite(text.into_bytes())],
+                        )
+                    }
+                    Ok(crate::api::schema::ResponseResult::PaneSelection { .. }) => {
+                        (false, Vec::new())
+                    }
+                    Ok(_) => {
+                        self.endpoint_error =
+                            Some("endpoint returned an unexpected selection result".to_owned());
+                        (true, Vec::new())
+                    }
+                    Err(error) => {
+                        self.endpoint_error = Some(error.message);
+                        (true, Vec::new())
+                    }
+                };
+            }
+            PendingEndpointKind::WordSelection {
+                pane_id,
+                absolute_row,
+                col,
+                generation,
+            } => {
+                if self.pending_word_selection != Some(generation)
+                    || self.snapshot.as_deref().is_none_or(|snapshot| {
+                        !snapshot.panes.iter().any(|pane| pane.pane_id == pane_id)
+                    })
+                {
+                    return (false, Vec::new());
+                }
+                self.pending_word_selection = None;
+                let row_text = match result {
+                    Ok(crate::api::schema::ResponseResult::PaneSelection {
+                        pane_id: returned_pane_id,
+                        text,
+                    }) if returned_pane_id == pane_id => text,
+                    Ok(crate::api::schema::ResponseResult::PaneSelection { .. }) => {
+                        return (false, Vec::new())
+                    }
+                    Ok(_) => {
+                        self.endpoint_error = Some(
+                            "endpoint returned an unexpected word-selection result".to_owned(),
+                        );
+                        return (true, Vec::new());
+                    }
+                    Err(error) => {
+                        self.endpoint_error = Some(error.message);
+                        return (true, Vec::new());
+                    }
+                };
+                let Some((start_col, end_col)) =
+                    crate::app::actions::word_bounds_at_column(&row_text, col)
+                else {
+                    self.selection = None;
+                    return (true, Vec::new());
+                };
+                let mut selection = crate::selection::Selection::absolute_range(
+                    pane_id,
+                    (absolute_row, start_col),
+                    (absolute_row, end_col),
+                );
+                if !selection.finish() {
+                    return (false, Vec::new());
+                }
+                self.selection = Some(selection);
+                self.selection_autoscroll = None;
+                self.selection_autoscroll_deadline = None;
+                if !self.config.copy_on_select {
+                    return (true, Vec::new());
+                }
+                self.selection_highlight_clear_deadline =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+                let mut outcome = ClientShellInput::default();
+                self.request_selection_copy(&mut outcome);
+                return (true, outcome.actions);
+            }
+            PendingEndpointKind::CopyMotion {
+                pane_id,
+                origin,
+                session_generation,
+            } => {
+                let mut outcome = ClientShellInput::default();
+                let (repaint, continue_queue) = match result {
+                    Ok(crate::api::schema::ResponseResult::PaneCopyMotion {
+                        pane_id: returned_pane_id,
+                        cursor,
+                        content_revision,
+                    }) if returned_pane_id == pane_id => (
+                        self.apply_copy_motion_target(
+                            &pane_id,
+                            origin,
+                            cursor,
+                            content_revision,
+                            &mut outcome,
+                        ),
+                        true,
+                    ),
+                    Ok(crate::api::schema::ResponseResult::PaneCopyMotion { .. }) => (false, false),
+                    Ok(_) => {
+                        self.endpoint_error =
+                            Some("endpoint returned an unexpected copy-motion result".to_owned());
+                        (true, false)
+                    }
+                    Err(error) => {
+                        self.endpoint_error = Some(error.message);
+                        (true, false)
+                    }
+                };
+                self.complete_copy_operation(session_generation, continue_queue, &mut outcome);
+                return (repaint || outcome.repaint, outcome.actions);
+            }
+            PendingEndpointKind::CopySearch {
+                pane_id,
+                origin,
+                query,
+                direction,
+                repeat,
+                generation,
+                session_generation,
+            } => {
+                let mut outcome = ClientShellInput::default();
+                let (repaint, continue_queue) = match result {
+                    Ok(crate::api::schema::ResponseResult::PaneCopySearch {
+                        pane_id: returned_pane_id,
+                        content_revision,
+                        matches,
+                        total,
+                        current,
+                        current_global,
+                    }) if returned_pane_id == pane_id => {
+                        let repaint = self.apply_copy_search_result(
+                            &pane_id,
+                            origin,
+                            query,
+                            direction,
+                            repeat,
+                            generation,
+                            ClientCopySearchResult {
+                                content_revision,
+                                matches,
+                                total,
+                                current: current.and_then(|index| usize::try_from(index).ok()),
+                                current_global,
+                            },
+                            &mut outcome,
+                        );
+                        if !repaint {
+                            self.cancel_deferred_copy_after_search(generation);
+                        }
+                        (repaint, repaint)
+                    }
+                    Ok(crate::api::schema::ResponseResult::PaneCopySearch { .. }) => {
+                        self.cancel_deferred_copy_after_search(generation);
+                        (false, false)
+                    }
+                    Ok(_) => {
+                        self.cancel_deferred_copy_after_search(generation);
+                        self.endpoint_error =
+                            Some("endpoint returned an unexpected copy-search result".to_owned());
+                        (true, false)
+                    }
+                    Err(error) => {
+                        self.cancel_deferred_copy_after_search(generation);
+                        self.endpoint_error = Some(error.message);
+                        (true, false)
+                    }
+                };
+                self.complete_copy_operation(session_generation, continue_queue, &mut outcome);
+                return (repaint || outcome.repaint, outcome.actions);
             }
             PendingEndpointKind::ReloadConfig => {
                 let repaint = match result {
@@ -560,6 +832,9 @@ impl ClientShellState {
             KeybindAction::Zoom => Some(Method::PaneZoom(PaneZoomParams {
                 pane_id: focused_pane,
                 mode: PaneZoomMode::Toggle,
+            })),
+            KeybindAction::EditScrollback => Some(Method::PaneEditScrollback(PaneTarget {
+                pane_id: focused_pane?,
             })),
             KeybindAction::ResizePaneLeft
             | KeybindAction::ResizePaneDown

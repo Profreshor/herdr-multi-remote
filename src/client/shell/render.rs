@@ -17,6 +17,7 @@ pub(super) fn render_mode_bar(
     buffer: &mut Buffer,
     pane_area: Rect,
     mode: ClientShellMode,
+    copy_mode: Option<&ClientCopyModeState>,
     endpoint_error: Option<&str>,
     keybinds: &LiveKeybindConfig,
     palette: &Palette,
@@ -103,6 +104,59 @@ pub(super) fn render_mode_bar(
                     ("esc".to_owned(), key),
                     (" done".to_owned(), base),
                 ]);
+            }
+            ClientShellMode::Copy => {
+                let copy_mode = copy_mode?;
+                if let Some(prompt) = copy_mode.search_prompt.as_ref() {
+                    let marker = match prompt.direction {
+                        crate::api::schema::PaneCopySearchDirection::Forward => "/",
+                        crate::api::schema::PaneCopySearchDirection::Backward => "?",
+                    };
+                    segments.extend([
+                        (" COPY ".to_owned(), mode_style),
+                        (" ".to_owned(), base),
+                        (marker.to_owned(), key),
+                        (
+                            prompt.query.clone(),
+                            Style::default().fg(palette.text).bg(palette.panel_bg),
+                        ),
+                        ("█".to_owned(), key),
+                        ("  enter search  esc cancel".to_owned(), base),
+                    ]);
+                } else {
+                    let select = if copy_mode.selection.is_some() {
+                        "selecting"
+                    } else {
+                        "select"
+                    };
+                    let match_status = copy_mode
+                        .search_current_global
+                        .map(|current| format!(" {}/{}", current + 1, copy_mode.search_total))
+                        .or_else(|| (!copy_mode.search_query.is_empty()).then(|| " 0/0".to_owned()))
+                        .unwrap_or_default();
+                    let (exit_keys, exit_label) =
+                        if copy_mode.search_query.is_empty() && copy_mode.selection.is_none() {
+                            ("q/esc", " exit")
+                        } else {
+                            ("esc", " clear  q exit")
+                        };
+                    segments.extend([
+                        (" COPY ".to_owned(), mode_style),
+                        (" ".to_owned(), base),
+                        ("h/j/k/l w/b/e { }".to_owned(), key),
+                        (" move  ".to_owned(), base),
+                        ("/ ?".to_owned(), key),
+                        (" search  ".to_owned(), base),
+                        ("n/N".to_owned(), key),
+                        (format!(" repeat{match_status}  "), base),
+                        ("v/space".to_owned(), key),
+                        (format!(" {select}  "), base),
+                        ("y/enter".to_owned(), key),
+                        (" copy  ".to_owned(), base),
+                        (exit_keys.to_owned(), key),
+                        (exit_label.to_owned(), base),
+                    ]);
+                }
             }
             ClientShellMode::Terminal => unreachable!(),
         }

@@ -157,6 +157,16 @@ pub enum Method {
     PaneFocusDirection(PaneFocusDirectionParams),
     #[serde(rename = "pane.resize")]
     PaneResize(PaneResizeParams),
+    #[serde(rename = "pane.scroll")]
+    PaneScroll(PaneScrollParams),
+    #[serde(rename = "pane.edit_scrollback")]
+    PaneEditScrollback(PaneTarget),
+    #[serde(rename = "pane.selection.read")]
+    PaneSelectionRead(PaneSelectionReadParams),
+    #[serde(rename = "pane.copy_motion")]
+    PaneCopyMotion(PaneCopyMotionParams),
+    #[serde(rename = "pane.copy_search")]
+    PaneCopySearch(PaneCopySearchParams),
     #[serde(rename = "pane.list")]
     PaneList(PaneListParams),
     #[serde(rename = "pane.current")]

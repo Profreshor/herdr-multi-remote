@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use crossterm::event::{KeyModifiers, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 
 use crate::protocol::{AttachScrollDirection, AttachScrollSource, ClientPaneInputEvent};
 
@@ -104,6 +104,21 @@ pub(super) fn apply_client_pane_input_events(
     runtime: &crate::terminal::TerminalRuntime,
     events: &[ClientPaneInputEvent],
 ) -> Result<(), String> {
+    apply_client_terminal_input_events(runtime, events, true)
+}
+
+pub(super) fn apply_client_popup_input_events(
+    runtime: &crate::terminal::TerminalRuntime,
+    events: &[ClientPaneInputEvent],
+) -> Result<(), String> {
+    apply_client_terminal_input_events(runtime, events, false)
+}
+
+fn apply_client_terminal_input_events(
+    runtime: &crate::terminal::TerminalRuntime,
+    events: &[ClientPaneInputEvent],
+    host_page_keys: bool,
+) -> Result<(), String> {
     for event in events {
         if let ClientPaneInputEvent::Mouse {
             kind,
@@ -172,9 +187,29 @@ pub(super) fn apply_client_pane_input_events(
             continue;
         }
 
-        runtime.scroll_reset();
         match event.to_raw_input_event() {
             crate::raw_input::RawInputEvent::Key(key) => {
+                let key_event = key.as_key_event();
+                if host_page_keys
+                    && matches!(key_event.code, KeyCode::PageUp | KeyCode::PageDown)
+                    && key_event.modifiers.is_empty()
+                    && runtime.plain_page_keys_use_host_scrollback() == Some(true)
+                {
+                    match key_event.kind {
+                        KeyEventKind::Release => continue,
+                        KeyEventKind::Press | KeyEventKind::Repeat => {
+                            let lines = runtime.current_size().0.max(1) as usize;
+                            if key_event.code == KeyCode::PageUp {
+                                runtime.scroll_up(lines);
+                            } else {
+                                runtime.scroll_down(lines);
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                runtime.scroll_reset();
                 let bytes = runtime.encode_terminal_key(key);
                 if !bytes.is_empty() {
                     runtime
@@ -183,11 +218,13 @@ pub(super) fn apply_client_pane_input_events(
                 }
             }
             crate::raw_input::RawInputEvent::Text(text) => {
+                runtime.scroll_reset();
                 runtime
                     .try_send_bytes(Bytes::copy_from_slice(text.as_str().as_bytes()))
                     .map_err(|err| format!("targeted pane text input failed: {err}"))?;
             }
             crate::raw_input::RawInputEvent::Paste(text) => {
+                runtime.scroll_reset();
                 runtime
                     .try_send_paste(text)
                     .map_err(|err| format!("targeted pane paste failed: {err}"))?;

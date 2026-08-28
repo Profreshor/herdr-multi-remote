@@ -17,7 +17,7 @@ mod creation;
 mod custom_commands;
 mod git_refresh;
 mod ids;
-mod input;
+pub(crate) mod input;
 pub(crate) mod pane_graphics;
 mod popup;
 mod runtime;

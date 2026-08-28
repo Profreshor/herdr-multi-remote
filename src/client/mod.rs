@@ -1467,6 +1467,9 @@ fn dispatch_client_shell_actions(
                     warn!("client shell endpoint worker unavailable");
                 }
             }
+            shell::ClientShellAction::ClipboardWrite(bytes) => {
+                crate::selection::write_osc52_bytes(&bytes);
+            }
             shell::ClientShellAction::Keybind(action) => {
                 debug!(
                     ?action,
@@ -1726,9 +1729,15 @@ async fn run_client_loop(
 
     // Main event loop.
     while !should_quit.load(Ordering::Acquire) {
+        let timer_delay = state
+            .shell
+            .as_ref()
+            .map_or(Duration::from_millis(100), |shell| {
+                shell.timer_delay(std::time::Instant::now())
+            });
         let event = tokio::select! {
             ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
-            _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
+            _ = tokio::time::sleep(timer_delay) => ClientLoopEvent::Timer,
         };
         let now = std::time::Instant::now();
         if let Some(shell) = state.shell.as_mut() {
@@ -2253,17 +2262,26 @@ async fn run_client_loop(
                     matcher.expire();
                 }
                 if state.shell.is_some() {
-                    let (effects, frame) = {
+                    let (effects, outcome, frame) = {
                         let shell = state.shell.as_mut().expect("checked shell mode");
-                        let (effects, repaint) = shell.tick_notifications(now);
-                        let frame = repaint
+                        let (effects, notification_repaint) = shell.tick_notifications(now);
+                        let mut outcome = shell.tick_selection_autoscroll(now);
+                        outcome.repaint |= notification_repaint | shell.tick_copy_feedback(now);
+                        let frame = outcome
+                            .repaint
                             .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
                             .flatten();
-                        (effects, frame)
+                        (effects, outcome, frame)
                     };
                     handle_shell_notification_effects(effects, &state.sound_config);
-                    if let Some(frame) = frame {
-                        state.present_frame(frame);
+                    if finish_client_shell_input(
+                        &mut state,
+                        outcome,
+                        frame,
+                        &mut write_stream,
+                        shell_endpoint_tx.as_ref(),
+                    )? {
+                        return Ok(());
                     }
                 }
             }

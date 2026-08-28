@@ -733,6 +733,33 @@ impl FrameData {
         }
     }
 
+    pub(crate) fn replace_from_ratatui_buffer_preserving_effects(
+        &mut self,
+        buffer: &ratatui::buffer::Buffer,
+        cursor: Option<CursorState>,
+    ) {
+        let width = self.width;
+        let hyperlinks = if width == 0 {
+            Vec::new()
+        } else {
+            self.cells
+                .iter()
+                .enumerate()
+                .filter_map(|(index, cell)| {
+                    let uri = self.hyperlinks.get(cell.hyperlink? as usize)?;
+                    let x = u16::try_from(index % usize::from(width)).ok()?;
+                    let y = u16::try_from(index / usize::from(width)).ok()?;
+                    Some(((x, y), cell.symbol.clone(), uri.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        let graphics = std::mem::take(&mut self.graphics);
+        let mut replacement =
+            Self::from_ratatui_buffer_with_hyperlinks(buffer, cursor, &hyperlinks);
+        replacement.graphics = graphics;
+        *self = replacement;
+    }
+
     /// Reconstructs a ratatui `Buffer` from this frame data.
     ///
     /// Returns `None` if the cells vector length doesn't match `width * height`.
@@ -882,14 +909,23 @@ pub struct ClientShellAgent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSurfacePane {
     pub pane_id: String,
+    pub content_revision: u64,
     pub rect: SurfaceRect,
     pub inner_rect: SurfaceRect,
     pub scrollbar_rect: Option<SurfaceRect>,
+    pub scroll: Option<PaneSurfaceScrollMetrics>,
     pub focused: bool,
     pub mouse_reporting: bool,
     pub sgr_pixel_mouse: bool,
     pub pixel_width: u32,
     pub pixel_height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSurfaceScrollMetrics {
+    pub offset_from_bottom: u64,
+    pub max_offset_from_bottom: u64,
+    pub viewport_rows: u64,
 }
 
 /// One draggable BSP split handle relative to a pane surface.

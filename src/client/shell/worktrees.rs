@@ -511,7 +511,12 @@ impl ClientShellState {
                 | PendingEndpointKind::PopupCommand
                 | PendingEndpointKind::ReloadConfig
                 | PendingEndpointKind::IntegrationList
-                | PendingEndpointKind::IntegrationInstall,
+                | PendingEndpointKind::IntegrationInstall
+                | PendingEndpointKind::SelectionCopy
+                | PendingEndpointKind::PaneScroll { .. }
+                | PendingEndpointKind::WordSelection { .. }
+                | PendingEndpointKind::CopyMotion { .. }
+                | PendingEndpointKind::CopySearch { .. },
                 Err(error),
             ) => {
                 self.endpoint_error = Some(error.message);

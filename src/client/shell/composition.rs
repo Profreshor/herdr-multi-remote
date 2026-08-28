@@ -64,6 +64,21 @@ impl ClientShellState {
                     pane.inner_rect.width,
                     pane.inner_rect.height,
                 ),
+                scrollbar_rect: pane.scrollbar_rect.map(|rect| {
+                    Rect::new(
+                        layout.pane_surface.x.saturating_add(rect.x),
+                        layout.pane_surface.y.saturating_add(rect.y),
+                        rect.width,
+                        rect.height,
+                    )
+                }),
+                scroll: pane.scroll.map(|metrics| crate::pane::ScrollMetrics {
+                    offset_from_bottom: usize::try_from(metrics.offset_from_bottom)
+                        .unwrap_or(usize::MAX),
+                    max_offset_from_bottom: usize::try_from(metrics.max_offset_from_bottom)
+                        .unwrap_or(usize::MAX),
+                    viewport_rows: usize::try_from(metrics.viewport_rows).unwrap_or(usize::MAX),
+                }),
                 pane_id: pane.pane_id.clone(),
                 popup: false,
                 mouse_reporting: pane.mouse_reporting,
@@ -109,6 +124,7 @@ impl ClientShellState {
             &mut buffer,
             layout.pane_surface,
             self.mode,
+            self.copy_mode.as_ref(),
             self.endpoint_error.as_deref(),
             &self.config.keybinds,
             &self.config.palette,
@@ -119,9 +135,108 @@ impl ClientShellState {
             frame.cells[start..start + usize::from(bar.width)].to_vec()
         });
         blit_pane_surface(&mut frame, &surface.frame, layout.pane_surface);
-        if let (Some(bar), Some(cells)) = (mode_bar, mode_bar_cells) {
+        if let (Some(bar), Some(cells)) = (mode_bar, mode_bar_cells.as_ref()) {
             let start = usize::from(bar.y) * usize::from(frame.width) + usize::from(bar.x);
-            frame.cells[start..start + usize::from(bar.width)].clone_from_slice(&cells);
+            frame.cells[start..start + usize::from(bar.width)].clone_from_slice(cells);
+            if frame
+                .cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.y == bar.y)
+            {
+                frame.cursor = None;
+            }
+        }
+        let has_selection = self
+            .selection
+            .as_ref()
+            .is_some_and(|selection| selection.is_visible());
+        let has_search = self
+            .copy_mode
+            .as_ref()
+            .is_some_and(|copy_mode| !copy_mode.search_matches.is_empty());
+        if has_selection || has_search {
+            let cursor = frame.cursor.clone();
+            let mut composed = frame.to_ratatui_buffer()?;
+            for hit in &self.hits.panes {
+                let copy_surface_coherent =
+                    client_copy_surface_coherent(self.copy_mode.as_ref(), hit);
+                if copy_surface_coherent {
+                    render_client_copy_search_highlights(
+                        &mut composed,
+                        self.copy_mode.as_ref(),
+                        hit,
+                        &self.config.palette,
+                        false,
+                    );
+                }
+                let selection_is_stale_copy_projection = !copy_surface_coherent
+                    && self.copy_mode.as_ref().is_some_and(|copy_mode| {
+                        copy_mode.pane_id == hit.pane_id
+                            && self
+                                .selection
+                                .as_ref()
+                                .is_some_and(|selection| selection.pane_id == hit.pane_id)
+                    });
+                if !selection_is_stale_copy_projection {
+                    crate::ui::render_selection_highlight(
+                        self.selection.as_ref(),
+                        &mut composed,
+                        &hit.pane_id,
+                        hit.inner_rect,
+                        hit.scroll,
+                        &self.config.palette,
+                        crate::terminal_theme::TerminalTheme::default(),
+                    );
+                }
+                if copy_surface_coherent {
+                    render_client_copy_search_highlights(
+                        &mut composed,
+                        self.copy_mode.as_ref(),
+                        hit,
+                        &self.config.palette,
+                        true,
+                    );
+                }
+            }
+            frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
+        }
+        if self.mode == ClientShellMode::Copy {
+            frame.cursor = None;
+            if let Some(copy_mode) = self.copy_mode.as_ref() {
+                if let Some(hit) = self.hits.panes.iter().find(|hit| {
+                    hit.pane_id == copy_mode.pane_id
+                        && client_copy_surface_coherent(Some(copy_mode), hit)
+                }) {
+                    let viewport_top = copy_mode
+                        .max_offset_from_bottom
+                        .saturating_sub(copy_mode.offset_from_bottom)
+                        .min(u32::MAX as usize) as u32;
+                    let viewport_row = copy_mode.cursor.row.saturating_sub(viewport_top);
+                    if viewport_row < u32::from(hit.inner_rect.height)
+                        && copy_mode.cursor.col < hit.inner_rect.width
+                    {
+                        let mut composed = frame.to_ratatui_buffer()?;
+                        let x = hit.inner_rect.x + copy_mode.cursor.col;
+                        let y = hit.inner_rect.y + viewport_row as u16;
+                        composed[(x, y)].set_style(
+                            Style::default()
+                                .fg(match self.config.palette.panel_bg {
+                                    ratatui::style::Color::Reset => self.config.palette.surface_dim,
+                                    color => color,
+                                })
+                                .bg(self.config.palette.accent)
+                                .add_modifier(Modifier::BOLD),
+                        );
+                        frame.replace_from_ratatui_buffer_preserving_effects(&composed, None);
+                    } else {
+                        frame.cursor = None;
+                    }
+                }
+            }
+        }
+        if let (Some(bar), Some(cells)) = (mode_bar, mode_bar_cells.as_ref()) {
+            let start = usize::from(bar.y) * usize::from(frame.width) + usize::from(bar.x);
+            frame.cells[start..start + usize::from(bar.width)].clone_from_slice(cells);
             if frame
                 .cursor
                 .as_ref()
@@ -132,7 +247,6 @@ impl ClientShellState {
         }
         self.hits.notification_toast = Rect::default();
         if let Some(notification) = self.visible_notification.as_ref() {
-            let graphics = std::mem::take(&mut frame.graphics);
             let cursor = frame.cursor.clone();
             let mut composed = frame.to_ratatui_buffer()?;
             self.hits.notification_toast = notifications::render_visible_notification(
@@ -142,8 +256,20 @@ impl ClientShellState {
                 self.config.toast_position,
                 &self.config.palette,
             );
-            frame = FrameData::from_ratatui_buffer_with_hyperlinks(&composed, cursor, &[]);
-            frame.graphics = graphics;
+            frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
+        }
+        if let Some(feedback) = self.copy_feedback.as_ref() {
+            let cursor = frame.cursor.clone();
+            let mut composed = frame.to_ratatui_buffer()?;
+            crate::ui::render_copy_feedback_buffer(
+                &mut composed,
+                layout.pane_surface,
+                feedback,
+                0,
+                self.config.clipboard_toast_position,
+                &self.config.palette,
+            );
+            frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
         }
         self.hits.popup = None;
         if let Some(popup) = surface.popup.as_deref() {
@@ -152,7 +278,6 @@ impl ClientShellState {
             if let Some(geometry) =
                 crate::popup_size::resolve_popup_geometry(width, height, layout.pane_surface)
             {
-                let graphics = std::mem::take(&mut frame.graphics);
                 let mut composed = frame.to_ratatui_buffer()?;
                 let block = ratatui::widgets::Block::default()
                     .borders(ratatui::widgets::Borders::ALL)
@@ -165,12 +290,13 @@ impl ClientShellState {
                     &mut composed,
                 );
                 ratatui::widgets::Widget::render(block, geometry.outer, &mut composed);
-                frame = FrameData::from_ratatui_buffer_with_hyperlinks(&composed, None, &[]);
-                frame.graphics = graphics;
+                frame.replace_from_ratatui_buffer_preserving_effects(&composed, None);
                 blit_pane_surface(&mut frame, &popup.frame, geometry.inner);
                 self.hits.popup = Some(PaneHit {
                     rect: geometry.outer,
                     inner_rect: geometry.inner,
+                    scrollbar_rect: None,
+                    scroll: None,
                     pane_id: popup.terminal_id.clone(),
                     popup: true,
                     mouse_reporting: popup.mouse_reporting,
@@ -181,7 +307,6 @@ impl ClientShellState {
             }
         }
         if let Some(overlay) = self.overlay.as_ref() {
-            let graphics = std::mem::take(&mut frame.graphics);
             let mut composed = frame.to_ratatui_buffer()?;
             let cursor = if let ClientShellOverlay::ContextMenu(menu) = overlay {
                 self.hits.context_menu_rows =
@@ -220,13 +345,82 @@ impl ClientShellState {
                 self.hits.settings_choices = rendered.settings_choices;
                 rendered.cursor
             };
-            frame = FrameData::from_ratatui_buffer_with_hyperlinks(&composed, cursor, &[]);
-            frame.graphics = graphics;
+            frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
         }
         if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
             help.scroll = help.scroll.min(self.hits.help_max_scroll);
         }
         Some(frame)
+    }
+}
+
+fn client_copy_surface_coherent(copy_mode: Option<&ClientCopyModeState>, hit: &PaneHit) -> bool {
+    copy_mode
+        .filter(|copy_mode| copy_mode.pane_id == hit.pane_id)
+        .is_none_or(|copy_mode| {
+            copy_mode.geometry == (hit.inner_rect.width, hit.inner_rect.height)
+                && hit.scroll.is_some_and(|scroll| {
+                    scroll.offset_from_bottom == copy_mode.offset_from_bottom
+                        && scroll.max_offset_from_bottom == copy_mode.max_offset_from_bottom
+                })
+        })
+}
+
+fn render_client_copy_search_highlights(
+    buffer: &mut Buffer,
+    copy_mode: Option<&ClientCopyModeState>,
+    hit: &PaneHit,
+    palette: &Palette,
+    current_only: bool,
+) {
+    let Some(copy_mode) = copy_mode.filter(|copy_mode| copy_mode.pane_id == hit.pane_id) else {
+        return;
+    };
+    if hit.inner_rect.is_empty() {
+        return;
+    }
+    let top = copy_mode
+        .max_offset_from_bottom
+        .saturating_sub(copy_mode.offset_from_bottom)
+        .min(u32::MAX as usize) as u32;
+    let bottom = top.saturating_add(u32::from(hit.inner_rect.height.saturating_sub(1)));
+    let style = if current_only {
+        Style::default()
+            .fg(panel_contrast_fg(palette))
+            .bg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.text).bg(palette.surface1)
+    };
+    for (index, text_match) in copy_mode.search_matches.iter().enumerate() {
+        if (copy_mode.search_current == Some(index)) != current_only
+            || text_match.end.row < top
+            || text_match.start.row > bottom
+        {
+            continue;
+        }
+        let start_row = text_match.start.row.max(top);
+        let end_row = text_match.end.row.min(bottom);
+        for absolute_row in start_row..=end_row {
+            let viewport_row = absolute_row.saturating_sub(top) as u16;
+            let start_col = if absolute_row == text_match.start.row {
+                text_match.start.col
+            } else {
+                0
+            };
+            let end_col = if absolute_row == text_match.end.row {
+                text_match.end.col
+            } else {
+                hit.inner_rect.width.saturating_sub(1)
+            };
+            for col in start_col..=end_col.min(hit.inner_rect.width.saturating_sub(1)) {
+                buffer[(
+                    hit.inner_rect.x.saturating_add(col),
+                    hit.inner_rect.y.saturating_add(viewport_row),
+                )]
+                    .set_style(style);
+            }
+        }
     }
 }
 

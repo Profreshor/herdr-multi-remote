@@ -2258,8 +2258,11 @@ impl AppState {
         let metrics = self.pane_scroll_metrics(terminal_runtimes, pane_id);
         let visible_selection = Selection::line_range(
             pane_id,
-            Selection::absolute_row_for_viewport(0, metrics),
-            Selection::absolute_row_for_viewport(info.inner_rect.height.saturating_sub(1), metrics),
+            crate::selection::absolute_row_for_viewport(0, metrics),
+            crate::selection::absolute_row_for_viewport(
+                info.inner_rect.height.saturating_sub(1),
+                metrics,
+            ),
             info.inner_rect.width.saturating_sub(1),
         );
         let visible_text = rt.extract_selection(&visible_selection)?;
@@ -2336,7 +2339,7 @@ impl CellSpan {
 /// zero-width marks use display columns, then prefers structured spans that
 /// users expect to copy whole (URLs and quoted paths), and finally falls back
 /// to a separator-delimited token.
-fn word_bounds_at_column(row: &str, col: u16) -> Option<(u16, u16)> {
+pub(crate) fn word_bounds_at_column(row: &str, col: u16) -> Option<(u16, u16)> {
     // Map the row into display cells before doing any word-boundary work.
     let cells = text_cells(row);
     let clicked_idx = cell_index_at_column(&cells, col)?;

@@ -21,6 +21,9 @@ pub(crate) struct ClientShellConfig {
     pub(super) toast_delivery: crate::config::ToastDelivery,
     pub(super) toast_delay_seconds: u64,
     pub(super) toast_position: crate::config::ToastHerdrPosition,
+    pub(super) copy_on_select: bool,
+    pub(super) clipboard_toast_enabled: bool,
+    pub(super) clipboard_toast_position: crate::config::ToastClipboardPosition,
     pub(super) theme_name: String,
     pub(super) theme_runtime: crate::app::state::ThemeRuntimeConfig,
     pub(super) palette: Palette,
@@ -93,6 +96,8 @@ pub(super) struct ShellHitMap {
 pub(super) struct PaneHit {
     pub(super) rect: Rect,
     pub(super) inner_rect: Rect,
+    pub(super) scrollbar_rect: Option<Rect>,
+    pub(super) scroll: Option<crate::pane::ScrollMetrics>,
     pub(super) pane_id: String,
     pub(super) popup: bool,
     pub(super) mouse_reporting: bool,
@@ -158,6 +163,12 @@ pub(super) enum ClientChromeDrag {
         last_sent_ratio: Option<f32>,
         last_sent_at: Option<std::time::Instant>,
     },
+    PaneScrollbar {
+        hit: PaneHit,
+        grab_row_offset: u16,
+        last_sent_offset: Option<usize>,
+        last_sent_at: Option<std::time::Instant>,
+    },
 }
 
 pub(super) struct WorkspaceHit {
@@ -173,6 +184,7 @@ pub(crate) enum ClientShellAction {
         boot_id: String,
         request: Box<crate::api::schema::Request>,
     },
+    ClipboardWrite(Vec<u8>),
     Keybind(crate::input::KeybindAction),
 }
 
@@ -192,6 +204,7 @@ pub(super) enum ClientShellMode {
     Prefix,
     Navigate,
     Resize,
+    Copy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -513,12 +526,45 @@ pub(super) enum PendingEndpointKind {
     ReloadConfig,
     IntegrationList,
     IntegrationInstall,
-    PrepareWorktreeCreate { workspace_id: String },
-    PrepareWorktreeOpen { workspace_id: String },
-    PrepareWorktreeRemove { workspace_id: String },
+    PrepareWorktreeCreate {
+        workspace_id: String,
+    },
+    PrepareWorktreeOpen {
+        workspace_id: String,
+    },
+    PrepareWorktreeRemove {
+        workspace_id: String,
+    },
     WorktreeCreate,
     WorktreeOpen,
-    WorktreeRemove { forced: bool },
+    WorktreeRemove {
+        forced: bool,
+    },
+    SelectionCopy,
+    PaneScroll {
+        pane_id: String,
+        serial: u64,
+    },
+    WordSelection {
+        pane_id: String,
+        absolute_row: u32,
+        col: u16,
+        generation: u64,
+    },
+    CopyMotion {
+        pane_id: String,
+        origin: crate::api::schema::PaneTextPoint,
+        session_generation: u64,
+    },
+    CopySearch {
+        pane_id: String,
+        origin: crate::api::schema::PaneTextPoint,
+        query: String,
+        direction: crate::api::schema::PaneCopySearchDirection,
+        repeat: bool,
+        generation: u64,
+        session_generation: u64,
+    },
 }
 
 pub(super) struct PendingEndpointRequest {
@@ -570,9 +616,99 @@ pub(super) struct ClientInputContext {
     pub(super) overlay: Option<ClientShellOverlayKind>,
     pub(super) popup_terminal_id: Option<String>,
     pub(super) popup_pending: bool,
+    pub(super) retained_selection: bool,
 }
 
 type ClientInputLeases = crate::input::InputLeaseTable<u8, ClientInputContext, ClientInputTarget>;
+
+#[derive(Clone, Debug)]
+pub(super) struct ClientPaneClick {
+    pub(super) pane_id: String,
+    pub(super) viewport_row: u16,
+    pub(super) col: u16,
+    pub(super) at: std::time::Instant,
+}
+
+impl ClientPaneClick {
+    pub(super) fn is_double_click_for(&self, next: &Self) -> bool {
+        self.pane_id == next.pane_id
+            && next.at.duration_since(self.at) <= std::time::Duration::from_millis(350)
+            && self.viewport_row.abs_diff(next.viewport_row) <= 1
+            && self.col.abs_diff(next.col) <= 1
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ClientSelectionAutoscrollDirection {
+    Up,
+    Down,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ClientSelectionAutoscroll {
+    pub(super) pane_id: String,
+    pub(super) direction: ClientSelectionAutoscrollDirection,
+    pub(super) last_mouse_column: u16,
+    pub(super) last_mouse_row: u16,
+    pub(super) inner_rect: Rect,
+    pub(super) offset_from_bottom: usize,
+    pub(super) max_offset_from_bottom: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ClientCopySelection {
+    Character {
+        anchor: crate::api::schema::PaneTextPoint,
+    },
+    Linewise {
+        anchor_row: u32,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ClientCopySearchPrompt {
+    pub(super) direction: crate::api::schema::PaneCopySearchDirection,
+    pub(super) query: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ClientCopyOperation {
+    Motion(crate::api::schema::PaneCopyMotion),
+    Search {
+        query: String,
+        direction: crate::api::schema::PaneCopySearchDirection,
+        repeat: bool,
+    },
+}
+
+pub(super) struct ClientCopySearchResult {
+    pub(super) content_revision: u64,
+    pub(super) matches: Vec<crate::api::schema::PaneTextRange>,
+    pub(super) total: u64,
+    pub(super) current: Option<usize>,
+    pub(super) current_global: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ClientCopyModeState {
+    pub(super) pane_id: String,
+    pub(super) content_revision: u64,
+    pub(super) geometry: (u16, u16),
+    pub(super) cursor: crate::api::schema::PaneTextPoint,
+    pub(super) offset_from_bottom: usize,
+    pub(super) max_offset_from_bottom: usize,
+    pub(super) entry_offset_from_bottom: usize,
+    pub(super) selection: Option<ClientCopySelection>,
+    pub(super) search_prompt: Option<ClientCopySearchPrompt>,
+    pub(super) search_query: String,
+    pub(super) search_direction: Option<crate::api::schema::PaneCopySearchDirection>,
+    pub(super) search_matches: Vec<crate::api::schema::PaneTextRange>,
+    pub(super) search_total: u64,
+    pub(super) search_current: Option<usize>,
+    pub(super) search_current_global: Option<u64>,
+    pub(super) search_generation: u64,
+    pub(super) copy_after_search: bool,
+}
 
 pub(crate) struct ClientShellState {
     pub(super) config: ClientShellConfig,
@@ -602,6 +738,24 @@ pub(crate) struct ClientShellState {
     pub(super) overlay: Option<ClientShellOverlay>,
     pub(super) previous_pane_id: Option<String>,
     pub(super) pane_mouse_gesture: Option<ClientPaneMouseGesture>,
+    pub(super) selection: Option<crate::selection::Selection<String>>,
+    pub(super) last_pane_click: Option<ClientPaneClick>,
+    pub(super) selection_autoscroll: Option<ClientSelectionAutoscroll>,
+    pub(super) selection_autoscroll_deadline: Option<std::time::Instant>,
+    pub(super) selection_highlight_clear_deadline: Option<std::time::Instant>,
+    pub(super) pending_word_selection: Option<u64>,
+    pub(super) word_selection_generation: u64,
+    pub(super) copy_mode: Option<ClientCopyModeState>,
+    pub(super) copy_session_generation: u64,
+    pub(super) copy_operation_in_flight: bool,
+    pub(super) copy_operation_queue: VecDeque<ClientCopyOperation>,
+    pub(super) copy_input_queue: VecDeque<crate::input::TerminalKey>,
+    pub(super) next_scroll_serial: u64,
+    pub(super) pane_scroll_in_flight: HashMap<String, u64>,
+    pub(super) pane_scroll_queued: HashMap<String, usize>,
+    pub(super) pane_scroll_targets: HashMap<String, usize>,
+    pub(super) copy_feedback: Option<crate::app::state::CopyFeedback>,
+    pub(super) copy_feedback_deadline: Option<std::time::Instant>,
     pub(super) host_mouse_pixels: Option<crate::input::mouse::HostPixels>,
     pub(super) input_leases: ClientInputLeases,
     pub(super) popup_pending: bool,
@@ -673,6 +827,24 @@ impl ClientShellState {
             overlay: None,
             previous_pane_id: None,
             pane_mouse_gesture: None,
+            selection: None,
+            last_pane_click: None,
+            selection_autoscroll: None,
+            selection_autoscroll_deadline: None,
+            selection_highlight_clear_deadline: None,
+            pending_word_selection: None,
+            word_selection_generation: 0,
+            copy_mode: None,
+            copy_session_generation: 0,
+            copy_operation_in_flight: false,
+            copy_operation_queue: VecDeque::new(),
+            copy_input_queue: VecDeque::new(),
+            next_scroll_serial: 0,
+            pane_scroll_in_flight: HashMap::new(),
+            pane_scroll_queued: HashMap::new(),
+            pane_scroll_targets: HashMap::new(),
+            copy_feedback: None,
+            copy_feedback_deadline: None,
             host_mouse_pixels: None,
             input_leases: ClientInputLeases::default(),
             popup_pending: false,
@@ -743,6 +915,9 @@ impl ClientShellState {
             self.reveal_focused_tab = true;
             self.last_tab_bar_width = None;
             self.pending_requests.clear();
+            self.pane_scroll_in_flight.clear();
+            self.pane_scroll_queued.clear();
+            self.pane_scroll_targets.clear();
             self.popup_pending = false;
             self.popup_pending_deadline = None;
             self.pending_integration_installs = 0;
@@ -753,6 +928,16 @@ impl ClientShellState {
             self.overlay = None;
             self.previous_pane_id = None;
             self.pane_mouse_gesture = None;
+            self.selection = None;
+            self.last_pane_click = None;
+            self.selection_autoscroll = None;
+            self.selection_autoscroll_deadline = None;
+            self.selection_highlight_clear_deadline = None;
+            self.pending_word_selection = None;
+            self.copy_mode = None;
+            self.reset_copy_pipeline();
+            self.copy_feedback = None;
+            self.copy_feedback_deadline = None;
             self.host_mouse_pixels = None;
         } else if let Some(previous) = self
             .snapshot
@@ -785,6 +970,67 @@ impl ClientShellState {
         {
             self.reveal_focused_tab = true;
         }
+        if self.selection.as_ref().is_some_and(|selection| {
+            snapshot.focused_pane_id.as_deref() != Some(selection.pane_id.as_str())
+                || !snapshot
+                    .panes
+                    .iter()
+                    .any(|pane| pane.pane_id == selection.pane_id)
+        }) {
+            self.selection = None;
+            self.selection_autoscroll = None;
+            self.selection_autoscroll_deadline = None;
+            self.selection_highlight_clear_deadline = None;
+            self.pending_word_selection = None;
+            self.last_pane_click = None;
+        }
+        if let Some(copy_pane_id) = self
+            .copy_mode
+            .as_ref()
+            .map(|copy_mode| copy_mode.pane_id.clone())
+        {
+            let pane_exists = snapshot
+                .panes
+                .iter()
+                .any(|pane| pane.pane_id == copy_pane_id);
+            let pane_focused = snapshot.focused_pane_id.as_deref() == Some(copy_pane_id.as_str());
+            if !pane_exists {
+                self.copy_mode = None;
+                self.reset_copy_pipeline();
+                if self
+                    .selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.pane_id == copy_pane_id)
+                {
+                    self.selection = None;
+                    self.stop_selection_autoscroll();
+                    self.selection_highlight_clear_deadline = None;
+                }
+                if self.mode == ClientShellMode::Copy {
+                    self.mode = ClientShellMode::Terminal;
+                }
+            } else if pane_focused {
+                if self.mode == ClientShellMode::Terminal {
+                    self.mode = ClientShellMode::Copy;
+                }
+                if self.selection.is_none() {
+                    self.sync_copy_selection();
+                }
+            } else {
+                if self
+                    .selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.pane_id == copy_pane_id)
+                {
+                    self.selection = None;
+                    self.stop_selection_autoscroll();
+                    self.selection_highlight_clear_deadline = None;
+                }
+                if self.mode == ClientShellMode::Copy {
+                    self.mode = ClientShellMode::Terminal;
+                }
+            }
+        }
         if self.mode == ClientShellMode::Navigate
             && self.navigate_workspace_id.as_ref().is_none_or(|selected| {
                 !snapshot
@@ -795,6 +1041,14 @@ impl ClientShellState {
         {
             self.navigate_workspace_id = snapshot.focused_workspace_id.clone();
         }
+        let pane_exists =
+            |pane_id: &String| snapshot.panes.iter().any(|pane| &pane.pane_id == pane_id);
+        self.pane_scroll_in_flight
+            .retain(|pane_id, _| pane_exists(pane_id));
+        self.pane_scroll_queued
+            .retain(|pane_id, _| pane_exists(pane_id));
+        self.pane_scroll_targets
+            .retain(|pane_id, _| pane_exists(pane_id));
         self.snapshot = Some(snapshot);
     }
 
@@ -819,6 +1073,14 @@ impl ClientShellState {
             self.mode = ClientShellMode::Terminal;
             self.navigate_workspace_id = None;
             self.overlay = None;
+            self.selection = None;
+            self.last_pane_click = None;
+            self.selection_autoscroll = None;
+            self.selection_autoscroll_deadline = None;
+            self.selection_highlight_clear_deadline = None;
+            self.pending_word_selection = None;
+            self.copy_mode = None;
+            self.reset_copy_pipeline();
             self.chrome_drag = None;
             self.workspace_press = None;
             self.tab_press = None;
@@ -834,6 +1096,83 @@ impl ClientShellState {
             self.popup_pending = false;
             self.popup_pending_deadline = None;
         }
+        let selection_content_changed = self.selection.as_ref().is_some_and(|selection| {
+            let previous_revision = self.pane_surface.as_ref().and_then(|previous| {
+                previous
+                    .panes
+                    .iter()
+                    .find(|pane| pane.pane_id == selection.pane_id)
+                    .map(|pane| pane.content_revision)
+            });
+            let next_revision = surface
+                .panes
+                .iter()
+                .find(|pane| pane.pane_id == selection.pane_id)
+                .map(|pane| pane.content_revision);
+            previous_revision.is_some()
+                && next_revision.is_some()
+                && previous_revision != next_revision
+        });
+        if selection_content_changed {
+            self.selection = None;
+            self.stop_selection_autoscroll();
+            self.selection_highlight_clear_deadline = None;
+        }
+        for pane in &surface.panes {
+            let Some(target) = self.pane_scroll_targets.get(&pane.pane_id).copied() else {
+                continue;
+            };
+            let Some(scroll) = pane.scroll else {
+                continue;
+            };
+            let target =
+                target.min(usize::try_from(scroll.max_offset_from_bottom).unwrap_or(usize::MAX));
+            if usize::try_from(scroll.offset_from_bottom).unwrap_or(usize::MAX) == target {
+                self.pane_scroll_targets.remove(&pane.pane_id);
+            }
+        }
+        let mut invalidated_copy_pane = None;
+        if let Some(copy_mode) = self.copy_mode.as_mut() {
+            if let Some(pane) = surface
+                .panes
+                .iter()
+                .find(|pane| pane.pane_id == copy_mode.pane_id)
+            {
+                let geometry = (pane.inner_rect.width, pane.inner_rect.height);
+                if copy_mode.content_revision != pane.content_revision
+                    || copy_mode.geometry != geometry
+                {
+                    copy_mode.content_revision = pane.content_revision;
+                    copy_mode.geometry = geometry;
+                    copy_mode.selection = None;
+                    copy_mode.search_matches.clear();
+                    copy_mode.search_total = 0;
+                    copy_mode.search_current = None;
+                    copy_mode.search_current_global = None;
+                    copy_mode.search_generation = copy_mode.search_generation.saturating_add(1);
+                    copy_mode.copy_after_search = false;
+                    invalidated_copy_pane = Some(copy_mode.pane_id.clone());
+                }
+                if let Some(scroll) = pane.scroll {
+                    let actual_offset =
+                        usize::try_from(scroll.offset_from_bottom).unwrap_or(usize::MAX);
+                    if !self.pane_scroll_targets.contains_key(&pane.pane_id) {
+                        copy_mode.offset_from_bottom = actual_offset;
+                    }
+                    copy_mode.max_offset_from_bottom =
+                        usize::try_from(scroll.max_offset_from_bottom).unwrap_or(usize::MAX);
+                }
+            }
+        }
+        if invalidated_copy_pane.as_ref().is_some_and(|pane_id| {
+            self.selection
+                .as_ref()
+                .is_some_and(|selection| &selection.pane_id == pane_id)
+        }) {
+            self.selection = None;
+            self.stop_selection_autoscroll();
+            self.selection_highlight_clear_deadline = None;
+        }
         self.popup_terminal_id = next_popup;
         self.pane_surface = Some(surface);
     }
@@ -846,6 +1185,34 @@ impl ClientShellState {
             self.popup_pending = false;
             self.popup_pending_deadline = None;
         }
+    }
+
+    pub(crate) fn tick_copy_feedback(&mut self, now: std::time::Instant) -> bool {
+        let mut repaint = false;
+        if self
+            .copy_feedback_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.copy_feedback = None;
+            self.copy_feedback_deadline = None;
+            repaint = true;
+        }
+        if self
+            .selection_highlight_clear_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.selection = None;
+            self.selection_highlight_clear_deadline = None;
+            repaint = true;
+        }
+        repaint
+    }
+
+    pub(crate) fn timer_delay(&self, now: std::time::Instant) -> std::time::Duration {
+        let default = std::time::Duration::from_millis(100);
+        self.selection_autoscroll_deadline
+            .map(|deadline| deadline.saturating_duration_since(now).min(default))
+            .unwrap_or(default)
     }
 
     pub(crate) fn invalidate_pane_surface(&mut self) {

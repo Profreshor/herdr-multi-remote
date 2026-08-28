@@ -291,6 +291,22 @@ impl TerminalRuntime {
         self.0.search_text_matches(query, case_sensitive)
     }
 
+    pub(crate) fn search_text_window(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+        direction: crate::pane::TerminalSearchDirection,
+        cursor: crate::pane::TerminalTextPoint,
+        previous: Option<(
+            crate::pane::TerminalTextPoint,
+            crate::pane::TerminalTextPoint,
+        )>,
+        limit: usize,
+    ) -> crate::pane::TerminalSearchWindow {
+        self.0
+            .search_text_window(query, case_sensitive, direction, cursor, previous, limit)
+    }
+
     pub(crate) fn text_match_is_current(&self, text_match: crate::pane::TerminalTextMatch) -> bool {
         self.0.text_match_is_current(text_match)
     }
@@ -309,6 +325,18 @@ impl TerminalRuntime {
         motion: crate::pane::TerminalWordMotion,
     ) -> Option<crate::pane::TerminalTextPoint> {
         self.0.word_motion_target(row, col, motion)
+    }
+
+    pub(crate) fn terminal_dimensions(&self) -> Option<(u16, u16)> {
+        self.0.terminal_dimensions()
+    }
+
+    pub(crate) fn paragraph_motion_target(
+        &self,
+        row: u32,
+        direction: i8,
+    ) -> Option<crate::pane::TerminalTextPoint> {
+        self.0.paragraph_motion_target(row, direction)
     }
 
     /// Collects the complete terminal input-mode snapshot.
