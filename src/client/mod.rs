@@ -1730,6 +1730,10 @@ async fn run_client_loop(
             ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
             _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
         };
+        let now = std::time::Instant::now();
+        if let Some(shell) = state.shell.as_mut() {
+            shell.tick_popup_pending(now);
+        }
 
         match event {
             #[cfg(unix)]
@@ -2251,8 +2255,7 @@ async fn run_client_loop(
                 if state.shell.is_some() {
                     let (effects, frame) = {
                         let shell = state.shell.as_mut().expect("checked shell mode");
-                        let (effects, repaint) =
-                            shell.tick_notifications(std::time::Instant::now());
+                        let (effects, repaint) = shell.tick_notifications(now);
                         let frame = repaint
                             .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
                             .flatten();

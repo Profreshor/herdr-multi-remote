@@ -52,7 +52,8 @@ use crate::server::client_accept::{
     accept_pending_client_connections, reject_pending_client_connections,
 };
 use crate::server::client_shell::{
-    render_pane_surface as render_client_shell_pane_surface, snapshot as client_shell_snapshot,
+    render_pane_surface as render_client_shell_pane_surface,
+    resize_popup_runtime as resize_client_shell_popup_runtime, snapshot as client_shell_snapshot,
 };
 use crate::server::client_transport::ServerEvent;
 use crate::server::clients::{
@@ -1082,6 +1083,8 @@ impl HeadlessServer {
             } else {
                 Default::default()
             };
+            self.app.state.view.terminal_area = area;
+            let _ = resize_client_shell_popup_runtime(&self.app, area, cell_size);
             crate::ui::compute_tab_surface(
                 &self.app.state,
                 &self.app.terminal_runtimes,
@@ -3601,14 +3604,46 @@ impl HeadlessServer {
                 {
                     return false;
                 }
+                let Some((workspace_index, runtime_pane_id)) = self.app.parse_pane_id(&pane_id)
+                else {
+                    return false;
+                };
+                if self
+                    .app
+                    .state
+                    .runtime_for_pane_in_workspace(
+                        &self.app.terminal_runtimes,
+                        workspace_index,
+                        runtime_pane_id,
+                    )
+                    .is_none()
+                {
+                    return false;
+                }
+                if self.app.state.popup_pane.is_some() {
+                    let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
+                        &self.app.terminal_runtimes,
+                        workspace_index,
+                        runtime_pane_id,
+                    ) else {
+                        return false;
+                    };
+                    let releases = events
+                        .into_iter()
+                        .filter(client_pane_input_releases_press)
+                        .collect::<Vec<_>>();
+                    if releases.is_empty() {
+                        return false;
+                    }
+                    if let Err(err) = apply_client_pane_input_events(runtime, &releases) {
+                        warn!(client_id, pane_id, err = %err, "targeted client shell release failed");
+                    }
+                    return true;
+                }
                 let foreground_changed = self.promote_client_to_foreground(client_id);
                 if foreground_changed {
                     self.resize_shared_runtime_to_effective_size_before_input();
                 }
-                let Some((workspace_index, runtime_pane_id)) = self.app.parse_pane_id(&pane_id)
-                else {
-                    return foreground_changed;
-                };
                 let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
                     &self.app.terminal_runtimes,
                     workspace_index,
@@ -3618,6 +3653,44 @@ impl HeadlessServer {
                 };
                 if let Err(err) = apply_client_pane_input_events(runtime, &events) {
                     warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
+                }
+                true
+            }
+            ServerEvent::ClientShellPopupInput {
+                client_id,
+                terminal_id,
+                events,
+            } => {
+                if self.handoff_in_progress
+                    || !self.clients.get(&client_id).is_some_and(|client| {
+                        matches!(client.mode, ClientConnectionMode::ClientShell)
+                    })
+                {
+                    return false;
+                }
+                let Some(popup_terminal_id) = self
+                    .app
+                    .state
+                    .popup_pane
+                    .as_ref()
+                    .map(|popup| popup.terminal_id.clone())
+                else {
+                    return false;
+                };
+                if popup_terminal_id.as_str() != terminal_id
+                    || self.app.terminal_runtimes.get(&popup_terminal_id).is_none()
+                {
+                    return false;
+                }
+                let foreground_changed = self.promote_client_to_foreground(client_id);
+                if foreground_changed {
+                    self.resize_shared_runtime_to_effective_size_before_input();
+                }
+                let Some(runtime) = self.app.terminal_runtimes.get(&popup_terminal_id) else {
+                    return foreground_changed;
+                };
+                if let Err(err) = apply_client_pane_input_events(runtime, &events) {
+                    warn!(client_id, terminal_id, err = %err, "targeted client popup input failed");
                 }
                 true
             }
@@ -4068,6 +4141,14 @@ impl HeadlessServer {
                 .app
                 .handle_deferred_worktree_api_request(msg.request, msg.respond_to);
             return changed | deferred_changed;
+        }
+        if self.foreground_client_id.is_some_and(|client_id| {
+            self.clients
+                .get(&client_id)
+                .is_some_and(|client| matches!(client.mode, ClientConnectionMode::ClientShell))
+        }) {
+            self.app.state.view.terminal_area =
+                Rect::new(0, 0, self.effective_size.0, self.effective_size.1);
         }
         let mut response = if matches!(
             &msg.request.method,
@@ -4879,7 +4960,7 @@ impl HeadlessServer {
                     } else {
                         crate::kitty_graphics::HostCellSize::default()
                     };
-                    let (frame, panes, splits) = render_client_shell_pane_surface(
+                    let (frame, panes, splits, popup) = render_client_shell_pane_surface(
                         &mut self.app,
                         area,
                         is_foreground,
@@ -4889,7 +4970,7 @@ impl HeadlessServer {
                         "full_render.render_tab_surface_virtual",
                         render_started,
                     );
-                    surface_parts = Some((panes, splits));
+                    surface_parts = Some((panes, splits, popup));
                     frame
                 }
                 ClientConnectionMode::TerminalAttach { terminal_id }
@@ -4989,7 +5070,7 @@ impl HeadlessServer {
                 encoded.incomplete = false;
             }
             let has_graphics = !frame.graphics.is_empty();
-            let prepared = if let Some((panes, splits)) = surface_parts {
+            let prepared = if let Some((panes, splits, popup)) = surface_parts {
                 client
                     .render_state
                     .prepare_pane_surface(protocol::PaneSurfaceFrame {
@@ -4997,6 +5078,7 @@ impl HeadlessServer {
                         frame,
                         panes,
                         splits,
+                        popup,
                     })
             } else {
                 client.render_state.prepare_frame(frame)
@@ -5306,6 +5388,19 @@ impl HeadlessServer {
 
 // Pane applications render their own motion responses through PTY output. Only Herdr modes with
 // hover selection mutate the current frame directly from a plain mouse-move event.
+fn client_pane_input_releases_press(event: &protocol::ClientPaneInputEvent) -> bool {
+    matches!(
+        event,
+        protocol::ClientPaneInputEvent::Key {
+            kind: protocol::ClientKeyKind::Release,
+            ..
+        } | protocol::ClientPaneInputEvent::Mouse {
+            kind: protocol::ClientMouseKind::Up(_),
+            ..
+        }
+    )
+}
+
 fn events_are_render_neutral_mouse_motion(
     events: &[crate::raw_input::RawInputEvent],
     mode: crate::app::Mode,
@@ -6613,6 +6708,111 @@ mod tests {
             .expect("focused runtime");
         assert_eq!(runtime.current_size(), (24, 79));
         assert!(input_rx.try_recv().is_err(), "legacy release emitted bytes");
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn client_shell_streams_and_targets_popup_terminal_content() {
+        let mut server = test_headless_server();
+        let mut pane_input = install_focused_test_runtime(&mut server, b"base-pane");
+        let (popup_runtime, mut popup_input) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                40,
+                12,
+                0,
+                b"POPUP_SHELL_LIVE",
+                4,
+            );
+        let (_, popup_terminal_id) = server.app.install_test_popup_runtime(popup_runtime);
+
+        let (writer, control_rx, render_rx) = test_client_writer();
+        assert!(
+            server.handle_server_event(ServerEvent::ClientShellConnected {
+                client_id: 12,
+                surface_cols: 80,
+                surface_rows: 23,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                pixel_mouse: false,
+                writer,
+            })
+        );
+        assert!(matches!(
+            read_server_message(control_rx.recv().expect("shell snapshot")),
+            ServerMessage::ClientShellSnapshot(_)
+        ));
+
+        server.render_and_stream();
+        let ServerMessage::PaneSurface(surface) =
+            read_server_message(render_rx.recv().expect("popup surface"))
+        else {
+            panic!("expected pane surface");
+        };
+        let popup = surface.popup.as_deref().expect("popup terminal surface");
+        assert_eq!(popup.terminal_id, popup_terminal_id.as_str());
+        assert!(frame_text(&popup.frame).contains("POPUP_SHELL_LIVE"));
+        assert_eq!((popup.frame.width, popup.frame.height), (37, 9));
+
+        assert!(
+            !server.handle_server_event(ServerEvent::ClientShellPaneInput {
+                client_id: 12,
+                pane_id: server.app.session_snapshot().focused_pane_id.unwrap(),
+                events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
+                    "must-not-leak".into(),
+                )],
+            })
+        );
+        assert!(pane_input.try_recv().is_err());
+
+        assert!(server.handle_server_event(ServerEvent::ClientShellResize {
+            client_id: 12,
+            surface_cols: 60,
+            surface_rows: 15,
+            cell_width_px: 0,
+            cell_height_px: 0,
+        }));
+        assert_eq!(
+            server
+                .app
+                .terminal_runtimes
+                .get(&popup_terminal_id)
+                .expect("popup runtime")
+                .current_size(),
+            (5, 27)
+        );
+
+        assert!(
+            server.handle_server_event(ServerEvent::ClientShellPopupInput {
+                client_id: 12,
+                terminal_id: popup_terminal_id.to_string(),
+                events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
+                    "typed".into()
+                )],
+            })
+        );
+        assert_eq!(
+            popup_input.try_recv().expect("popup input"),
+            Bytes::from_static(b"typed")
+        );
+        assert!(
+            !server.handle_server_event(ServerEvent::ClientShellPopupInput {
+                client_id: 12,
+                terminal_id: "stale-popup".into(),
+                events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
+                    "wrong".into()
+                )],
+            })
+        );
+        assert!(popup_input.try_recv().is_err());
+
+        assert!(server.app.close_popup_pane());
+        server.render_and_stream();
+        let ServerMessage::PaneSurface(surface) =
+            read_server_message(render_rx.recv().expect("popup close surface"))
+        else {
+            panic!("expected pane surface after popup close");
+        };
+        assert!(surface.popup.is_none());
         shutdown_test_runtimes(&mut server);
     }
 

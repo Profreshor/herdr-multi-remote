@@ -145,15 +145,7 @@ impl ClientShellState {
                 outcome.actions.push(ClientShellAction::Keybind(action));
             }
             crate::input::KeybindMatch::Command(command) => {
-                let Ok(action) =
-                    crate::protocol::ClientShellCommandAction::try_from(command.action)
-                else {
-                    self.endpoint_error = Some(
-                        "popup commands require the client-owned popup terminal surface".to_owned(),
-                    );
-                    outcome.repaint = true;
-                    return;
-                };
+                let action = command.action.into();
                 let command_id = self.snapshot.as_deref().and_then(|snapshot| {
                     snapshot
                         .commands
@@ -180,10 +172,20 @@ impl ClientShellState {
                     tab_id: snapshot.focused_tab_id.clone(),
                     pane_id: snapshot.focused_pane_id.clone(),
                 };
-                self.push_endpoint_method(
-                    crate::api::schema::Method::CommandInvoke(params),
-                    outcome,
-                );
+                if action == crate::protocol::ClientShellCommandAction::Popup {
+                    self.popup_pending = true;
+                    self.popup_pending_deadline = None;
+                    self.push_endpoint_method_with_kind(
+                        crate::api::schema::Method::CommandInvoke(params),
+                        PendingEndpointKind::PopupCommand,
+                        outcome,
+                    );
+                } else {
+                    self.push_endpoint_method(
+                        crate::api::schema::Method::CommandInvoke(params),
+                        outcome,
+                    );
+                }
             }
         }
     }
@@ -257,6 +259,21 @@ impl ClientShellState {
         }
         match pending.kind {
             PendingEndpointKind::Generic => {}
+            PendingEndpointKind::PopupCommand => {
+                return match result {
+                    Ok(_) => {
+                        self.popup_pending_deadline =
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+                        (false, Vec::new())
+                    }
+                    Err(error) => {
+                        self.popup_pending = false;
+                        self.popup_pending_deadline = None;
+                        self.endpoint_error = Some(error.message);
+                        (true, Vec::new())
+                    }
+                };
+            }
             PendingEndpointKind::ReloadConfig => {
                 let repaint = match result {
                     Ok(crate::api::schema::ResponseResult::ConfigReload {

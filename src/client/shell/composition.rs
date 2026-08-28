@@ -65,6 +65,7 @@ impl ClientShellState {
                     pane.inner_rect.height,
                 ),
                 pane_id: pane.pane_id.clone(),
+                popup: false,
                 mouse_reporting: pane.mouse_reporting,
                 sgr_pixel_mouse: pane.sgr_pixel_mouse,
                 pixel_width: pane.pixel_width,
@@ -144,6 +145,41 @@ impl ClientShellState {
             frame = FrameData::from_ratatui_buffer_with_hyperlinks(&composed, cursor, &[]);
             frame.graphics = graphics;
         }
+        self.hits.popup = None;
+        if let Some(popup) = surface.popup.as_deref() {
+            let width = popup.width.map(client_popup_size);
+            let height = popup.height.map(client_popup_size);
+            if let Some(geometry) =
+                crate::popup_size::resolve_popup_geometry(width, height, layout.pane_surface)
+            {
+                let graphics = std::mem::take(&mut frame.graphics);
+                let mut composed = frame.to_ratatui_buffer()?;
+                let block = ratatui::widgets::Block::default()
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .border_style(ratatui::style::Style::default().fg(self.config.palette.accent))
+                    .title(popup.title.clone())
+                    .style(ratatui::style::Style::default().bg(self.config.palette.panel_bg));
+                ratatui::widgets::Widget::render(
+                    ratatui::widgets::Clear,
+                    geometry.outer,
+                    &mut composed,
+                );
+                ratatui::widgets::Widget::render(block, geometry.outer, &mut composed);
+                frame = FrameData::from_ratatui_buffer_with_hyperlinks(&composed, None, &[]);
+                frame.graphics = graphics;
+                blit_pane_surface(&mut frame, &popup.frame, geometry.inner);
+                self.hits.popup = Some(PaneHit {
+                    rect: geometry.outer,
+                    inner_rect: geometry.inner,
+                    pane_id: popup.terminal_id.clone(),
+                    popup: true,
+                    mouse_reporting: popup.mouse_reporting,
+                    sgr_pixel_mouse: popup.sgr_pixel_mouse,
+                    pixel_width: popup.pixel_width,
+                    pixel_height: popup.pixel_height,
+                });
+            }
+        }
         if let Some(overlay) = self.overlay.as_ref() {
             let graphics = std::mem::take(&mut frame.graphics);
             let mut composed = frame.to_ratatui_buffer()?;
@@ -191,5 +227,16 @@ impl ClientShellState {
             help.scroll = help.scroll.min(self.hits.help_max_scroll);
         }
         Some(frame)
+    }
+}
+
+fn client_popup_size(size: crate::protocol::ClientShellPopupSize) -> crate::popup_size::PopupSize {
+    match size {
+        crate::protocol::ClientShellPopupSize::Cells(cells) => {
+            crate::popup_size::PopupSize::Cells(cells)
+        }
+        crate::protocol::ClientShellPopupSize::Percent(percent) => {
+            crate::popup_size::PopupSize::Percent(percent)
+        }
     }
 }

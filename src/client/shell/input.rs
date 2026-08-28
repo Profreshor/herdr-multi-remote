@@ -57,23 +57,39 @@ impl ClientShellState {
                 RawInputEvent::Key(key) => self.handle_key(key, &mut outcome),
                 RawInputEvent::Text(text) => {
                     let text = text.into_string();
-                    if self.insert_overlay_text(&text) {
-                        outcome.repaint = true;
-                    } else if self.overlay.is_none() && self.mode == ClientShellMode::Terminal {
-                        self.push_focused_pane_event(
+                    if let Some(target) = self.popup_input_target() {
+                        super::push_target_event(
+                            target,
                             ClientPaneInputEvent::TextCommit(text),
                             &mut outcome,
                         );
+                    } else if !self.popup_pending {
+                        if self.insert_overlay_text(&text) {
+                            outcome.repaint = true;
+                        } else if self.overlay.is_none() && self.mode == ClientShellMode::Terminal {
+                            self.push_focused_pane_event(
+                                ClientPaneInputEvent::TextCommit(text),
+                                &mut outcome,
+                            );
+                        }
                     }
                 }
                 RawInputEvent::Paste(text) => {
-                    if self.insert_overlay_text(&text) {
-                        outcome.repaint = true;
-                    } else if self.overlay.is_none() && self.mode == ClientShellMode::Terminal {
-                        self.push_focused_pane_event(
+                    if let Some(target) = self.popup_input_target() {
+                        super::push_target_event(
+                            target,
                             ClientPaneInputEvent::Paste(text),
                             &mut outcome,
                         );
+                    } else if !self.popup_pending {
+                        if self.insert_overlay_text(&text) {
+                            outcome.repaint = true;
+                        } else if self.overlay.is_none() && self.mode == ClientShellMode::Terminal {
+                            self.push_focused_pane_event(
+                                ClientPaneInputEvent::Paste(text),
+                                &mut outcome,
+                            );
+                        }
                     }
                 }
                 RawInputEvent::Mouse(mouse) => self.handle_mouse(mouse, &mut outcome),
@@ -142,12 +158,16 @@ impl ClientShellState {
         &mut self,
         lease_key: crate::input::InputLeaseKey<u8>,
         key: crate::input::TerminalKey,
-        plan: crate::input::RepeatPlan<ClientInputContext, String>,
+        plan: crate::input::RepeatPlan<ClientInputContext, ClientInputTarget>,
         outcome: &mut ClientShellInput,
     ) {
         match plan {
             crate::input::RepeatPlan::Forwarded(target) => {
-                self.push_pane_key(target, key, outcome);
+                let pane_blocked_by_popup = matches!(&target, ClientInputTarget::Pane(_))
+                    && (self.popup_pending || self.popup_terminal_id.is_some());
+                if !pane_blocked_by_popup {
+                    self.push_pane_key(target, key, outcome);
+                }
             }
             crate::input::RepeatPlan::Reprocess {
                 context,
@@ -181,7 +201,13 @@ impl ClientShellState {
         &mut self,
         key: &crate::input::TerminalKey,
         outcome: &mut ClientShellInput,
-    ) -> Option<String> {
+    ) -> Option<ClientInputTarget> {
+        if let Some(target) = self.popup_input_target() {
+            return Some(target);
+        }
+        if self.popup_pending {
+            return None;
+        }
         if self.overlay.is_some() {
             self.route_overlay_key(key, outcome);
             return None;
@@ -203,13 +229,13 @@ impl ClientShellState {
                     outcome.repaint = true;
                     return None;
                 }
-                self.focused_pane_id()
+                self.focused_pane_id().map(ClientInputTarget::Pane)
             }
             ClientShellMode::Prefix => {
                 if crate::config::terminal_key_matches_combo(key, self.config.keybinds.prefix) {
                     self.mode = ClientShellMode::Terminal;
                     outcome.repaint = true;
-                    return self.focused_pane_id();
+                    return self.focused_pane_id().map(ClientInputTarget::Pane);
                 }
                 if key.code == KeyCode::Esc {
                     self.mode = ClientShellMode::Terminal;
@@ -573,6 +599,11 @@ impl ClientShellState {
         ClientInputContext {
             mode: self.mode,
             overlay: self.overlay.as_ref().map(ClientShellOverlay::kind),
+            popup_terminal_id: self.popup_input_target().and_then(|target| match target {
+                ClientInputTarget::Popup(terminal_id) => Some(terminal_id),
+                ClientInputTarget::Pane(_) => None,
+            }),
+            popup_pending: self.popup_pending,
         }
     }
 
@@ -582,20 +613,26 @@ impl ClientShellState {
             .and_then(|snapshot| snapshot.focused_pane_id.clone())
     }
 
+    fn popup_input_target(&self) -> Option<ClientInputTarget> {
+        self.popup_terminal_id
+            .as_ref()
+            .map(|terminal_id| ClientInputTarget::Popup(terminal_id.clone()))
+    }
+
     fn push_pane_key(
         &self,
-        pane_id: String,
+        target: ClientInputTarget,
         key: crate::input::TerminalKey,
         outcome: &mut ClientShellInput,
     ) {
         if let Some(event) = ClientPaneInputEvent::from_terminal_key(key) {
-            super::push_pane_event(pane_id, event, outcome);
+            super::push_target_event(target, event, outcome);
         }
     }
 
     fn push_focused_pane_event(&self, event: ClientPaneInputEvent, outcome: &mut ClientShellInput) {
         if let Some(pane_id) = self.focused_pane_id() {
-            super::push_pane_event(pane_id, event, outcome);
+            super::push_target_event(ClientInputTarget::Pane(pane_id), event, outcome);
         }
     }
 }

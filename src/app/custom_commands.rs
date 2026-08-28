@@ -31,16 +31,11 @@ impl EndpointCommandRegistry {
         let namespace = new_command_namespace();
         let entries = bindings
             .iter()
-            .filter_map(|binding| {
-                let action =
-                    crate::protocol::ClientShellCommandAction::try_from(binding.action).ok()?;
-                Some((binding, action))
-            })
             .enumerate()
-            .map(|(index, (binding, action))| EndpointCommand {
+            .map(|(index, binding)| EndpointCommand {
+                action: binding.action.into(),
                 id: format!("cmd_{namespace}_{index}"),
                 binding: binding.clone(),
-                action,
             })
             .collect();
         Self { entries }
@@ -328,11 +323,16 @@ mod tests {
     }
 
     #[test]
-    fn popup_commands_are_absent_until_the_client_owns_their_surface() {
+    fn popup_commands_are_advertised_without_exposing_the_command_text() {
         let mut app = test_app();
         install(&mut app, binding(crate::config::CustomCommandAction::Popup));
 
-        assert!(app.client_shell_command_manifest().is_empty());
-        assert!(app.endpoint_commands.entries.is_empty());
+        let manifest = app.client_shell_command_manifest();
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(
+            manifest[0].action,
+            crate::protocol::ClientShellCommandAction::Popup
+        );
+        assert!(!format!("{manifest:?}").contains("secret-command"));
     }
 }

@@ -172,6 +172,7 @@ pub(super) fn render_pane_surface(
     FrameData,
     Vec<protocol::PaneSurfacePane>,
     Vec<protocol::PaneSurfaceSplit>,
+    Option<Box<protocol::ClientShellPopupSurface>>,
 ) {
     let (buffer, cursor, hyperlinks, layout) =
         crate::server::render_stream::render_tab_surface_virtual(
@@ -255,11 +256,92 @@ pub(super) fn render_pane_surface(
             })
         })
         .collect();
+    let popup = render_popup_surface(app, area, is_foreground, cell_size);
     (
         FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, cursor, &hyperlinks),
         panes,
         splits,
+        popup,
     )
+}
+
+fn render_popup_surface(
+    app: &app::App,
+    area: Rect,
+    is_foreground: bool,
+    cell_size: crate::kitty_graphics::HostCellSize,
+) -> Option<Box<protocol::ClientShellPopupSurface>> {
+    let popup = app.state.popup_pane.as_ref()?;
+    let geometry = if is_foreground {
+        resize_popup_runtime(app, area, cell_size)?
+    } else {
+        crate::popup_size::resolve_popup_geometry(popup.width, popup.height, area)?
+    };
+    let runtime = app.terminal_runtimes.get(&popup.terminal_id)?;
+    let content_area = Rect::new(0, 0, geometry.inner.width, geometry.inner.height);
+    let (buffer, mut cursor) =
+        crate::server::render_stream::render_terminal_virtual(runtime, content_area);
+    if !is_foreground {
+        cursor = None;
+    }
+    let hyperlinks = runtime.visible_hyperlinks(content_area);
+    let title = app
+        .state
+        .terminals
+        .get(&popup.terminal_id)
+        .and_then(|terminal| terminal.manual_label.clone())
+        .unwrap_or_else(|| "popup".to_owned());
+    let (pixel_width, pixel_height) = if cell_size.is_known() {
+        (
+            u32::from(content_area.width) * cell_size.width_px,
+            u32::from(content_area.height) * cell_size.height_px,
+        )
+    } else {
+        (0, 0)
+    };
+    Some(Box::new(protocol::ClientShellPopupSurface {
+        terminal_id: popup.terminal_id.to_string(),
+        title,
+        width: popup.width.map(client_popup_size),
+        height: popup.height.map(client_popup_size),
+        frame: FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, cursor, &hyperlinks),
+        mouse_reporting: runtime.mouse_reporting_enabled(),
+        sgr_pixel_mouse: runtime.sgr_pixel_mouse_enabled(),
+        pixel_width,
+        pixel_height,
+    }))
+}
+
+pub(super) fn resize_popup_runtime(
+    app: &app::App,
+    area: Rect,
+    cell_size: crate::kitty_graphics::HostCellSize,
+) -> Option<crate::popup_size::PopupResolvedGeometry> {
+    let popup = app.state.popup_pane.as_ref()?;
+    let geometry = crate::popup_size::resolve_popup_geometry(popup.width, popup.height, area)?;
+    let runtime = app.terminal_runtimes.get(&popup.terminal_id)?;
+    if !app
+        .state
+        .direct_attach_resize_locks
+        .contains(&popup.terminal_id)
+    {
+        runtime.resize(
+            geometry.inner.height,
+            geometry.inner.width,
+            cell_size.width_px,
+            cell_size.height_px,
+        );
+    }
+    Some(geometry)
+}
+
+fn client_popup_size(size: crate::popup_size::PopupSize) -> protocol::ClientShellPopupSize {
+    match size {
+        crate::popup_size::PopupSize::Cells(cells) => protocol::ClientShellPopupSize::Cells(cells),
+        crate::popup_size::PopupSize::Percent(percent) => {
+            protocol::ClientShellPopupSize::Percent(percent)
+        }
+    }
 }
 
 fn split_hit_rect(

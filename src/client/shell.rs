@@ -64,21 +64,45 @@ fn delete_overlay_word(rename: &mut ClientRenameOverlay) {
     }
 }
 
-fn push_pane_event(pane_id: String, event: ClientPaneInputEvent, outcome: &mut ClientShellInput) {
-    if let Some(ClientMessage::ClientShellPaneInput {
-        pane_id: pending_pane,
-        events,
-    }) = outcome.requests.last_mut()
-    {
-        if *pending_pane == pane_id {
-            events.push(event);
-            return;
+fn push_target_event(
+    target: ClientInputTarget,
+    event: ClientPaneInputEvent,
+    outcome: &mut ClientShellInput,
+) {
+    match target {
+        ClientInputTarget::Pane(pane_id) => {
+            if let Some(ClientMessage::ClientShellPaneInput {
+                pane_id: pending_pane,
+                events,
+            }) = outcome.requests.last_mut()
+            {
+                if *pending_pane == pane_id {
+                    events.push(event);
+                    return;
+                }
+            }
+            outcome.requests.push(ClientMessage::ClientShellPaneInput {
+                pane_id,
+                events: vec![event],
+            });
+        }
+        ClientInputTarget::Popup(terminal_id) => {
+            if let Some(ClientMessage::ClientShellPopupInput {
+                terminal_id: pending_terminal,
+                events,
+            }) = outcome.requests.last_mut()
+            {
+                if *pending_terminal == terminal_id {
+                    events.push(event);
+                    return;
+                }
+            }
+            outcome.requests.push(ClientMessage::ClientShellPopupInput {
+                terminal_id,
+                events: vec![event],
+            });
         }
     }
-    outcome.requests.push(ClientMessage::ClientShellPaneInput {
-        pane_id,
-        events: vec![event],
-    });
 }
 
 fn contains(rect: Rect, point: (u16, u16)) -> bool {
@@ -354,7 +378,34 @@ mod tests {
                 pixel_height: 0,
             }],
             splits: Vec::new(),
+            popup: None,
         }
+    }
+
+    fn surface_with_popup() -> PaneSurfaceFrame {
+        let mut surface = surface();
+        let popup_buffer = Buffer::with_lines(["popup-live", "", ""]);
+        surface.popup = Some(Box::new(crate::protocol::ClientShellPopupSurface {
+            terminal_id: "terminal-popup".into(),
+            title: "popup title".into(),
+            width: Some(crate::protocol::ClientShellPopupSize::Cells(12)),
+            height: Some(crate::protocol::ClientShellPopupSize::Cells(5)),
+            frame: FrameData::from_ratatui_buffer_with_hyperlinks(
+                &popup_buffer,
+                Some(crate::protocol::CursorState {
+                    x: 2,
+                    y: 1,
+                    visible: true,
+                    shape: 1,
+                }),
+                &[],
+            ),
+            mouse_reporting: true,
+            sgr_pixel_mouse: false,
+            pixel_width: 0,
+            pixel_height: 0,
+        }));
+        surface
     }
 
     #[test]
@@ -384,6 +435,335 @@ mod tests {
             frame.cursor.as_ref().map(|cursor| (cursor.x, cursor.y)),
             Some((27, 2))
         );
+    }
+
+    #[test]
+    fn client_composes_popup_terminal_content_inside_client_owned_chrome() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface_with_popup());
+
+        let frame = state.compose(106, 20).expect("popup frame");
+        let popup = state.hits.popup.as_ref().expect("popup hit geometry");
+        assert_eq!(popup.rect.width, 12);
+        assert_eq!(popup.rect.height, 5);
+        assert_eq!(popup.inner_rect.width, 9);
+        assert_eq!(popup.inner_rect.height, 3);
+        let text = frame
+            .cells
+            .chunks(frame.width as usize)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("popup tit"));
+        assert!(text.contains("popup-liv"));
+        assert_eq!(
+            frame.cursor.as_ref().map(|cursor| (cursor.x, cursor.y)),
+            Some((popup.inner_rect.x + 2, popup.inner_rect.y + 1))
+        );
+    }
+
+    #[test]
+    fn popup_owns_keys_text_paste_and_mouse_before_shell_controls() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface_with_popup());
+        state.compose(106, 20).expect("popup frame");
+
+        for bytes in [b"x".as_slice(), b"\x02".as_slice(), b"\x1b".as_slice()] {
+            let input = state.handle_input_bytes(bytes);
+            assert!(matches!(
+                &input.requests[..],
+                [ClientMessage::ClientShellPopupInput { terminal_id, .. }]
+                    if terminal_id == "terminal-popup"
+            ));
+            assert_eq!(state.mode, ClientShellMode::Terminal);
+        }
+
+        let text = state.handle_raw_events(vec![RawInputEvent::Text(
+            crate::input::TextCommit::new("ime"),
+        )]);
+        assert!(matches!(
+            &text.requests[..],
+            [ClientMessage::ClientShellPopupInput { events, .. }]
+                if matches!(&events[..], [ClientPaneInputEvent::TextCommit(value)] if value == "ime")
+        ));
+        let paste = state.handle_raw_events(vec![RawInputEvent::Paste("paste".into())]);
+        assert!(matches!(
+            &paste.requests[..],
+            [ClientMessage::ClientShellPopupInput { events, .. }]
+                if matches!(&events[..], [ClientPaneInputEvent::Paste(value)] if value == "paste")
+        ));
+
+        let popup = state.hits.popup.as_ref().expect("popup hit").clone();
+        let mouse =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: popup.inner_rect.x + 3,
+                row: popup.inner_rect.y + 1,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(matches!(
+            &mouse.requests[..],
+            [ClientMessage::ClientShellPopupInput { events, .. }]
+                if matches!(
+                    &events[..],
+                    [ClientPaneInputEvent::Mouse {
+                        position: ClientMousePosition::Cell { column: 3, row: 1 },
+                        ..
+                    }]
+                )
+        ));
+        assert!(state.pane_mouse_gesture.is_some());
+        state.set_pane_surface(surface());
+        assert!(state.pane_mouse_gesture.is_none());
+    }
+
+    #[test]
+    fn popup_transition_dismisses_client_overlays_and_restores_pane_input_after_close() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface());
+        state.record_binding(
+            crate::input::KeybindMatch::Action(crate::input::KeybindAction::Help),
+            &mut ClientShellInput::default(),
+        );
+        assert!(state.overlay.is_some());
+
+        state.set_pane_surface(surface_with_popup());
+        assert!(state.overlay.is_none());
+        assert_eq!(state.mode, ClientShellMode::Terminal);
+        let popup_input = state.handle_input_bytes(b"p");
+        assert!(matches!(
+            &popup_input.requests[..],
+            [ClientMessage::ClientShellPopupInput { .. }]
+        ));
+
+        state.set_pane_surface(surface());
+        let pane_input = state.handle_input_bytes(b"p");
+        assert!(matches!(
+            &pane_input.requests[..],
+            [ClientMessage::ClientShellPaneInput { pane_id, .. }] if pane_id == "pane_1"
+        ));
+    }
+
+    #[test]
+    fn popup_target_survives_surface_invalidation_during_resize() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface_with_popup());
+        state.invalidate_pane_surface();
+
+        assert!(matches!(
+            &state.handle_input_bytes(b"x").requests[..],
+            [ClientMessage::ClientShellPopupInput { terminal_id, .. }]
+                if terminal_id == "terminal-popup"
+        ));
+        let mouse =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(mouse.requests.is_empty());
+        assert!(mouse.actions.is_empty());
+    }
+
+    #[test]
+    fn popup_close_reprocesses_held_key_repeats_into_the_focused_pane() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface_with_popup());
+
+        let press = state.handle_raw_events(vec![RawInputEvent::Key(
+            crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty()),
+        )]);
+        assert!(matches!(
+            &press.requests[..],
+            [ClientMessage::ClientShellPopupInput { .. }]
+        ));
+
+        state.set_pane_surface(surface());
+        let repeat = state.handle_raw_events(vec![RawInputEvent::Key(
+            crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty())
+                .with_kind(crossterm::event::KeyEventKind::Repeat),
+        )]);
+        assert!(matches!(
+            &repeat.requests[..],
+            [ClientMessage::ClientShellPaneInput { pane_id, .. }] if pane_id == "pane_1"
+        ));
+    }
+
+    #[test]
+    fn pending_popup_suppresses_held_pane_repeats_but_preserves_release() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface());
+        let key = crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty());
+        assert!(matches!(
+            &state
+                .handle_raw_events(vec![RawInputEvent::Key(key.clone())])
+                .requests[..],
+            [ClientMessage::ClientShellPaneInput { .. }]
+        ));
+
+        state.popup_pending = true;
+        let repeat = state.handle_raw_events(vec![RawInputEvent::Key(
+            key.clone()
+                .with_kind(crossterm::event::KeyEventKind::Repeat),
+        )]);
+        assert!(repeat.requests.is_empty());
+        let release = state.handle_raw_events(vec![RawInputEvent::Key(
+            key.with_kind(crossterm::event::KeyEventKind::Release),
+        )]);
+        assert!(matches!(
+            &release.requests[..],
+            [ClientMessage::ClientShellPaneInput { events, .. }]
+                if matches!(
+                    &events[..],
+                    [ClientPaneInputEvent::Key {
+                        kind: crate::protocol::ClientKeyKind::Release,
+                        ..
+                    }]
+                )
+        ));
+    }
+
+    #[test]
+    fn pane_mouse_release_survives_popup_open_transition() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        let mut pane_surface = surface();
+        pane_surface.panes[0].mouse_reporting = true;
+        state.set_pane_surface(pane_surface);
+        state.compose(106, 20).expect("pane frame");
+        let pane = state.hits.panes[0].clone();
+
+        let down =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: pane.inner_rect.x,
+                row: pane.inner_rect.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(matches!(
+            &down.requests[..],
+            [ClientMessage::ClientShellPaneInput { .. }]
+        ));
+        assert!(state.pane_mouse_gesture.is_some());
+
+        state.set_pane_surface(surface_with_popup());
+        let up =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(matches!(
+            &up.requests[..],
+            [ClientMessage::ClientShellPaneInput { pane_id, events }]
+                if pane_id == "pane_1"
+                    && matches!(
+                        &events[..],
+                        [ClientPaneInputEvent::Mouse {
+                            kind: crate::protocol::ClientMouseKind::Up(
+                                crate::protocol::ClientMouseButton::Left
+                            ),
+                            ..
+                        }]
+                    )
+        ));
+        assert!(state.pane_mouse_gesture.is_none());
+    }
+
+    #[test]
+    fn popup_command_blocks_underlying_input_until_surface_or_error() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        let binding = crate::config::CustomCommandKeybind {
+            bindings: crate::config::ActionKeybinds::prefix("t"),
+            label: "prefix+t".into(),
+            command: "secret-popup-command".into(),
+            action: crate::config::CustomCommandAction::Popup,
+            description: None,
+            width: None,
+            height: None,
+        };
+        let mut projection = snapshot();
+        projection
+            .commands
+            .push(crate::protocol::ClientShellCommand {
+                command_id: "cmd_popup".into(),
+                binding_label: binding.label.clone(),
+                action: crate::protocol::ClientShellCommandAction::Popup,
+            });
+        state.set_snapshot(Box::new(projection));
+        state.set_pane_surface(surface());
+
+        let mut invoke = ClientShellInput::default();
+        state.record_binding(crate::input::KeybindMatch::Command(binding), &mut invoke);
+        assert!(state.popup_pending);
+        assert!(state
+            .handle_input_bytes(b"not-for-pane")
+            .requests
+            .is_empty());
+        assert!(state
+            .handle_raw_events(vec![RawInputEvent::Paste("secret".into())])
+            .requests
+            .is_empty());
+
+        let request_id = match &invoke.actions[..] {
+            [ClientShellAction::Endpoint { request, .. }] => request.id.clone(),
+            other => panic!("expected popup command request, got {other:?}"),
+        };
+        let (repaint, _) = state.handle_endpoint_result(
+            "boot-1",
+            &request_id,
+            Err(ClientShellEndpointError {
+                code: Some("command_failed".into()),
+                message: "popup failed".into(),
+            }),
+        );
+        assert!(repaint);
+        assert!(!state.popup_pending);
+        assert!(matches!(
+            &state.handle_input_bytes(b"p").requests[..],
+            [ClientMessage::ClientShellPaneInput { .. }]
+        ));
+
+        let binding = crate::config::CustomCommandKeybind {
+            bindings: crate::config::ActionKeybinds::prefix("t"),
+            label: "prefix+t".into(),
+            command: "secret-popup-command".into(),
+            action: crate::config::CustomCommandAction::Popup,
+            description: None,
+            width: None,
+            height: None,
+        };
+        let mut invoke = ClientShellInput::default();
+        state.record_binding(crate::input::KeybindMatch::Command(binding), &mut invoke);
+        let request_id = match &invoke.actions[..] {
+            [ClientShellAction::Endpoint { request, .. }] => request.id.clone(),
+            other => panic!("expected popup command request, got {other:?}"),
+        };
+        state.handle_endpoint_result(
+            "boot-1",
+            &request_id,
+            Ok(crate::api::schema::ResponseResult::Ok {}),
+        );
+        assert!(state.popup_pending);
+        assert!(state
+            .handle_input_bytes(b"still-blocked")
+            .requests
+            .is_empty());
+        let deadline = state.popup_pending_deadline.expect("pending timeout");
+        state.tick_popup_pending(deadline);
+        assert!(!state.popup_pending);
     }
 
     #[test]

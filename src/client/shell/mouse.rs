@@ -256,13 +256,20 @@ impl ClientShellState {
             if gesture_event {
                 let button = gesture.button;
                 let modifiers = mouse.modifiers.difference(gesture.stripped_modifiers);
-                let hit = self
-                    .hits
-                    .panes
-                    .iter()
-                    .find(|hit| hit.pane_id == gesture.hit.pane_id)
-                    .cloned()
-                    .unwrap_or_else(|| gesture.hit.clone());
+                let hit = if gesture.hit.popup {
+                    self.hits
+                        .popup
+                        .as_ref()
+                        .filter(|hit| hit.pane_id == gesture.hit.pane_id)
+                        .cloned()
+                } else {
+                    self.hits
+                        .panes
+                        .iter()
+                        .find(|hit| hit.pane_id == gesture.hit.pane_id)
+                        .cloned()
+                }
+                .unwrap_or_else(|| gesture.hit.clone());
                 self.push_pane_mouse_event(&hit, mouse, modifiers, outcome);
                 if mouse.kind == MouseEventKind::Up(button) {
                     self.pane_mouse_gesture = None;
@@ -275,6 +282,39 @@ impl ClientShellState {
             ) {
                 return;
             }
+        }
+        if self.popup_pending {
+            return;
+        }
+        if let Some(hit) = self.hits.popup.clone() {
+            if super::contains(hit.inner_rect, point) {
+                match mouse.kind {
+                    MouseEventKind::Down(button) => {
+                        self.push_pane_mouse_event(&hit, mouse, mouse.modifiers, outcome);
+                        if hit.mouse_reporting {
+                            self.pane_mouse_gesture = Some(ClientPaneMouseGesture {
+                                hit,
+                                button,
+                                stripped_modifiers: crossterm::event::KeyModifiers::empty(),
+                            });
+                        }
+                    }
+                    MouseEventKind::Moved if hit.mouse_reporting => {
+                        self.push_pane_mouse_event(&hit, mouse, mouse.modifiers, outcome);
+                    }
+                    MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight => {
+                        self.push_pane_mouse_event(&hit, mouse, mouse.modifiers, outcome);
+                    }
+                    MouseEventKind::Up(_) | MouseEventKind::Drag(_) | MouseEventKind::Moved => {}
+                }
+            }
+            return;
+        }
+        if self.popup_terminal_id.is_some() {
+            return;
         }
         if self.overlay.is_none()
             && mouse.kind == MouseEventKind::Down(MouseButton::Left)
@@ -1450,8 +1490,13 @@ impl ClientShellState {
         } else {
             cell
         };
-        push_pane_event(
-            hit.pane_id.clone(),
+        let target = if hit.popup {
+            ClientInputTarget::Popup(hit.pane_id.clone())
+        } else {
+            ClientInputTarget::Pane(hit.pane_id.clone())
+        };
+        push_target_event(
+            target,
             ClientPaneInputEvent::Mouse {
                 kind,
                 position,

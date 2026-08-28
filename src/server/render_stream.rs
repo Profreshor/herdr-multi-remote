@@ -7,8 +7,8 @@ use crate::app::state::AppState;
 use crate::app::Mode;
 use crate::protocol::render_ansi::{BlitEncoder, EncodedBlit};
 use crate::protocol::{
-    CursorState, FrameData, PaneSurfaceFrame, PaneSurfacePane, RenderEncoding, ServerMessage,
-    TerminalFrame,
+    ClientShellPopupSurface, CursorState, FrameData, PaneSurfaceFrame, PaneSurfacePane,
+    RenderEncoding, ServerMessage, TerminalFrame,
 };
 use crate::terminal::TerminalRuntimeRegistry;
 
@@ -18,6 +18,7 @@ pub(crate) enum ClientRenderState {
     Semantic {
         last_frame: Option<FrameData>,
         last_surface_panes: Option<Vec<PaneSurfacePane>>,
+        last_surface_popup: Option<Box<ClientShellPopupSurface>>,
         last_surface_projection_revision: Option<u64>,
     },
     /// Terminal-ANSI clients keep a terminal diff encoder and sequence number.
@@ -34,6 +35,7 @@ impl ClientRenderState {
             RenderEncoding::SemanticFrame => Self::Semantic {
                 last_frame: None,
                 last_surface_panes: None,
+                last_surface_popup: None,
                 last_surface_projection_revision: None,
             },
             RenderEncoding::TerminalAnsi => Self::TerminalAnsi {
@@ -49,10 +51,12 @@ impl ClientRenderState {
             Self::Semantic {
                 last_frame,
                 last_surface_panes,
+                last_surface_popup,
                 last_surface_projection_revision,
             } => {
                 *last_frame = None;
                 *last_surface_panes = None;
+                *last_surface_popup = None;
                 *last_surface_projection_revision = None;
             }
             Self::TerminalAnsi {
@@ -71,10 +75,12 @@ impl ClientRenderState {
             Self::Semantic {
                 last_frame,
                 last_surface_panes,
+                last_surface_popup,
                 last_surface_projection_revision,
             } => {
                 *last_frame = None;
                 *last_surface_panes = None;
+                *last_surface_popup = None;
                 *last_surface_projection_revision = None;
             }
             Self::TerminalAnsi {
@@ -87,11 +93,13 @@ impl ClientRenderState {
         if let Self::Semantic {
             last_frame,
             last_surface_panes,
+            last_surface_popup,
             last_surface_projection_revision,
         } = self
         {
             *last_frame = None;
             *last_surface_panes = None;
+            *last_surface_popup = None;
             *last_surface_projection_revision = None;
         }
     }
@@ -156,6 +164,7 @@ impl ClientRenderState {
         let Self::Semantic {
             last_frame,
             last_surface_panes,
+            last_surface_popup,
             last_surface_projection_revision,
         } = self
         else {
@@ -163,6 +172,7 @@ impl ClientRenderState {
         };
         if last_frame.as_ref() == Some(&surface.frame)
             && last_surface_panes.as_ref() == Some(&surface.panes)
+            && *last_surface_popup == surface.popup
             && *last_surface_projection_revision == Some(surface.projection_revision)
         {
             return None;
@@ -185,6 +195,7 @@ impl ClientRenderState {
                 Self::Semantic {
                     last_frame,
                     last_surface_panes,
+                    last_surface_popup,
                     last_surface_projection_revision,
                 },
                 PreparedRender::Semantic {
@@ -193,12 +204,14 @@ impl ClientRenderState {
             ) => {
                 *last_frame = Some(frame);
                 *last_surface_panes = None;
+                *last_surface_popup = None;
                 *last_surface_projection_revision = None;
             }
             (
                 Self::Semantic {
                     last_frame,
                     last_surface_panes,
+                    last_surface_popup,
                     last_surface_projection_revision,
                 },
                 PreparedRender::Semantic {
@@ -208,6 +221,7 @@ impl ClientRenderState {
                 *last_surface_projection_revision = Some(surface.projection_revision);
                 *last_frame = Some(surface.frame);
                 *last_surface_panes = Some(surface.panes);
+                *last_surface_popup = surface.popup;
             }
             (
                 Self::TerminalAnsi {
@@ -235,6 +249,46 @@ impl ClientRenderState {
             Self::Semantic { .. } => None,
             Self::TerminalAnsi { seq, .. } => Some(*seq),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn popup_surface(content: &str) -> PaneSurfaceFrame {
+        let pane = ratatui::buffer::Buffer::with_lines(["pane"]);
+        let popup = ratatui::buffer::Buffer::with_lines([content]);
+        PaneSurfaceFrame {
+            projection_revision: 1,
+            frame: FrameData::from_ratatui_buffer_with_hyperlinks(&pane, None, &[]),
+            panes: Vec::new(),
+            splits: Vec::new(),
+            popup: Some(Box::new(ClientShellPopupSurface {
+                terminal_id: "popup-terminal".into(),
+                title: "popup".into(),
+                width: None,
+                height: None,
+                frame: FrameData::from_ratatui_buffer_with_hyperlinks(&popup, None, &[]),
+                mouse_reporting: false,
+                sgr_pixel_mouse: false,
+                pixel_width: 0,
+                pixel_height: 0,
+            })),
+        }
+    }
+
+    #[test]
+    fn popup_only_surface_changes_are_not_deduplicated() {
+        let mut state = ClientRenderState::new(RenderEncoding::SemanticFrame);
+        let prepared = state
+            .prepare_pane_surface(popup_surface("first"))
+            .expect("initial surface");
+        state.commit_sent_frame(prepared);
+
+        assert!(state
+            .prepare_pane_surface(popup_surface("second"))
+            .is_some());
     }
 }
 

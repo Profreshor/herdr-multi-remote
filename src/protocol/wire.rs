@@ -576,6 +576,12 @@ pub enum ClientMessage {
         pane_id: String,
         events: Vec<ClientPaneInputEvent>,
     },
+
+    /// Deliver client-classified semantic input to the active popup terminal.
+    ClientShellPopupInput {
+        terminal_id: String,
+        events: Vec<ClientPaneInputEvent>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -781,18 +787,17 @@ pub struct ClientShellSnapshot {
 pub enum ClientShellCommandAction {
     Shell,
     Pane,
+    Popup,
     PluginAction,
 }
 
-impl TryFrom<crate::config::CustomCommandAction> for ClientShellCommandAction {
-    type Error = ();
-
-    fn try_from(action: crate::config::CustomCommandAction) -> Result<Self, Self::Error> {
+impl From<crate::config::CustomCommandAction> for ClientShellCommandAction {
+    fn from(action: crate::config::CustomCommandAction) -> Self {
         match action {
-            crate::config::CustomCommandAction::Shell => Ok(Self::Shell),
-            crate::config::CustomCommandAction::Pane => Ok(Self::Pane),
-            crate::config::CustomCommandAction::PluginAction => Ok(Self::PluginAction),
-            crate::config::CustomCommandAction::Popup => Err(()),
+            crate::config::CustomCommandAction::Shell => Self::Shell,
+            crate::config::CustomCommandAction::Pane => Self::Pane,
+            crate::config::CustomCommandAction::Popup => Self::Popup,
+            crate::config::CustomCommandAction::PluginAction => Self::PluginAction,
         }
     }
 }
@@ -931,6 +936,26 @@ pub struct PaneSurfaceFrame {
     pub frame: FrameData,
     pub panes: Vec<PaneSurfacePane>,
     pub splits: Vec<PaneSurfaceSplit>,
+    pub popup: Option<Box<ClientShellPopupSurface>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClientShellPopupSize {
+    Cells(u16),
+    Percent(u8),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientShellPopupSurface {
+    pub terminal_id: String,
+    pub title: String,
+    pub width: Option<ClientShellPopupSize>,
+    pub height: Option<ClientShellPopupSize>,
+    pub frame: FrameData,
+    pub mouse_reporting: bool,
+    pub sgr_pixel_mouse: bool,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
 }
 
 /// Terminal ANSI bytes encoded by the server for network-efficient clients.

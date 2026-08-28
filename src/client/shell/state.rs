@@ -53,6 +53,7 @@ pub(super) struct ShellHitMap {
     pub(super) workspace_max_scroll: usize,
     pub(super) tabs: Vec<(Rect, String)>,
     pub(super) panes: Vec<PaneHit>,
+    pub(super) popup: Option<PaneHit>,
     pub(super) pane_splits: Vec<PaneSplitHit>,
     pub(super) agents: Vec<(Rect, String)>,
     pub(super) agent_body: Rect,
@@ -93,6 +94,7 @@ pub(super) struct PaneHit {
     pub(super) rect: Rect,
     pub(super) inner_rect: Rect,
     pub(super) pane_id: String,
+    pub(super) popup: bool,
     pub(super) mouse_reporting: bool,
     pub(super) sgr_pixel_mouse: bool,
     pub(super) pixel_width: u32,
@@ -507,6 +509,7 @@ impl ClientShellOverlay {
 #[derive(Debug)]
 pub(super) enum PendingEndpointKind {
     Generic,
+    PopupCommand,
     ReloadConfig,
     IntegrationList,
     IntegrationInstall,
@@ -556,17 +559,26 @@ pub(super) struct ClientVisibleNotification {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ClientInputTarget {
+    Pane(String),
+    Popup(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ClientInputContext {
     pub(super) mode: ClientShellMode,
     pub(super) overlay: Option<ClientShellOverlayKind>,
+    pub(super) popup_terminal_id: Option<String>,
+    pub(super) popup_pending: bool,
 }
 
-type ClientInputLeases = crate::input::InputLeaseTable<u8, ClientInputContext, String>;
+type ClientInputLeases = crate::input::InputLeaseTable<u8, ClientInputContext, ClientInputTarget>;
 
 pub(crate) struct ClientShellState {
     pub(super) config: ClientShellConfig,
     pub(super) snapshot: Option<Box<ClientShellSnapshot>>,
     pub(super) pane_surface: Option<PaneSurfaceFrame>,
+    pub(super) popup_terminal_id: Option<String>,
     pub(super) sidebar_collapsed: bool,
     pub(super) sidebar_collapsed_manual: bool,
     pub(super) sidebar_width: u16,
@@ -592,6 +604,8 @@ pub(crate) struct ClientShellState {
     pub(super) pane_mouse_gesture: Option<ClientPaneMouseGesture>,
     pub(super) host_mouse_pixels: Option<crate::input::mouse::HostPixels>,
     pub(super) input_leases: ClientInputLeases,
+    pub(super) popup_pending: bool,
+    pub(super) popup_pending_deadline: Option<std::time::Instant>,
     pub(super) next_request_id: u64,
     pub(super) pending_requests: HashMap<String, PendingEndpointRequest>,
     pub(super) pending_integration_installs: usize,
@@ -635,6 +649,7 @@ impl ClientShellState {
             config,
             snapshot: None,
             pane_surface: None,
+            popup_terminal_id: None,
             sidebar_collapsed,
             sidebar_collapsed_manual: preferences.sidebar_collapsed.is_some(),
             sidebar_width,
@@ -660,6 +675,8 @@ impl ClientShellState {
             pane_mouse_gesture: None,
             host_mouse_pixels: None,
             input_leases: ClientInputLeases::default(),
+            popup_pending: false,
+            popup_pending_deadline: None,
             next_request_id: 1,
             pending_requests: HashMap::new(),
             pending_integration_installs: 0,
@@ -715,6 +732,7 @@ impl ClientShellState {
             .is_some_and(|current| current.boot_id != snapshot.boot_id)
         {
             self.pane_surface = None;
+            self.popup_terminal_id = None;
             self.chrome_drag = None;
             self.workspace_press = None;
             self.tab_press = None;
@@ -725,6 +743,8 @@ impl ClientShellState {
             self.reveal_focused_tab = true;
             self.last_tab_bar_width = None;
             self.pending_requests.clear();
+            self.popup_pending = false;
+            self.popup_pending_deadline = None;
             self.pending_integration_installs = 0;
             self.pending_notifications.clear();
             self.visible_notification = None;
@@ -786,7 +806,46 @@ impl ClientShellState {
         {
             self.hits = ShellHitMap::default();
         }
+        let previous_popup = self.popup_terminal_id.clone();
+        let next_popup = surface
+            .popup
+            .as_deref()
+            .map(|popup| popup.terminal_id.clone());
+        if previous_popup != next_popup {
+            if let Some(terminal_id) = previous_popup.as_ref() {
+                self.input_leases
+                    .remove_target(&ClientInputTarget::Popup(terminal_id.clone()));
+            }
+            self.mode = ClientShellMode::Terminal;
+            self.navigate_workspace_id = None;
+            self.overlay = None;
+            self.chrome_drag = None;
+            self.workspace_press = None;
+            self.tab_press = None;
+            if self.pane_mouse_gesture.as_ref().is_some_and(|gesture| {
+                gesture.hit.popup && previous_popup.as_deref() == Some(gesture.hit.pane_id.as_str())
+            }) {
+                self.pane_mouse_gesture = None;
+            }
+            self.hits.popup = None;
+            self.endpoint_error = None;
+        }
+        if next_popup.is_some() {
+            self.popup_pending = false;
+            self.popup_pending_deadline = None;
+        }
+        self.popup_terminal_id = next_popup;
         self.pane_surface = Some(surface);
+    }
+
+    pub(crate) fn tick_popup_pending(&mut self, now: std::time::Instant) {
+        if self
+            .popup_pending_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.popup_pending = false;
+            self.popup_pending_deadline = None;
+        }
     }
 
     pub(crate) fn invalidate_pane_surface(&mut self) {
