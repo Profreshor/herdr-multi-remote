@@ -221,6 +221,7 @@ impl ClientShellState {
             Method::WorktreeList(WorktreeListParams {
                 workspace_id: Some(workspace_id),
                 cwd: None,
+                trust_repository: false,
             }),
             kind,
             outcome,
@@ -276,6 +277,7 @@ impl ClientShellState {
                 path: Some(path),
                 label: None,
                 focus: true,
+                trust_repository: false,
             }),
             PendingEndpointKind::WorktreeCreate,
             outcome,
@@ -326,6 +328,7 @@ impl ClientShellState {
                 branch: None,
                 label: None,
                 focus: true,
+                trust_repository: false,
             }),
             PendingEndpointKind::WorktreeOpen,
             outcome,
@@ -348,6 +351,7 @@ impl ClientShellState {
             crate::api::schema::Method::WorktreeRemove(crate::api::schema::WorktreeRemoveParams {
                 workspace_id,
                 force: forced,
+                trust_repository: false,
             }),
             PendingEndpointKind::WorktreeRemove { forced },
             outcome,
