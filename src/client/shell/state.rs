@@ -17,6 +17,12 @@ pub(crate) struct ClientShellConfig {
     pub(super) agents: crate::config::AgentsSidebarConfig,
     pub(super) agent_panel_sort: crate::config::AgentPanelSortConfig,
     pub(super) status_indicators: crate::config::StatusIndicatorStyle,
+    pub(super) sound_enabled: bool,
+    pub(super) toast_delivery: crate::config::ToastDelivery,
+    pub(super) toast_delay_seconds: u64,
+    pub(super) toast_position: crate::config::ToastHerdrPosition,
+    pub(super) theme_name: String,
+    pub(super) theme_runtime: crate::app::state::ThemeRuntimeConfig,
     pub(super) palette: Palette,
     pub(super) keybinds: LiveKeybindConfig,
     pub(super) prompt_new_tab_name: bool,
@@ -61,6 +67,9 @@ pub(super) struct ShellHitMap {
     pub(super) new_tab: Rect,
     pub(super) tab_scroll_left: Rect,
     pub(super) tab_scroll_right: Rect,
+    pub(super) global_launcher: Rect,
+    pub(super) notification_toast: Rect,
+    pub(super) global_menu_rows: Vec<(Rect, usize)>,
     pub(super) context_menu_rows: Vec<(Rect, usize)>,
     pub(super) overlay_primary: Rect,
     pub(super) overlay_clear: Rect,
@@ -70,6 +79,13 @@ pub(super) struct ShellHitMap {
     pub(super) navigator_rows: Vec<(Rect, usize)>,
     pub(super) worktree_search: Rect,
     pub(super) worktree_rows: Vec<(Rect, usize)>,
+    pub(super) help_popup: Rect,
+    pub(super) help_scrollbar: Rect,
+    pub(super) help_scroll_metrics: Option<crate::pane::ScrollMetrics>,
+    pub(super) help_max_scroll: usize,
+    pub(super) settings_popup: Rect,
+    pub(super) settings_tabs: Vec<(Rect, ClientSettingsSection)>,
+    pub(super) settings_choices: Vec<(Rect, usize)>,
 }
 
 #[derive(Clone)]
@@ -121,6 +137,9 @@ pub(super) enum ClientChromeDrag {
     AgentScrollbar {
         grab_row_offset: u16,
     },
+    HelpScrollbar {
+        grab_row_offset: u16,
+    },
     Tab {
         tab_id: String,
         workspace_id: String,
@@ -161,6 +180,7 @@ pub(crate) struct ClientShellInput {
     pub detach: bool,
     pub repaint: bool,
     pub resize: bool,
+    pub query_host_appearance: bool,
     pub requests: Vec<ClientMessage>,
     pub actions: Vec<ClientShellAction>,
 }
@@ -183,6 +203,8 @@ pub(super) enum ClientShellOverlayKind {
     WorktreeOpen,
     WorktreeRemove,
     ContextMenu,
+    GlobalMenu,
+    Settings,
 }
 
 #[derive(Debug)]
@@ -256,6 +278,52 @@ pub(super) struct ClientHelpOverlay {
     pub(super) query: String,
     pub(super) search_focused: bool,
     pub(super) scroll: usize,
+}
+
+#[derive(Debug)]
+pub(super) struct ClientGlobalMenuOverlay {
+    pub(super) highlighted: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ClientSettingsSection {
+    Theme,
+    Indicators,
+    Sound,
+    Toast,
+    Integrations,
+}
+
+impl ClientSettingsSection {
+    pub(super) const ALL: &[Self] = &[
+        Self::Theme,
+        Self::Indicators,
+        Self::Sound,
+        Self::Toast,
+        Self::Integrations,
+    ];
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Theme => "theme",
+            Self::Indicators => "indicators",
+            Self::Sound => "sound",
+            Self::Toast => "toasts",
+            Self::Integrations => "integrations",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct ClientSettingsOverlay {
+    pub(super) section: ClientSettingsSection,
+    pub(super) selected: usize,
+    pub(super) original_theme_name: String,
+    pub(super) original_palette: Palette,
+    pub(super) integrations: Vec<crate::api::schema::IntegrationInfo>,
+    pub(super) integration_messages: Vec<String>,
+    pub(super) loading_integrations: bool,
+    pub(super) installing_integrations: bool,
 }
 
 #[derive(Debug)]
@@ -416,6 +484,8 @@ pub(super) enum ClientShellOverlay {
     WorktreeOpen(ClientWorktreeOpenOverlay),
     WorktreeRemove(ClientWorktreeRemoveOverlay),
     ContextMenu(ClientContextMenuOverlay),
+    GlobalMenu(ClientGlobalMenuOverlay),
+    Settings(ClientSettingsOverlay),
 }
 
 impl ClientShellOverlay {
@@ -429,6 +499,8 @@ impl ClientShellOverlay {
             Self::WorktreeOpen(_) => ClientShellOverlayKind::WorktreeOpen,
             Self::WorktreeRemove(_) => ClientShellOverlayKind::WorktreeRemove,
             Self::ContextMenu(_) => ClientShellOverlayKind::ContextMenu,
+            Self::GlobalMenu(_) => ClientShellOverlayKind::GlobalMenu,
+            Self::Settings(_) => ClientShellOverlayKind::Settings,
         }
     }
 }
@@ -437,6 +509,8 @@ impl ClientShellOverlay {
 pub(super) enum PendingEndpointKind {
     Generic,
     ReloadConfig,
+    IntegrationList,
+    IntegrationInstall,
     PrepareWorktreeCreate { workspace_id: String },
     PrepareWorktreeOpen { workspace_id: String },
     PrepareWorktreeRemove { workspace_id: String },
@@ -454,6 +528,32 @@ pub(super) struct PendingEndpointRequest {
 pub(crate) struct ClientShellEndpointError {
     pub code: Option<String>,
     pub message: String,
+}
+
+pub(crate) enum ClientShellNotificationEffect {
+    Sound {
+        sound: crate::sound::Sound,
+        agent: Option<String>,
+    },
+    Terminal {
+        title: String,
+        body: Option<String>,
+    },
+    System {
+        title: String,
+        body: Option<String>,
+    },
+}
+
+pub(super) struct ClientPendingNotification {
+    pub(super) event: SemanticNotification,
+    pub(super) deadline: std::time::Instant,
+    pub(super) validate_state: bool,
+}
+
+pub(super) struct ClientVisibleNotification {
+    pub(super) event: SemanticNotification,
+    pub(super) deadline: std::time::Instant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -495,6 +595,10 @@ pub(crate) struct ClientShellState {
     pub(super) input_leases: ClientInputLeases,
     pub(super) next_request_id: u64,
     pub(super) pending_requests: HashMap<String, PendingEndpointRequest>,
+    pub(super) pending_integration_installs: usize,
+    pub(super) pending_notifications: Vec<ClientPendingNotification>,
+    pub(super) visible_notification: Option<ClientVisibleNotification>,
+    pub(super) outer_focused: Option<bool>,
     pub(super) endpoint_error: Option<String>,
 }
 
@@ -559,6 +663,10 @@ impl ClientShellState {
             input_leases: ClientInputLeases::default(),
             next_request_id: 1,
             pending_requests: HashMap::new(),
+            pending_integration_installs: 0,
+            pending_notifications: Vec::new(),
+            visible_notification: None,
+            outer_focused: None,
             endpoint_error: None,
         }
     }
@@ -618,6 +726,9 @@ impl ClientShellState {
             self.reveal_focused_tab = true;
             self.last_tab_bar_width = None;
             self.pending_requests.clear();
+            self.pending_integration_installs = 0;
+            self.pending_notifications.clear();
+            self.visible_notification = None;
             self.endpoint_error = None;
             self.navigate_workspace_id = None;
             self.overlay = None;

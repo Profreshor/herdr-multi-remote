@@ -42,6 +42,15 @@ impl ClientShellState {
                     outcome.repaint = true;
                     return;
                 }
+                if action == crate::input::KeybindAction::Settings {
+                    self.open_settings_overlay();
+                    outcome.repaint = true;
+                    return;
+                }
+                if action == crate::input::KeybindAction::OpenNotificationTarget {
+                    self.focus_visible_notification(outcome);
+                    return;
+                }
                 if action == crate::input::KeybindAction::ReloadConfig {
                     self.push_endpoint_method_with_kind(
                         crate::api::schema::Method::ServerReloadConfig(
@@ -196,9 +205,9 @@ impl ClientShellState {
         boot_id: &str,
         request_id: &str,
         result: Result<crate::api::schema::ResponseResult, ClientShellEndpointError>,
-    ) -> bool {
+    ) -> (bool, Vec<ClientShellAction>) {
         let Some(pending) = self.pending_requests.remove(request_id) else {
-            return false;
+            return (false, Vec::new());
         };
         if pending.boot_id != boot_id
             || self
@@ -206,12 +215,12 @@ impl ClientShellState {
                 .as_deref()
                 .is_none_or(|snapshot| snapshot.boot_id != boot_id)
         {
-            return false;
+            return (false, Vec::new());
         }
         match pending.kind {
             PendingEndpointKind::Generic => {}
             PendingEndpointKind::ReloadConfig => {
-                return match result {
+                let repaint = match result {
                     Ok(crate::api::schema::ResponseResult::ConfigReload {
                         diagnostics, ..
                     }) if !diagnostics.is_empty() => {
@@ -230,10 +239,20 @@ impl ClientShellState {
                         true
                     }
                 };
+                return (repaint, Vec::new());
             }
-            kind => return self.handle_worktree_endpoint_result(kind, result),
+            kind @ (PendingEndpointKind::IntegrationList
+            | PendingEndpointKind::IntegrationInstall) => {
+                return self.handle_settings_endpoint_result(kind, result);
+            }
+            kind => {
+                return (
+                    self.handle_worktree_endpoint_result(kind, result),
+                    Vec::new(),
+                );
+            }
         }
-        match result {
+        let repaint = match result {
             Ok(_) => false,
             Err(error)
                 if self.config.confirm_close
@@ -249,7 +268,8 @@ impl ClientShellState {
                 self.endpoint_error = Some(error.message);
                 true
             }
-        }
+        };
+        (repaint, Vec::new())
     }
 
     pub(super) fn endpoint_method_for_action(

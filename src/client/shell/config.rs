@@ -49,6 +49,7 @@ impl ClientShellState {
 
 impl ClientShellConfig {
     pub(crate) fn from_config(config: &Config) -> Self {
+        let theme_runtime = crate::app::client_theme_runtime_from_config(config);
         Self {
             sidebar_width: config.ui.sidebar_width,
             sidebar_min_width: config.ui.sidebar_min_width,
@@ -62,6 +63,12 @@ impl ClientShellConfig {
             agents: config.ui.sidebar.agents.clone(),
             agent_panel_sort: config.ui.agent_panel_sort,
             status_indicators: config.ui.status_indicators,
+            sound_enabled: config.ui.sound.enabled,
+            toast_delivery: config.ui.toast.delivery,
+            toast_delay_seconds: config.ui.toast.delay_seconds,
+            toast_position: config.ui.toast.herdr.position,
+            theme_name: theme_runtime.manual_name.clone(),
+            theme_runtime,
             palette: crate::app::client_palette_from_config(config),
             keybinds: config
                 .live_keybinds_with_diagnostics()
@@ -134,6 +141,10 @@ impl ClientShellConfig {
                 self.agents = ui.sidebar.agents.clone();
                 self.agent_panel_sort = ui.agent_panel_sort;
                 self.status_indicators = ui.status_indicators;
+                self.sound_enabled = ui.sound.enabled;
+                self.toast_delivery = ui.toast.delivery;
+                self.toast_delay_seconds = ui.toast.delay_seconds;
+                self.toast_position = ui.toast.herdr.position;
                 self.prompt_new_tab_name = ui.prompt_new_tab_name;
                 self.prompt_new_workspace_name = ui.prompt_new_workspace_name;
                 self.confirm_close = ui.confirm_close;
@@ -144,6 +155,8 @@ impl ClientShellConfig {
         }
 
         if !invalid_section("theme") {
+            self.theme_runtime = crate::app::client_theme_runtime_from_config(config);
+            self.theme_name = self.theme_runtime.manual_name.clone();
             self.palette = crate::app::client_palette_from_config(config);
         }
         if !invalid_section("worktrees") {

@@ -62,6 +62,24 @@ impl ConfigEdit<'_> {
     }
 }
 
+pub(crate) fn update_file(
+    description: &str,
+    update: impl FnOnce(&str) -> String,
+) -> Result<(), String> {
+    let path = super::config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create config directory: {error}"))?;
+    }
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    std::fs::write(&path, update(&content))
+        .map_err(|error| format!("failed to save {description}: {error}"))
+}
+
+pub(crate) fn write_edit(edit: ConfigEdit<'_>) -> Result<(), String> {
+    update_file(edit.description(), |content| edit.apply(content))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

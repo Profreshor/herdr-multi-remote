@@ -108,6 +108,7 @@ pub(super) fn render_worktree_create_overlay(
             visible: true,
             shape: 0,
         }),
+        ..OverlayRender::default()
     })
 }
 
@@ -293,6 +294,7 @@ pub(super) fn render_worktree_open_overlay(
             visible: true,
             shape: 0,
         }),
+        ..OverlayRender::default()
     })
 }
 
@@ -403,5 +405,6 @@ pub(super) fn render_worktree_remove_overlay(
         worktree_search: Rect::default(),
         worktree_rows: Vec::new(),
         cursor: None,
+        ..OverlayRender::default()
     })
 }

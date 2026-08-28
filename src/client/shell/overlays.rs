@@ -1,7 +1,9 @@
 use super::*;
 
+mod settings_overlay;
 mod worktree_overlays;
 
+#[derive(Default)]
 pub(crate) struct OverlayRender {
     pub(crate) primary: Rect,
     pub(crate) clear: Rect,
@@ -11,6 +13,13 @@ pub(crate) struct OverlayRender {
     pub(crate) navigator_rows: Vec<(Rect, usize)>,
     pub(crate) worktree_search: Rect,
     pub(crate) worktree_rows: Vec<(Rect, usize)>,
+    pub(crate) help_popup: Rect,
+    pub(crate) help_scrollbar: Rect,
+    pub(crate) help_scroll_metrics: Option<crate::pane::ScrollMetrics>,
+    pub(crate) help_max_scroll: usize,
+    pub(crate) settings_popup: Rect,
+    pub(crate) settings_tabs: Vec<(Rect, ClientSettingsSection)>,
+    pub(crate) settings_choices: Vec<(Rect, usize)>,
     pub(crate) cursor: Option<crate::protocol::CursorState>,
 }
 
@@ -23,7 +32,9 @@ pub(crate) fn render_client_overlay(
 ) -> Option<OverlayRender> {
     if !matches!(
         o,
-        ClientShellOverlay::Navigator(_) | ClientShellOverlay::ContextMenu(_)
+        ClientShellOverlay::Navigator(_)
+            | ClientShellOverlay::ContextMenu(_)
+            | ClientShellOverlay::GlobalMenu(_)
     ) {
         for y in b.area.y..b.area.bottom() {
             for x in b.area.x..b.area.right() {
@@ -37,6 +48,7 @@ pub(crate) fn render_client_overlay(
         ClientShellOverlay::ConfirmClose(v) => render_confirm_close_overlay(b, v, p),
         ClientShellOverlay::Help(v) => render_help_overlay(b, v, k, p),
         ClientShellOverlay::Navigator(v) => render_navigator_overlay(b, v, s, p),
+        ClientShellOverlay::Settings(v) => settings_overlay::render_settings_overlay(b, v, p),
         ClientShellOverlay::WorktreeCreate(v) => {
             worktree_overlays::render_worktree_create_overlay(b, v, p)
         }
@@ -46,8 +58,62 @@ pub(crate) fn render_client_overlay(
         ClientShellOverlay::WorktreeRemove(v) => {
             worktree_overlays::render_worktree_remove_overlay(b, v, p)
         }
-        ClientShellOverlay::ContextMenu(_) => None,
+        ClientShellOverlay::ContextMenu(_) | ClientShellOverlay::GlobalMenu(_) => None,
     }
+}
+
+pub(crate) fn render_global_menu(
+    buffer: &mut Buffer,
+    launcher: Rect,
+    menu: &ClientGlobalMenuOverlay,
+    palette: &Palette,
+) -> Option<Vec<(Rect, usize)>> {
+    let screen = buffer.area;
+    let width = super::super::global_menu::GLOBAL_MENU_ITEMS
+        .iter()
+        .map(|(label, _)| display_width(label))
+        .max()
+        .unwrap_or(8)
+        .saturating_add(4)
+        .min(screen.width.max(1));
+    let height = (super::super::global_menu::GLOBAL_MENU_ITEMS.len() as u16)
+        .saturating_add(2)
+        .min(screen.height.max(1));
+    let x = launcher
+        .right()
+        .saturating_sub(width)
+        .min(screen.right().saturating_sub(width));
+    let y = launcher.y.saturating_sub(height).max(screen.y);
+    let inner = panel(
+        buffer,
+        Rect::new(x, y, width, height),
+        palette.accent,
+        palette.panel_bg,
+    )?;
+    let mut rows = Vec::new();
+    for (index, (label, _)) in super::super::global_menu::GLOBAL_MENU_ITEMS
+        .iter()
+        .enumerate()
+    {
+        let row_y = inner.y.saturating_add(index as u16);
+        if row_y >= inner.bottom() {
+            break;
+        }
+        let row = Rect::new(inner.x, row_y, inner.width, 1);
+        let highlighted = index == menu.highlighted;
+        let style = if highlighted {
+            Style::default()
+                .fg(panel_contrast_fg(palette))
+                .bg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.text).bg(palette.panel_bg)
+        };
+        buffer.set_style(row, style);
+        put_text(buffer, row.x, row.y, row.width, &format!(" {label}"), style);
+        rows.push((row, index));
+    }
+    Some(rows)
 }
 
 pub(crate) fn render_context_menu(
@@ -247,6 +313,7 @@ fn render_rename_overlay(
             visible: true,
             shape: 0,
         }),
+        ..OverlayRender::default()
     })
 }
 
@@ -486,7 +553,72 @@ fn render_navigator_overlay(
             visible: true,
             shape: 0,
         }),
+        ..OverlayRender::default()
     })
+}
+
+fn help_lines(
+    keybinds: &LiveKeybindConfig,
+    query: &str,
+    palette: &Palette,
+) -> Vec<(usize, ratatui::text::Line<'static>)> {
+    use ratatui::text::{Line, Span};
+
+    let groups = crate::input::filter_keybind_help_groups(
+        crate::input::keybind_help_groups(&keybinds.keybinds, keybinds.prefix),
+        query,
+    );
+    let key_width = groups
+        .iter()
+        .flat_map(|(_, entries)| entries.iter().map(|(key, _)| key.chars().count()))
+        .max()
+        .unwrap_or(8);
+    if groups.is_empty() {
+        let message = " no matching keybinds";
+        return vec![(
+            message.chars().count(),
+            Line::from(Span::styled(
+                message,
+                Style::default().fg(palette.overlay1).bg(palette.panel_bg),
+            )),
+        )];
+    }
+
+    let mut lines = Vec::new();
+    for (group, entries) in groups {
+        lines.push((
+            group.len() + 1,
+            Line::from(Span::styled(
+                format!(" {group}"),
+                Style::default()
+                    .fg(palette.accent)
+                    .bg(palette.panel_bg)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        ));
+        for (key, label) in entries {
+            let padded_key = format!(" {key:<key_width$} ");
+            let width = padded_key.chars().count() + label.chars().count();
+            lines.push((
+                width,
+                Line::from(vec![
+                    Span::styled(
+                        padded_key,
+                        Style::default()
+                            .fg(palette.mauve)
+                            .bg(palette.panel_bg)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        label.into_owned(),
+                        Style::default().fg(palette.text).bg(palette.panel_bg),
+                    ),
+                ]),
+            ));
+        }
+        lines.push((0, Line::raw("")));
+    }
+    lines
 }
 
 fn render_help_overlay(
@@ -495,6 +627,8 @@ fn render_help_overlay(
     k: &LiveKeybindConfig,
     p: &Palette,
 ) -> Option<OverlayRender> {
+    use ratatui::widgets::{Paragraph, Widget, Wrap};
+
     let q = popup(b.area, 76, 22)?;
     let i = panel(b, q, p.accent, p.panel_bg)?;
     if i.width < 20 || i.height < 6 {
@@ -540,36 +674,59 @@ fn render_help_overlay(
             .fg(if h.search_focused { p.text } else { p.overlay0 })
             .bg(p.panel_bg),
     );
-    let groups = crate::input::filter_keybind_help_groups(
-        crate::input::keybind_help_groups(&k.keybinds, k.prefix),
-        &h.query,
-    );
-    let mut lines = Vec::new();
-    for (g, es) in groups {
-        lines.push((
-            format!(" {g}"),
-            Style::default()
-                .fg(p.accent)
-                .bg(p.panel_bg)
-                .add_modifier(Modifier::BOLD),
-        ));
-        for (key, label) in es {
-            lines.push((
-                format!(" {key}  {label}"),
-                Style::default().fg(p.text).bg(p.panel_bg),
-            ));
-        }
-        lines.push((String::new(), Style::default().bg(p.panel_bg)));
-    }
+
     let body = Rect::new(i.x, i.y + 3, i.width, i.height.saturating_sub(5));
-    for (r, (t, st)) in lines
-        .into_iter()
-        .skip(h.scroll)
-        .take(body.height as usize)
-        .enumerate()
-    {
-        put_text(b, body.x, body.y + r as u16, body.width, &t, st)
+    let lines = help_lines(k, &h.query, p);
+    let viewport_rows = usize::from(body.height.max(1));
+    let wrapped_rows = |width: u16| {
+        let width = usize::from(width.max(1));
+        lines
+            .iter()
+            .map(|(line_width, _)| line_width.max(&1).div_ceil(width))
+            .sum::<usize>()
+    };
+    let needs_scrollbar = wrapped_rows(body.width) > viewport_rows;
+    let text_area = if needs_scrollbar {
+        Rect::new(body.x, body.y, body.width.saturating_sub(1), body.height)
+    } else {
+        body
+    };
+    let total_rows = wrapped_rows(text_area.width);
+    let max_scroll = total_rows.saturating_sub(viewport_rows);
+    let scroll = h.scroll.min(max_scroll);
+    let metrics = crate::pane::ScrollMetrics {
+        offset_from_bottom: max_scroll.saturating_sub(scroll),
+        max_offset_from_bottom: max_scroll,
+        viewport_rows,
+    };
+    let scrollbar = needs_scrollbar.then_some(Rect::new(
+        body.right().saturating_sub(1),
+        body.y,
+        1,
+        body.height,
+    ));
+    Widget::render(
+        Paragraph::new(lines.into_iter().map(|(_, line)| line).collect::<Vec<_>>())
+            .wrap(Wrap { trim: false })
+            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+        text_area,
+        b,
+    );
+    if let Some(track) = scrollbar {
+        if let Some(thumb) = crate::ui::scrollbar_thumb(metrics, track) {
+            for y in track.y..track.bottom() {
+                b[(track.x, y)]
+                    .set_symbol("▐")
+                    .set_style(Style::default().fg(p.overlay0).bg(p.panel_bg));
+            }
+            for y in thumb.top..thumb.top.saturating_add(thumb.len) {
+                b[(track.x, y)]
+                    .set_symbol("▐")
+                    .set_style(Style::default().fg(p.overlay1).bg(p.panel_bg));
+            }
+        }
     }
+
     put_text(
         b,
         i.x,
@@ -583,20 +740,18 @@ fn render_help_overlay(
         Style::default().fg(p.overlay0).bg(p.panel_bg),
     );
     Some(OverlayRender {
-        primary: Rect::default(),
-        clear: Rect::default(),
         cancel: close,
-        navigator_popup: Rect::default(),
-        navigator_search: Rect::default(),
-        navigator_rows: Vec::new(),
-        worktree_search: Rect::default(),
-        worktree_rows: Vec::new(),
+        help_popup: q,
+        help_scrollbar: scrollbar.unwrap_or_default(),
+        help_scroll_metrics: Some(metrics),
+        help_max_scroll: max_scroll,
         cursor: h.search_focused.then(|| crate::protocol::CursorState {
             x: (i.x + 3 + display_width(&h.query)).min(i.right() - 1),
             y: sy,
             visible: true,
             shape: 0,
         }),
+        ..OverlayRender::default()
     })
 }
 fn render_confirm_close_overlay(
@@ -657,5 +812,6 @@ fn render_confirm_close_overlay(
         worktree_search: Rect::default(),
         worktree_rows: Vec::new(),
         cursor: None,
+        ..OverlayRender::default()
     })
 }

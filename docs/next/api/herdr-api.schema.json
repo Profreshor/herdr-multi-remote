@@ -5704,6 +5704,22 @@
         {
           "properties": {
             "method": {
+              "const": "integration.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "integration.install",
               "type": "string"
             },
@@ -7171,6 +7187,33 @@
           ],
           "type": "object"
         },
+        "IntegrationInfo": {
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "command": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/schemas/success_response/$defs/IntegrationState"
+            },
+            "target": {
+              "$ref": "#/schemas/success_response/$defs/IntegrationTarget"
+            }
+          },
+          "required": [
+            "target",
+            "label",
+            "command",
+            "available",
+            "state"
+          ],
+          "type": "object"
+        },
         "IntegrationInstallResult": {
           "properties": {
             "messages": {
@@ -7184,6 +7227,14 @@
             "messages"
           ],
           "type": "object"
+        },
+        "IntegrationState": {
+          "enum": [
+            "not_installed",
+            "current",
+            "outdated"
+          ],
+          "type": "string"
         },
         "IntegrationTarget": {
           "enum": [
@@ -9493,6 +9544,25 @@
                 "type",
                 "changed",
                 "reason"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "integrations": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/IntegrationInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "integration_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "integrations"
               ],
               "type": "object"
             },

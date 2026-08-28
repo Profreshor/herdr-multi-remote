@@ -506,7 +506,13 @@ impl ClientShellState {
                     Some("endpoint returned an unexpected worktree result".to_owned());
                 true
             }
-            (PendingEndpointKind::Generic | PendingEndpointKind::ReloadConfig, Err(error)) => {
+            (
+                PendingEndpointKind::Generic
+                | PendingEndpointKind::ReloadConfig
+                | PendingEndpointKind::IntegrationList
+                | PendingEndpointKind::IntegrationInstall,
+                Err(error),
+            ) => {
                 self.endpoint_error = Some(error.message);
                 true
             }

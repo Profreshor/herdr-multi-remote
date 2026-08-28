@@ -350,6 +350,13 @@ pub(crate) fn render_sidebar(
             " new",
             Style::default().fg(palette.overlay0),
         );
+        let launcher_width = 6.min(workspace_area.width);
+        hits.global_launcher = Rect::new(
+            workspace_area.right().saturating_sub(launcher_width),
+            footer_y,
+            launcher_width,
+            1,
+        );
         put_right_text(
             buffer,
             workspace_area,

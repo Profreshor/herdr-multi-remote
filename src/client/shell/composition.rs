@@ -129,12 +129,35 @@ impl ClientShellState {
                 frame.cursor = None;
             }
         }
+        self.hits.notification_toast = Rect::default();
+        if let Some(notification) = self.visible_notification.as_ref() {
+            let graphics = std::mem::take(&mut frame.graphics);
+            let cursor = frame.cursor.clone();
+            let mut composed = frame.to_ratatui_buffer()?;
+            self.hits.notification_toast = notifications::render_visible_notification(
+                &mut composed,
+                layout.pane_surface,
+                notification,
+                self.config.toast_position,
+                &self.config.palette,
+            );
+            frame = FrameData::from_ratatui_buffer_with_hyperlinks(&composed, cursor, &[]);
+            frame.graphics = graphics;
+        }
         if let Some(overlay) = self.overlay.as_ref() {
             let graphics = std::mem::take(&mut frame.graphics);
             let mut composed = frame.to_ratatui_buffer()?;
             let cursor = if let ClientShellOverlay::ContextMenu(menu) = overlay {
                 self.hits.context_menu_rows =
                     render::render_context_menu(&mut composed, menu, &self.config.palette)?;
+                None
+            } else if let ClientShellOverlay::GlobalMenu(menu) = overlay {
+                self.hits.global_menu_rows = render::render_global_menu(
+                    &mut composed,
+                    self.hits.global_launcher,
+                    menu,
+                    &self.config.palette,
+                )?;
                 None
             } else {
                 let rendered = render::render_client_overlay(
@@ -152,10 +175,20 @@ impl ClientShellState {
                 self.hits.navigator_rows = rendered.navigator_rows;
                 self.hits.worktree_search = rendered.worktree_search;
                 self.hits.worktree_rows = rendered.worktree_rows;
+                self.hits.help_popup = rendered.help_popup;
+                self.hits.help_scrollbar = rendered.help_scrollbar;
+                self.hits.help_scroll_metrics = rendered.help_scroll_metrics;
+                self.hits.help_max_scroll = rendered.help_max_scroll;
+                self.hits.settings_popup = rendered.settings_popup;
+                self.hits.settings_tabs = rendered.settings_tabs;
+                self.hits.settings_choices = rendered.settings_choices;
                 rendered.cursor
             };
             frame = FrameData::from_ratatui_buffer_with_hyperlinks(&composed, cursor, &[]);
             frame.graphics = graphics;
+        }
+        if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
+            help.scroll = help.scroll.min(self.hits.help_max_scroll);
         }
         Some(frame)
     }

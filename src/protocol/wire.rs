@@ -931,6 +931,35 @@ pub enum NotifyKind {
     SystemToast,
 }
 
+/// A client-rendered notification category. The server reports the semantic
+/// event; each connected shell client chooses how (or whether) to present it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SemanticNotificationKind {
+    NeedsAttention,
+    Finished,
+    UpdateInstalled,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SemanticNotificationSound {
+    Done,
+    Request,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticNotification {
+    pub kind: SemanticNotificationKind,
+    pub title: String,
+    pub body: Option<String>,
+    pub sound: Option<SemanticNotificationSound>,
+    pub agent: Option<String>,
+    pub workspace_id: Option<String>,
+    pub tab_id: Option<String>,
+    pub pane_id: Option<String>,
+    pub position: Option<crate::config::ToastHerdrPosition>,
+}
+
 /// Messages sent from the server to the client over the client protocol socket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerMessage {
@@ -1034,6 +1063,10 @@ pub enum ServerMessage {
 
     /// Active-tab pane content rendered at a client-requested origin-relative size.
     PaneSurface(PaneSurfaceFrame),
+
+    /// Ephemeral semantic notification delivered over the private control lane.
+    /// It is sent only to currently connected client-rendered shells.
+    SemanticNotification(SemanticNotification),
 }
 
 // ---------------------------------------------------------------------------
@@ -1849,6 +1882,25 @@ mod tests {
         let msg = ServerMessage::ServerShutdown {
             reason: Some("updating".to_owned()),
         };
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ServerMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn semantic_notification_roundtrip() {
+        let msg = ServerMessage::SemanticNotification(SemanticNotification {
+            kind: SemanticNotificationKind::NeedsAttention,
+            title: "codex needs attention".into(),
+            body: Some("repo · 1".into()),
+            sound: Some(SemanticNotificationSound::Request),
+            agent: Some("codex".into()),
+            workspace_id: Some("w1".into()),
+            tab_id: Some("w1:t1".into()),
+            pane_id: Some("w1:p1".into()),
+            position: Some(crate::config::ToastHerdrPosition::TopRight),
+        });
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ServerMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();

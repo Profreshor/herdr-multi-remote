@@ -273,6 +273,37 @@ fn request_round_trips_for_agent_explain() {
 }
 
 #[test]
+fn integration_list_request_and_response_round_trip() {
+    let request = Request {
+        id: "req_integrations".into(),
+        method: Method::IntegrationList(EmptyParams::default()),
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "integration.list");
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
+
+    let response = SuccessResponse {
+        id: "req_integrations".into(),
+        result: ResponseResult::IntegrationList {
+            integrations: vec![IntegrationInfo {
+                target: IntegrationTarget::Codex,
+                label: "codex".into(),
+                command: "codex".into(),
+                available: true,
+                state: IntegrationState::Outdated,
+            }],
+        },
+    };
+    let json = serde_json::to_value(&response).unwrap();
+    assert_eq!(json["result"]["type"], "integration_list");
+    assert_eq!(json["result"]["integrations"][0]["state"], "outdated");
+    assert_eq!(
+        serde_json::from_value::<SuccessResponse>(json).unwrap(),
+        response
+    );
+}
+
+#[test]
 fn notification_show_request_parses() {
     let json = r#"{"id":"req_1","method":"notification.show","params":{"title":"build failed","body":"api workspace","position":"top-left","sound":"request"}}"#;
     let request: Request = serde_json::from_str(json).unwrap();

@@ -393,9 +393,27 @@ fn resolve_effective_theme(
     )
 }
 
+pub(crate) fn client_theme_runtime_from_config(config: &Config) -> state::ThemeRuntimeConfig {
+    theme_runtime_config(config, true)
+}
+
+pub(crate) fn client_palette_for_theme(
+    runtime: &state::ThemeRuntimeConfig,
+    name: &str,
+) -> state::Palette {
+    resolve_palette_for_theme_name(name, "catppuccin", runtime, None)
+}
+
 pub(crate) fn client_palette_from_config(config: &Config) -> state::Palette {
-    let runtime = theme_runtime_config(config, true);
+    let runtime = client_theme_runtime_from_config(config);
     resolve_effective_theme(&runtime, None).0
+}
+
+pub(crate) fn client_palette_for_appearance(
+    runtime: &state::ThemeRuntimeConfig,
+    appearance: crate::terminal_theme::HostAppearance,
+) -> state::Palette {
+    resolve_effective_theme(runtime, Some(appearance)).0
 }
 
 impl App {

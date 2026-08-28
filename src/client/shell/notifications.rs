@@ -1,0 +1,242 @@
+use super::*;
+use ratatui::{
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Paragraph, Widget},
+};
+
+pub(super) fn render_visible_notification(
+    buffer: &mut Buffer,
+    area: Rect,
+    notification: &ClientVisibleNotification,
+    default_position: crate::config::ToastHerdrPosition,
+    palette: &Palette,
+) -> Rect {
+    if area.is_empty() {
+        return Rect::default();
+    }
+    let event = &notification.event;
+    let body = event.body.as_deref().unwrap_or_default();
+    let content_width = unicode_width::UnicodeWidthStr::width(event.title.as_str())
+        .max(unicode_width::UnicodeWidthStr::width(body))
+        .saturating_add(6);
+    let width = u16::try_from(content_width)
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    let height: u16 = if body.is_empty() { 3 } else { 4 }.min(area.height);
+    let position = event.position.unwrap_or(default_position);
+    let x = match position {
+        crate::config::ToastHerdrPosition::TopLeft
+        | crate::config::ToastHerdrPosition::BottomLeft => area.x,
+        crate::config::ToastHerdrPosition::TopRight
+        | crate::config::ToastHerdrPosition::BottomRight => area.right().saturating_sub(width),
+    };
+    let y = match position {
+        crate::config::ToastHerdrPosition::TopLeft
+        | crate::config::ToastHerdrPosition::TopRight => area.y,
+        crate::config::ToastHerdrPosition::BottomLeft
+        | crate::config::ToastHerdrPosition::BottomRight => area.bottom().saturating_sub(height),
+    };
+    let rect = Rect::new(x, y, width, height);
+    Clear.render(rect, buffer);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette.overlay0))
+        .style(Style::default().bg(palette.panel_bg));
+    let inner = block.inner(rect);
+    block.render(rect, buffer);
+    Paragraph::new(Line::from(vec![
+        Span::styled(
+            "●",
+            Style::default().fg(match event.kind {
+                SemanticNotificationKind::NeedsAttention => palette.red,
+                SemanticNotificationKind::Finished => palette.blue,
+                SemanticNotificationKind::UpdateInstalled | SemanticNotificationKind::Custom => {
+                    palette.accent
+                }
+            }),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            event.title.as_str(),
+            Style::default()
+                .fg(palette.text)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]))
+    .render(Rect::new(inner.x, inner.y, inner.width, 1), buffer);
+    if !body.is_empty() && inner.height > 1 {
+        Paragraph::new(Line::from(Span::styled(
+            body,
+            Style::default().fg(palette.overlay0),
+        )))
+        .render(
+            Rect::new(
+                inner.x.saturating_add(2),
+                inner.y + 1,
+                inner.width.saturating_sub(2),
+                1,
+            ),
+            buffer,
+        );
+    }
+    rect
+}
+
+impl ClientShellState {
+    pub(super) fn focus_visible_notification(&mut self, outcome: &mut ClientShellInput) {
+        let Some(notification) = self.visible_notification.take() else {
+            return;
+        };
+        outcome.repaint = true;
+        if let Some(pane_id) = notification.event.pane_id {
+            self.push_endpoint_method(
+                crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget { pane_id }),
+                outcome,
+            );
+        }
+    }
+
+    pub(crate) fn receive_notification(
+        &mut self,
+        event: SemanticNotification,
+        now: std::time::Instant,
+    ) -> (Vec<ClientShellNotificationEffect>, bool) {
+        let delay = if event.kind == SemanticNotificationKind::Custom {
+            0
+        } else {
+            self.config.toast_delay_seconds
+        };
+        let deadline = now
+            .checked_add(std::time::Duration::from_secs(delay))
+            .unwrap_or(now);
+        let cleared_visible = event.pane_id.as_deref().is_some_and(|pane_id| {
+            self.visible_notification
+                .as_ref()
+                .is_some_and(|visible| visible.event.pane_id.as_deref() == Some(pane_id))
+        });
+        if let Some(pane_id) = event.pane_id.as_deref() {
+            self.pending_notifications
+                .retain(|pending| pending.event.pane_id.as_deref() != Some(pane_id));
+            if cleared_visible {
+                self.visible_notification = None;
+            }
+        }
+        self.pending_notifications.push(ClientPendingNotification {
+            event,
+            deadline,
+            validate_state: delay > 0,
+        });
+        let (effects, repaint) = self.tick_notifications(now);
+        (effects, repaint || cleared_visible)
+    }
+
+    pub(crate) fn tick_notifications(
+        &mut self,
+        now: std::time::Instant,
+    ) -> (Vec<ClientShellNotificationEffect>, bool) {
+        let mut repaint = false;
+        if self
+            .visible_notification
+            .as_ref()
+            .is_some_and(|visible| now >= visible.deadline)
+        {
+            self.visible_notification = None;
+            repaint = true;
+        }
+
+        let pending = std::mem::take(&mut self.pending_notifications);
+        let mut effects = Vec::new();
+        for pending in pending {
+            if pending.deadline > now {
+                self.pending_notifications.push(pending);
+                continue;
+            }
+            if pending.validate_state && !self.notification_still_current(&pending.event) {
+                continue;
+            }
+            let target_active = self.notification_target_is_active(&pending.event);
+            let suppress_external = target_active && self.outer_focused != Some(false);
+            if let Some(sound) = pending.event.sound {
+                let suppress_sound =
+                    pending.event.kind == SemanticNotificationKind::Finished && suppress_external;
+                if !suppress_sound {
+                    effects.push(ClientShellNotificationEffect::Sound {
+                        sound: match sound {
+                            SemanticNotificationSound::Done => crate::sound::Sound::Done,
+                            SemanticNotificationSound::Request => crate::sound::Sound::Request,
+                        },
+                        agent: pending.event.agent.clone(),
+                    });
+                }
+            }
+
+            match self.config.toast_delivery {
+                crate::config::ToastDelivery::Off => {}
+                crate::config::ToastDelivery::Herdr if !target_active => {
+                    let duration = match pending.event.kind {
+                        SemanticNotificationKind::NeedsAttention => 8,
+                        SemanticNotificationKind::Finished => 5,
+                        SemanticNotificationKind::UpdateInstalled => 3,
+                        SemanticNotificationKind::Custom => 5,
+                    };
+                    self.visible_notification = Some(ClientVisibleNotification {
+                        event: pending.event,
+                        deadline: now + std::time::Duration::from_secs(duration),
+                    });
+                    repaint = true;
+                }
+                crate::config::ToastDelivery::Herdr => {}
+                crate::config::ToastDelivery::Terminal if !suppress_external => {
+                    effects.push(ClientShellNotificationEffect::Terminal {
+                        title: pending.event.title,
+                        body: pending.event.body,
+                    });
+                }
+                crate::config::ToastDelivery::System if !suppress_external => {
+                    effects.push(ClientShellNotificationEffect::System {
+                        title: pending.event.title,
+                        body: pending.event.body,
+                    });
+                }
+                crate::config::ToastDelivery::Terminal | crate::config::ToastDelivery::System => {}
+            }
+        }
+        (effects, repaint)
+    }
+
+    fn notification_target_is_active(&self, event: &SemanticNotification) -> bool {
+        let Some(snapshot) = self.snapshot.as_deref() else {
+            return false;
+        };
+        if let Some(tab_id) = event.tab_id.as_deref() {
+            return snapshot.focused_tab_id.as_deref() == Some(tab_id);
+        }
+        event.workspace_id.as_deref().is_some_and(|workspace_id| {
+            snapshot.focused_workspace_id.as_deref() == Some(workspace_id)
+        })
+    }
+
+    fn notification_still_current(&self, event: &SemanticNotification) -> bool {
+        let Some(pane_id) = event.pane_id.as_deref() else {
+            return true;
+        };
+        let Some(agent) = self.snapshot.as_deref().and_then(|snapshot| {
+            snapshot
+                .agents
+                .iter()
+                .find(|agent| agent.pane_id == pane_id)
+        }) else {
+            return false;
+        };
+        match event.kind {
+            SemanticNotificationKind::NeedsAttention => {
+                agent.agent_status == crate::api::schema::AgentStatus::Blocked
+            }
+            SemanticNotificationKind::Finished => matches!(
+                agent.agent_status,
+                crate::api::schema::AgentStatus::Idle | crate::api::schema::AgentStatus::Done
+            ),
+            SemanticNotificationKind::UpdateInstalled | SemanticNotificationKind::Custom => true,
+        }
+    }
+}

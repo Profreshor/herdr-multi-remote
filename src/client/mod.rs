@@ -1513,6 +1513,10 @@ fn finish_client_shell_input(
             client_shell_resize_message(shell, state.reported_size.0, state.reported_size.1, 0, 0);
         write_to_server(write_stream, &resize).map_err(ClientError::ConnectionLost)?;
     }
+    #[cfg(not(windows))]
+    if outcome.query_host_appearance {
+        query_host_terminal_appearance();
+    }
     dispatch_client_shell_actions(outcome.actions, endpoint_tx);
     for request in outcome.requests {
         write_to_server(write_stream, &request).map_err(ClientError::ConnectionLost)?;
@@ -1944,9 +1948,11 @@ async fn run_client_loop(
                 request_id,
                 result,
             } => {
-                let repaint = state.shell.as_mut().is_some_and(|shell| {
-                    shell.handle_endpoint_result(&boot_id, &request_id, *result)
-                });
+                let (repaint, actions) = state.shell.as_mut().map_or_else(
+                    || (false, Vec::new()),
+                    |shell| shell.handle_endpoint_result(&boot_id, &request_id, *result),
+                );
+                dispatch_client_shell_actions(actions, shell_endpoint_tx.as_ref());
                 if repaint {
                     if let Some(frame) = state.shell.as_mut().and_then(|shell| {
                         shell.compose(state.reported_size.0, state.reported_size.1)
@@ -2149,7 +2155,28 @@ async fn run_client_loop(
                     message,
                     body,
                 } => {
-                    handle_notify(kind, &message, body.as_deref(), &state.sound_config);
+                    if state.shell.is_none() {
+                        handle_notify(kind, &message, body.as_deref(), &state.sound_config);
+                    }
+                }
+                ServerMessage::SemanticNotification(event) => {
+                    if state.shell.is_some() {
+                        let (effects, frame) = {
+                            let shell = state.shell.as_mut().expect("checked shell mode");
+                            let (effects, repaint) =
+                                shell.receive_notification(event, std::time::Instant::now());
+                            let frame = repaint
+                                .then(|| {
+                                    shell.compose(state.reported_size.0, state.reported_size.1)
+                                })
+                                .flatten();
+                            (effects, frame)
+                        };
+                        handle_shell_notification_effects(effects, &state.sound_config);
+                        if let Some(frame) = frame {
+                            state.present_frame(frame);
+                        }
+                    }
                 }
                 ServerMessage::Clipboard { data } => {
                     forward_clipboard(&data);
@@ -2223,6 +2250,21 @@ async fn run_client_loop(
                 #[cfg(unix)]
                 if let Ok(mut matcher) = state.direct_graphics_response.lock() {
                     matcher.expire();
+                }
+                if state.shell.is_some() {
+                    let (effects, frame) = {
+                        let shell = state.shell.as_mut().expect("checked shell mode");
+                        let (effects, repaint) =
+                            shell.tick_notifications(std::time::Instant::now());
+                        let frame = repaint
+                            .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
+                            .flatten();
+                        (effects, frame)
+                    };
+                    handle_shell_notification_effects(effects, &state.sound_config);
+                    if let Some(frame) = frame {
+                        state.present_frame(frame);
+                    }
                 }
             }
         }
@@ -2374,6 +2416,35 @@ fn reload_local_client_config(
         }
         Err(diagnostics) => {
             warn!(diagnostics = ?diagnostics, "failed to reload local client config; keeping current client config");
+        }
+    }
+}
+
+fn handle_shell_notification_effects(
+    effects: Vec<shell::ClientShellNotificationEffect>,
+    sound_config: &crate::config::SoundConfig,
+) {
+    for effect in effects {
+        match effect {
+            shell::ClientShellNotificationEffect::Sound { sound, agent } => {
+                let agent = agent.as_deref().and_then(crate::detect::parse_agent_label);
+                if sound_config.allows(agent) {
+                    crate::sound::play(sound, sound_config);
+                }
+            }
+            shell::ClientShellNotificationEffect::Terminal { title, body } => {
+                if let Err(err) = crate::terminal_notify::show_notification(&title, body.as_deref())
+                {
+                    warn!(err = %err, "failed to emit terminal notification");
+                }
+            }
+            shell::ClientShellNotificationEffect::System { title, body } => {
+                if let Err(err) =
+                    crate::platform::show_desktop_notification(&title, body.as_deref())
+                {
+                    warn!(err = %err, "failed to emit system notification");
+                }
+            }
         }
     }
 }

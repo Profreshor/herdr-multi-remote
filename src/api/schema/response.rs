@@ -210,6 +210,9 @@ pub enum ResponseResult {
         changed: bool,
         reason: ClientWindowTitleReason,
     },
+    IntegrationList {
+        integrations: Vec<super::integrations::IntegrationInfo>,
+    },
     IntegrationInstall {
         target: IntegrationTarget,
         details: IntegrationInstallResult,

@@ -1,9 +1,27 @@
 use std::borrow::Cow;
 
-use crate::config::{ActionKeybinds, IndexedKeybind, Keybinds};
+use crossterm::event::{KeyCode, KeyModifiers};
+
+use crate::{
+    config::{ActionKeybinds, IndexedKeybind, Keybinds},
+    input::TerminalKey,
+};
 
 pub(crate) type KeybindHelpEntry = (String, Cow<'static, str>);
 pub(crate) type KeybindHelpGroup = (&'static str, Vec<KeybindHelpEntry>);
+
+pub(crate) fn keybind_help_text_char(key: &TerminalKey) -> Option<char> {
+    if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+        return None;
+    }
+    if let Some(character) = key.shifted_codepoint.and_then(char::from_u32) {
+        return Some(character);
+    }
+    let KeyCode::Char(character) = key.code else {
+        return None;
+    };
+    Some(character)
+}
 
 fn entry(key: impl Into<String>, label: &'static str) -> KeybindHelpEntry {
     (key.into(), Cow::Borrowed(label))

@@ -252,6 +252,36 @@ impl ClientShellState {
     ) {
         use crossterm::event::KeyModifiers;
 
+        if matches!(self.overlay, Some(ClientShellOverlay::GlobalMenu(_))) {
+            match key.code {
+                KeyCode::Esc => {
+                    self.overlay = None;
+                    outcome.repaint = true;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.move_global_menu_selection(-1);
+                    outcome.repaint = true;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.move_global_menu_selection(1);
+                    outcome.repaint = true;
+                }
+                KeyCode::Enter => {
+                    let highlighted = match self.overlay.as_ref() {
+                        Some(ClientShellOverlay::GlobalMenu(menu)) => menu.highlighted,
+                        _ => return,
+                    };
+                    self.activate_global_menu_item(highlighted, outcome);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.route_settings_key(key, outcome) {
+            return;
+        }
+
         if matches!(self.overlay, Some(ClientShellOverlay::ContextMenu(_))) {
             match key.code {
                 KeyCode::Esc => {
@@ -440,64 +470,118 @@ impl ClientShellState {
             return;
         }
 
-        if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
+        if matches!(self.overlay, Some(ClientShellOverlay::Help(_))) {
+            let text_character = crate::input::keybind_help_text_char(key);
             let (code, modifiers) = crate::config::normalize_key_combo((key.code, key.modifiers));
-            if code == KeyCode::Esc {
-                if help.search_focused {
-                    help.search_focused = false;
-                } else {
-                    self.overlay = None;
-                }
-                outcome.repaint = true;
-                return;
-            }
-            if !help.search_focused && code == KeyCode::Enter {
-                self.overlay = None;
-                outcome.repaint = true;
-                return;
-            }
-            if !help.search_focused && modifiers.is_empty() && code == KeyCode::Char('/') {
-                help.search_focused = true;
-                outcome.repaint = true;
-                return;
-            }
-            if help.search_focused {
-                if code == KeyCode::Char('u') && modifiers.contains(KeyModifiers::CONTROL) {
-                    help.query.clear();
-                    help.scroll = 0;
-                    outcome.repaint = true;
-                    return;
-                }
-                if code == KeyCode::Backspace {
-                    help.query.pop();
-                    help.scroll = 0;
-                    outcome.repaint = true;
-                    return;
-                }
-                if let KeyCode::Char(character) = code {
-                    if modifiers.difference(KeyModifiers::SHIFT).is_empty() {
-                        if let Some(text) = key.generated_text.as_deref() {
-                            help.query.push_str(text);
-                        } else {
-                            help.query.push(character);
+            let search_focused = matches!(
+                self.overlay,
+                Some(ClientShellOverlay::Help(ClientHelpOverlay {
+                    search_focused: true,
+                    ..
+                }))
+            );
+            if search_focused {
+                match code {
+                    KeyCode::Esc => {
+                        if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
+                            help.search_focused = false;
+                            help.query.clear();
+                            help.scroll = 0;
                         }
-                        help.scroll = 0;
-                        outcome.repaint = true;
-                        return;
+                    }
+                    KeyCode::Enter => self.overlay = None,
+                    KeyCode::Home => {
+                        if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
+                            help.scroll = 0;
+                        }
+                    }
+                    KeyCode::End => {
+                        if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
+                            help.scroll = self.hits.help_max_scroll;
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
+                        let delta = match code {
+                            KeyCode::Up => -1,
+                            KeyCode::Down => 1,
+                            KeyCode::PageUp => -8,
+                            KeyCode::PageDown => 8,
+                            _ => unreachable!(),
+                        };
+                        if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
+                            help.scroll = help
+                                .scroll
+                                .saturating_add_signed(delta)
+                                .min(self.hits.help_max_scroll);
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
+                            help.query.pop();
+                            help.scroll = 0;
+                        }
+                    }
+                    KeyCode::Char('u') if modifiers == KeyModifiers::CONTROL => {
+                        if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
+                            help.query.clear();
+                            help.scroll = 0;
+                        }
+                    }
+                    _ => {
+                        if let Some(character) = text_character {
+                            if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
+                                help.query.push(character);
+                                help.scroll = 0;
+                            }
+                        }
                     }
                 }
-            }
-            let delta = match code {
-                KeyCode::Up | KeyCode::Char('k') => Some(-1isize),
-                KeyCode::Down | KeyCode::Char('j') => Some(1),
-                KeyCode::PageUp => Some(-10),
-                KeyCode::PageDown => Some(10),
-                _ => None,
-            };
-            if let Some(delta) = delta {
-                help.scroll = help.scroll.saturating_add_signed(delta);
                 outcome.repaint = true;
+                return;
             }
+
+            match code {
+                KeyCode::Esc | KeyCode::Enter => self.overlay = None,
+                KeyCode::Home => {
+                    if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
+                        help.scroll = 0;
+                    }
+                }
+                KeyCode::End => {
+                    if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
+                        help.scroll = self.hits.help_max_scroll;
+                    }
+                }
+                KeyCode::Up
+                | KeyCode::Char('k')
+                | KeyCode::Down
+                | KeyCode::Char('j')
+                | KeyCode::PageUp
+                | KeyCode::PageDown => {
+                    let delta = match code {
+                        KeyCode::Up | KeyCode::Char('k') => -1,
+                        KeyCode::Down | KeyCode::Char('j') => 1,
+                        KeyCode::PageUp => -8,
+                        KeyCode::PageDown => 8,
+                        _ => unreachable!(),
+                    };
+                    if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
+                        help.scroll = help
+                            .scroll
+                            .saturating_add_signed(delta)
+                            .min(self.hits.help_max_scroll);
+                    }
+                }
+                _ if text_character == Some('/') => {
+                    if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
+                        help.search_focused = true;
+                        help.scroll = 0;
+                    }
+                }
+                _ if text_character == Some('?') => self.overlay = None,
+                _ => {}
+            }
+            outcome.repaint = true;
             return;
         }
 

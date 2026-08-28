@@ -309,7 +309,7 @@ pub(super) fn keybind_help_back(state: &mut AppState) {
 
 pub(crate) fn handle_keybind_help_key(state: &mut AppState, key: TerminalKey) {
     if state.keybind_help.search_focused {
-        let text_char = keybind_help_text_char(key.clone());
+        let text_char = crate::input::keybind_help_text_char(&key);
         match key.code {
             KeyCode::Up => state.scroll_keybind_help(-1),
             KeyCode::Down => state.scroll_keybind_help(1),
@@ -343,28 +343,15 @@ pub(crate) fn handle_keybind_help_key(state: &mut AppState, key: TerminalKey) {
         KeyCode::PageDown => state.scroll_keybind_help(8),
         KeyCode::Home => state.keybind_help.scroll = 0,
         KeyCode::End => state.keybind_help.scroll = state.keybind_help_max_scroll(),
-        _ if keybind_help_text_char(key.clone()) == Some('/') => {
+        _ if crate::input::keybind_help_text_char(&key) == Some('/') => {
             state.keybind_help.search_focused = true;
             state.keybind_help.scroll = 0;
         }
         KeyCode::Esc => keybind_help_back(state),
         KeyCode::Enter => leave_modal(state),
-        _ if keybind_help_text_char(key.clone()) == Some('?') => leave_modal(state),
+        _ if crate::input::keybind_help_text_char(&key) == Some('?') => leave_modal(state),
         _ => {}
     }
-}
-
-fn keybind_help_text_char(key: TerminalKey) -> Option<char> {
-    if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
-        return None;
-    }
-    if let Some(character) = key.shifted_codepoint.and_then(char::from_u32) {
-        return Some(character);
-    }
-    let KeyCode::Char(character) = key.code else {
-        return None;
-    };
-    Some(character)
 }
 
 pub(super) fn open_rename_workspace(

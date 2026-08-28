@@ -5,12 +5,15 @@ mod agent_sidebar;
 mod composition;
 mod config;
 mod context_menu;
+mod global_menu;
 mod input;
 mod mouse;
+mod notifications;
 mod overlay_input;
 mod preferences;
 mod render;
 mod scroll;
+mod settings;
 mod state;
 mod worktrees;
 
@@ -31,7 +34,8 @@ use crate::config::{
 };
 use crate::protocol::{
     ClientMessage, ClientMousePosition, ClientPaneInputEvent, ClientShellSnapshot, ClientShellTab,
-    ClientShellWorkspace, ClientSurfaceSize, FrameData, PaneSurfaceFrame,
+    ClientShellWorkspace, ClientSurfaceSize, FrameData, PaneSurfaceFrame, SemanticNotification,
+    SemanticNotificationKind, SemanticNotificationSound,
 };
 #[cfg(test)]
 use crate::raw_input::RawInputEvent;
@@ -1948,6 +1952,321 @@ detach = "prefix+x"
     }
 
     #[test]
+    fn global_menu_opens_from_sidebar_and_routes_client_actions() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface());
+        state.compose(106, 30).expect("shell frame");
+        let launcher = state.hits.global_launcher;
+        assert_ne!(launcher, Rect::default());
+
+        let open =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: launcher.x,
+                row: launcher.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(open.repaint);
+        let menu = state.compose(106, 30).expect("global menu");
+        let text = menu
+            .cells
+            .chunks(menu.width as usize)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("settings"));
+        assert!(text.contains("keybinds"));
+        assert!(text.contains("reload config"));
+        assert!(text.contains("detach"));
+
+        let keybinds = state.hits.global_menu_rows[1].0;
+        let help =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: keybinds.x,
+                row: keybinds.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(help.actions.is_empty());
+        assert!(matches!(state.overlay, Some(ClientShellOverlay::Help(_))));
+
+        state.overlay = Some(ClientShellOverlay::GlobalMenu(ClientGlobalMenuOverlay {
+            highlighted: 3,
+        }));
+        let detach = state.handle_input_bytes(b"\r");
+        assert!(detach.detach);
+        assert!(state.overlay.is_none());
+    }
+
+    #[test]
+    fn client_settings_preview_restore_and_endpoint_integrations_are_owned_by_overlay() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface());
+        state.overlay = Some(ClientShellOverlay::GlobalMenu(ClientGlobalMenuOverlay {
+            highlighted: 0,
+        }));
+        let open = state.handle_input_bytes(b"\r");
+        assert!(open.actions.is_empty());
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::Settings(ClientSettingsOverlay {
+                section: ClientSettingsSection::Theme,
+                ..
+            }))
+        ));
+        let original_theme = state.config.theme_name.clone();
+        let original_palette = state.config.palette.clone();
+        state.handle_input_bytes(b"j");
+        assert_ne!(state.config.theme_name, original_theme);
+        assert_ne!(state.config.palette.accent, original_palette.accent);
+        state.handle_input_bytes(b"\x1b");
+        assert!(state.overlay.is_none());
+        assert_eq!(state.config.theme_name, original_theme);
+        assert_eq!(state.config.palette.accent, original_palette.accent);
+
+        state.open_settings_overlay();
+        state.handle_input_bytes(b"j");
+        state.handle_input_bytes(b"\t");
+        state
+            .compose(106, 30)
+            .expect("settings outside-click geometry");
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        })]);
+        assert!(state.overlay.is_none());
+        assert_eq!(state.config.theme_name, original_theme);
+        assert_eq!(state.config.palette.accent, original_palette.accent);
+
+        state.open_settings_overlay();
+        state.compose(106, 30).expect("settings overlay");
+        for _ in 0..3 {
+            let next = state.handle_input_bytes(b"\t");
+            assert!(next.actions.is_empty());
+        }
+        let integrations = state.handle_input_bytes(b"\t");
+        let [ClientShellAction::Endpoint { request, .. }] = &integrations.actions[..] else {
+            panic!("integration section should request endpoint status");
+        };
+        assert!(matches!(
+            request.method,
+            crate::api::schema::Method::IntegrationList(_)
+        ));
+        let request_id = request.id.clone();
+        assert!(
+            state
+                .handle_endpoint_result(
+                    "boot-1",
+                    &request_id,
+                    Ok(crate::api::schema::ResponseResult::IntegrationList {
+                        integrations: vec![
+                            crate::api::schema::IntegrationInfo {
+                                target: crate::api::schema::IntegrationTarget::Codex,
+                                label: "codex".into(),
+                                command: "codex".into(),
+                                available: true,
+                                state: crate::api::schema::IntegrationState::Outdated,
+                            },
+                            crate::api::schema::IntegrationInfo {
+                                target: crate::api::schema::IntegrationTarget::Claude,
+                                label: "claude".into(),
+                                command: "claude".into(),
+                                available: false,
+                                state: crate::api::schema::IntegrationState::NotInstalled,
+                            },
+                        ],
+                    }),
+                )
+                .0
+        );
+        let frame = state.compose(106, 30).expect("loaded integrations");
+        let text = frame
+            .cells
+            .chunks(frame.width as usize)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("update available"));
+        assert!(text.contains("not found"));
+        assert!(!text.contains("pane labels"));
+
+        let popup = state.hits.settings_popup;
+        let blank_click =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: popup.right().saturating_sub(2),
+                row: popup.y + 3,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        assert!(!blank_click.repaint);
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::Settings(_))
+        ));
+
+        let install = state.handle_input_bytes(b"\r");
+        assert_eq!(install.actions.len(), 1);
+        assert!(matches!(
+            &install.actions[0],
+            ClientShellAction::Endpoint { request, .. }
+                if matches!(
+                    request.method,
+                    crate::api::schema::Method::IntegrationInstall(
+                        crate::api::schema::IntegrationInstallParams {
+                            target: crate::api::schema::IntegrationTarget::Codex
+                        }
+                    )
+                )
+        ));
+        let escape = state.handle_input_bytes(b"\x1b");
+        assert!(!escape.repaint);
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::Settings(_))
+        ));
+        let install_request_id = match &install.actions[0] {
+            ClientShellAction::Endpoint { request, .. } => request.id.clone(),
+            _ => unreachable!("integration install action"),
+        };
+        let (repaint, refresh_actions) = state.handle_endpoint_result(
+            "boot-1",
+            &install_request_id,
+            Ok(crate::api::schema::ResponseResult::IntegrationInstall {
+                target: crate::api::schema::IntegrationTarget::Codex,
+                details: crate::api::schema::IntegrationInstallResult {
+                    messages: vec!["installed codex".into()],
+                },
+            }),
+        );
+        assert!(repaint);
+        assert!(matches!(
+            refresh_actions.as_slice(),
+            [ClientShellAction::Endpoint { request, .. }]
+                if matches!(request.method, crate::api::schema::Method::IntegrationList(_))
+        ));
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::Settings(ClientSettingsOverlay {
+                loading_integrations: true,
+                installing_integrations: false,
+                ref integration_messages,
+                ..
+            })) if integration_messages == &["installed codex"]
+        ));
+    }
+
+    #[test]
+    fn help_overlay_restores_released_search_scroll_and_custom_binding_behavior() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state
+            .config
+            .keybinds
+            .keybinds
+            .custom_commands
+            .push(crate::config::CustomCommandKeybind {
+                bindings: crate::config::ActionKeybinds::prefix("z"),
+                label: "prefix+z".into(),
+                command: "plugin.action".into(),
+                action: crate::config::CustomCommandAction::PluginAction,
+                description: Some("run plugin action".into()),
+                width: None,
+                height: None,
+            });
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface());
+        let mut open = ClientShellInput::default();
+        state.record_binding(
+            crate::input::KeybindMatch::Action(crate::input::KeybindAction::Help),
+            &mut open,
+        );
+        let initial = state.compose(106, 30).expect("help overlay");
+        let text = initial
+            .cells
+            .chunks(initial.width as usize)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("global"));
+        assert!(state.hits.help_max_scroll > 0);
+        assert_ne!(state.hits.help_scrollbar, Rect::default());
+
+        state.handle_input_bytes(b"/");
+        state.handle_input_bytes(b"plugin");
+        let custom = state.compose(106, 30).expect("custom help search");
+        let text = custom
+            .cells
+            .chunks(custom.width as usize)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("custom"));
+        assert!(text.contains("run plugin action"));
+        state.handle_input_bytes(b"\x1b");
+
+        state.handle_input_bytes(b"/");
+        state.handle_input_bytes(b"does-not-exist");
+        let empty = state.compose(106, 30).expect("empty help search");
+        let text = empty
+            .cells
+            .chunks(empty.width as usize)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("no matching keybinds"));
+
+        state.handle_input_bytes(b"\x1b");
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::Help(ClientHelpOverlay {
+                search_focused: false,
+                ref query,
+                scroll: 0,
+            })) if query.is_empty()
+        ));
+        state.compose(106, 30).expect("restored help");
+        state.handle_input_bytes(b"\x1b[F");
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::Help(ClientHelpOverlay { scroll, .. }))
+                if scroll == state.hits.help_max_scroll
+        ));
+        state.handle_input_bytes(b"\x1b[H");
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::Help(ClientHelpOverlay {
+                scroll: 0,
+                ..
+            }))
+        ));
+        state.handle_input_bytes(b"?");
+        assert!(state.overlay.is_none());
+    }
+
+    #[test]
     fn pane_cycle_last_and_agent_actions_resolve_to_stable_pane_ids() {
         let mut initial = snapshot();
         let mut second = initial.panes[0].clone();
@@ -2487,14 +2806,18 @@ detach = "prefix+x"
             panic!("pane close should use endpoint API");
         };
         let request_id = request.id.clone();
-        assert!(state.handle_endpoint_result(
-            "boot-1",
-            &request_id,
-            Err(ClientShellEndpointError {
-                code: Some("confirmation_required".into()),
-                message: "confirmation required".into(),
-            }),
-        ));
+        assert!(
+            state
+                .handle_endpoint_result(
+                    "boot-1",
+                    &request_id,
+                    Err(ClientShellEndpointError {
+                        code: Some("confirmation_required".into()),
+                        message: "confirmation required".into(),
+                    }),
+                )
+                .0
+        );
         let frame = state.compose(106, 20).expect("confirmation overlay");
         let text = frame
             .cells
@@ -2724,11 +3047,11 @@ detach = "prefix+x"
                 if params.workspace_id.as_deref() == Some("ws_1")
         ));
         let request_id = request.id.clone();
-        assert!(state.handle_endpoint_result(
-            "boot-1",
-            &request_id,
-            Ok(worktree_list_result(None)),
-        ));
+        assert!(
+            state
+                .handle_endpoint_result("boot-1", &request_id, Ok(worktree_list_result(None)))
+                .0
+        );
         let frame = state.compose(106, 30).expect("new worktree modal");
         let text = frame
             .cells
@@ -2874,6 +3197,150 @@ detach = "prefix+x"
             crate::api::schema::Method::WorktreeRemove(params)
                 if params.workspace_id == "ws_1" && params.force
         ));
+    }
+
+    #[test]
+    fn semantic_notifications_use_client_policy_and_stable_navigation_targets() {
+        let mut config = ClientShellConfig::from_config(&Config::default());
+        config.toast_delivery = crate::config::ToastDelivery::Herdr;
+        config.toast_delay_seconds = 0;
+        let mut state = ClientShellState::new(config);
+        let mut projected = snapshot();
+        projected.agents.push(ClientShellAgent {
+            pane_id: "pane_2".into(),
+            workspace_id: "ws_2".into(),
+            tab_id: "tab_2".into(),
+            name: None,
+            display_agent: Some("codex".into()),
+            agent: Some("codex".into()),
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            agent_status: AgentStatus::Blocked,
+            state_change_seq: 1,
+            state_labels: Vec::new(),
+            tokens: Vec::new(),
+            focused: false,
+        });
+        state.set_snapshot(Box::new(projected));
+        state.set_pane_surface(surface());
+        let now = std::time::Instant::now();
+        let (effects, repaint) = state.receive_notification(
+            SemanticNotification {
+                kind: SemanticNotificationKind::NeedsAttention,
+                title: "codex needs attention".into(),
+                body: Some("other · 2".into()),
+                sound: Some(SemanticNotificationSound::Request),
+                agent: Some("codex".into()),
+                workspace_id: Some("ws_2".into()),
+                tab_id: Some("tab_2".into()),
+                pane_id: Some("pane_2".into()),
+                position: None,
+            },
+            now,
+        );
+        assert!(repaint);
+        assert!(matches!(
+            effects.as_slice(),
+            [ClientShellNotificationEffect::Sound {
+                sound: crate::sound::Sound::Request,
+                ..
+            }]
+        ));
+        let frame = state.compose(100, 28).expect("notification frame");
+        let rendered = frame
+            .cells
+            .chunks(frame.width as usize)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("codex needs attention"));
+        let hit = state.hits.notification_toast;
+        let click = RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.x,
+            row: hit.y,
+            modifiers: KeyModifiers::empty(),
+        });
+        let outcome = state.handle_raw_events(vec![click]);
+        assert!(outcome.actions.iter().any(|action| matches!(
+            action,
+            ClientShellAction::Endpoint { request, .. }
+                if matches!(
+                    &request.method,
+                    crate::api::schema::Method::PaneFocus(params)
+                        if params.pane_id == "pane_2"
+                )
+        )));
+        assert!(state.visible_notification.is_none());
+
+        state.receive_notification(
+            SemanticNotification {
+                kind: SemanticNotificationKind::NeedsAttention,
+                title: "codex needs attention".into(),
+                body: None,
+                sound: None,
+                agent: Some("codex".into()),
+                workspace_id: Some("ws_2".into()),
+                tab_id: Some("tab_2".into()),
+                pane_id: Some("pane_2".into()),
+                position: None,
+            },
+            now,
+        );
+        let mut keybind = ClientShellInput::default();
+        state.record_binding(
+            crate::input::KeybindMatch::Action(crate::input::KeybindAction::OpenNotificationTarget),
+            &mut keybind,
+        );
+        assert!(keybind.actions.iter().any(|action| matches!(
+            action,
+            ClientShellAction::Endpoint { request, .. }
+                if matches!(
+                    &request.method,
+                    crate::api::schema::Method::PaneFocus(params)
+                        if params.pane_id == "pane_2"
+                )
+        )));
+        assert!(state.visible_notification.is_none());
+
+        state.receive_notification(
+            SemanticNotification {
+                kind: SemanticNotificationKind::NeedsAttention,
+                title: "first".into(),
+                body: None,
+                sound: None,
+                agent: Some("codex".into()),
+                workspace_id: Some("ws_2".into()),
+                tab_id: Some("tab_2".into()),
+                pane_id: Some("pane_2".into()),
+                position: None,
+            },
+            now,
+        );
+        assert!(state.visible_notification.is_some());
+        state.config.toast_delay_seconds = 1;
+        let (_, repaint) = state.receive_notification(
+            SemanticNotification {
+                kind: SemanticNotificationKind::NeedsAttention,
+                title: "replacement".into(),
+                body: None,
+                sound: None,
+                agent: Some("codex".into()),
+                workspace_id: Some("ws_2".into()),
+                tab_id: Some("tab_2".into()),
+                pane_id: Some("pane_2".into()),
+                position: None,
+            },
+            now,
+        );
+        assert!(repaint);
+        assert!(state.visible_notification.is_none());
+        assert_eq!(state.pending_notifications.len(), 1);
     }
 
     #[test]

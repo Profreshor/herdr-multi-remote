@@ -77,11 +77,22 @@ impl ClientShellState {
                     }
                 }
                 RawInputEvent::Mouse(mouse) => self.handle_mouse(mouse, &mut outcome),
-                RawInputEvent::OuterFocusGained
-                | RawInputEvent::OuterFocusLost
-                | RawInputEvent::HostDefaultColor { .. }
+                RawInputEvent::OuterFocusGained => {
+                    self.outer_focused = Some(true);
+                    outcome.query_host_appearance = true;
+                }
+                RawInputEvent::OuterFocusLost => self.outer_focused = Some(false),
+                RawInputEvent::HostColorSchemeChanged(appearance) => {
+                    if self.config.theme_runtime.auto_switch {
+                        self.config.palette = crate::app::client_palette_for_appearance(
+                            &self.config.theme_runtime,
+                            appearance,
+                        );
+                        outcome.repaint = true;
+                    }
+                }
+                RawInputEvent::HostDefaultColor { .. }
                 | RawInputEvent::HostPaletteColors { .. }
-                | RawInputEvent::HostColorSchemeChanged(_)
                 | RawInputEvent::HostCellSizeReport { .. }
                 | RawInputEvent::Unsupported => {}
             }

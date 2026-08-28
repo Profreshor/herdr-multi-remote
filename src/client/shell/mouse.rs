@@ -276,6 +276,13 @@ impl ClientShellState {
                 return;
             }
         }
+        if self.overlay.is_none()
+            && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            && super::contains(self.hits.notification_toast, point)
+        {
+            self.focus_visible_notification(outcome);
+            return;
+        }
         if mouse.kind == MouseEventKind::Drag(MouseButton::Left) {
             match self.chrome_drag.as_ref() {
                 Some(ClientChromeDrag::SidebarWidth) => {
@@ -313,6 +320,24 @@ impl ClientShellState {
                         let next = metrics.max_offset_from_bottom.saturating_sub(offset);
                         if next != self.agent_scroll {
                             self.agent_scroll = next;
+                            outcome.repaint = true;
+                        }
+                    }
+                    return;
+                }
+                Some(ClientChromeDrag::HelpScrollbar { grab_row_offset }) => {
+                    if let (Some(metrics), Some(ClientShellOverlay::Help(help))) =
+                        (self.hits.help_scroll_metrics, self.overlay.as_mut())
+                    {
+                        let offset = crate::ui::scrollbar_offset_from_drag_row(
+                            metrics,
+                            self.hits.help_scrollbar,
+                            mouse.row,
+                            *grab_row_offset,
+                        );
+                        let next = metrics.max_offset_from_bottom.saturating_sub(offset);
+                        if next != help.scroll {
+                            help.scroll = next;
                             outcome.repaint = true;
                         }
                     }
@@ -527,7 +552,8 @@ impl ClientShellState {
                         self.persist_chrome_preferences(outcome);
                     }
                     ClientChromeDrag::WorkspaceScrollbar { .. }
-                    | ClientChromeDrag::AgentScrollbar { .. } => {}
+                    | ClientChromeDrag::AgentScrollbar { .. }
+                    | ClientChromeDrag::HelpScrollbar { .. } => {}
                 }
                 return;
             }
@@ -551,6 +577,37 @@ impl ClientShellState {
                 );
                 return;
             }
+        }
+        if matches!(self.overlay, Some(ClientShellOverlay::GlobalMenu(_))) {
+            let row_hit = self
+                .hits
+                .global_menu_rows
+                .iter()
+                .find(|(rect, _)| super::contains(*rect, point))
+                .copied();
+            match mouse.kind {
+                MouseEventKind::Moved => {
+                    if let (Some((_, index)), Some(ClientShellOverlay::GlobalMenu(menu))) =
+                        (row_hit, self.overlay.as_mut())
+                    {
+                        menu.highlighted = index;
+                        outcome.repaint = true;
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if super::contains(self.hits.global_launcher, point) {
+                        self.toggle_global_menu();
+                        outcome.repaint = true;
+                    } else if let Some((_, index)) = row_hit {
+                        self.activate_global_menu_item(index, outcome);
+                    } else {
+                        self.overlay = None;
+                        outcome.repaint = true;
+                    }
+                }
+                _ => {}
+            }
+            return;
         }
         if matches!(self.overlay, Some(ClientShellOverlay::ContextMenu(_))) {
             let row_hit = self
@@ -657,22 +714,123 @@ impl ClientShellState {
             }
             return;
         }
-        if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
+        if matches!(self.overlay, Some(ClientShellOverlay::Settings(_))) {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                if let Some((_, section)) = self
+                    .hits
+                    .settings_tabs
+                    .iter()
+                    .find(|(rect, _)| super::contains(*rect, point))
+                    .copied()
+                {
+                    self.select_settings_section(section, outcome);
+                } else if let Some((_, index)) = self
+                    .hits
+                    .settings_choices
+                    .iter()
+                    .find(|(rect, _)| super::contains(*rect, point))
+                    .copied()
+                {
+                    self.select_settings_choice(index);
+                    let immediate = matches!(
+                        self.overlay,
+                        Some(ClientShellOverlay::Settings(ClientSettingsOverlay {
+                            section: ClientSettingsSection::Indicators
+                                | ClientSettingsSection::Sound
+                                | ClientSettingsSection::Toast,
+                            ..
+                        }))
+                    );
+                    if immediate {
+                        self.apply_settings_choice(outcome);
+                    }
+                    outcome.repaint = true;
+                } else if super::contains(self.hits.overlay_primary, point) {
+                    self.apply_settings_choice(outcome);
+                } else if super::contains(self.hits.overlay_cancel, point)
+                    || !super::contains(self.hits.settings_popup, point)
+                {
+                    let installing = matches!(
+                        self.overlay,
+                        Some(ClientShellOverlay::Settings(ClientSettingsOverlay {
+                            installing_integrations: true,
+                            ..
+                        }))
+                    );
+                    if !installing {
+                        self.cancel_settings_overlay();
+                        outcome.repaint = true;
+                    }
+                }
+            }
+            return;
+        }
+        if matches!(self.overlay, Some(ClientShellOverlay::Help(_))) {
             match mouse.kind {
                 MouseEventKind::ScrollUp => {
-                    help.scroll = help.scroll.saturating_sub(1);
-                    outcome.repaint = true;
+                    if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
+                        let next = help.scroll.saturating_sub(3);
+                        if next != help.scroll {
+                            help.scroll = next;
+                            outcome.repaint = true;
+                        }
+                    }
                 }
                 MouseEventKind::ScrollDown => {
-                    help.scroll = help.scroll.saturating_add(1);
-                    outcome.repaint = true;
+                    if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
+                        let next = help.scroll.saturating_add(3).min(self.hits.help_max_scroll);
+                        if next != help.scroll {
+                            help.scroll = next;
+                            outcome.repaint = true;
+                        }
+                    }
                 }
-                MouseEventKind::Down(MouseButton::Left)
-                    if super::contains(self.hits.overlay_primary, point)
-                        || super::contains(self.hits.overlay_cancel, point) =>
-                {
-                    self.overlay = None;
-                    outcome.repaint = true;
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if super::contains(self.hits.help_scrollbar, point) {
+                        if let Some(metrics) = self.hits.help_scroll_metrics {
+                            if let Some(grab_row_offset) = crate::ui::scrollbar_thumb_grab_offset(
+                                metrics,
+                                self.hits.help_scrollbar,
+                                mouse.row,
+                            ) {
+                                self.chrome_drag =
+                                    Some(ClientChromeDrag::HelpScrollbar { grab_row_offset });
+                            } else {
+                                let offset = crate::ui::scrollbar_offset_from_row(
+                                    metrics,
+                                    self.hits.help_scrollbar,
+                                    mouse.row,
+                                );
+                                if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut()
+                                {
+                                    help.scroll =
+                                        metrics.max_offset_from_bottom.saturating_sub(offset);
+                                    outcome.repaint = true;
+                                }
+                            }
+                        }
+                    } else if super::contains(self.hits.overlay_cancel, point) {
+                        let search_focused = matches!(
+                            self.overlay,
+                            Some(ClientShellOverlay::Help(ClientHelpOverlay {
+                                search_focused: true,
+                                ..
+                            }))
+                        );
+                        if search_focused {
+                            if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
+                                help.search_focused = false;
+                                help.query.clear();
+                                help.scroll = 0;
+                            }
+                        } else {
+                            self.overlay = None;
+                        }
+                        outcome.repaint = true;
+                    } else if !super::contains(self.hits.help_popup, point) {
+                        self.overlay = None;
+                        outcome.repaint = true;
+                    }
                 }
                 _ => {}
             }
@@ -1033,6 +1191,11 @@ impl ClientShellState {
                     self.agent_panel_sort_manual = true;
                     self.agent_scroll = 0;
                     self.persist_chrome_preferences(outcome);
+                    outcome.repaint = true;
+                    return;
+                }
+                if super::contains(self.hits.global_launcher, point) {
+                    self.toggle_global_menu();
                     outcome.repaint = true;
                     return;
                 }
