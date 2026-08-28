@@ -8,7 +8,7 @@ mod layouts;
 mod pane_graphics;
 mod panes;
 pub(crate) mod plugins;
-mod responses;
+pub(super) mod responses;
 mod session;
 mod tabs;
 mod workspaces;
@@ -999,6 +999,9 @@ impl App {
             }
             Method::NotificationShow(params) => {
                 return self.handle_notification_show(request.id, params);
+            }
+            Method::CommandInvoke(params) => {
+                return self.handle_command_invoke(request.id, params);
             }
             Method::ClientWindowTitleSet(_) | Method::ClientWindowTitleClear(_) => {
                 return responses::encode_success(

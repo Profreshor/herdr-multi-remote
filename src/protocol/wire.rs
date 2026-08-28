@@ -774,6 +774,34 @@ pub struct ClientShellSnapshot {
     pub tabs: Vec<ClientShellTab>,
     pub panes: Vec<ClientShellPane>,
     pub agents: Vec<ClientShellAgent>,
+    pub commands: Vec<ClientShellCommand>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClientShellCommandAction {
+    Shell,
+    Pane,
+    PluginAction,
+}
+
+impl TryFrom<crate::config::CustomCommandAction> for ClientShellCommandAction {
+    type Error = ();
+
+    fn try_from(action: crate::config::CustomCommandAction) -> Result<Self, Self::Error> {
+        match action {
+            crate::config::CustomCommandAction::Shell => Ok(Self::Shell),
+            crate::config::CustomCommandAction::Pane => Ok(Self::Pane),
+            crate::config::CustomCommandAction::PluginAction => Ok(Self::PluginAction),
+            crate::config::CustomCommandAction::Popup => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientShellCommand {
+    pub command_id: String,
+    pub binding_label: String,
+    pub action: ClientShellCommandAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1870,6 +1898,11 @@ mod tests {
                 right_click_passthrough: false,
             }],
             agents: Vec::new(),
+            commands: vec![ClientShellCommand {
+                command_id: "cmd_0123456789abcdef0123456789abcdef".into(),
+                binding_label: "prefix+z".into(),
+                action: ClientShellCommandAction::Shell,
+            }],
         }));
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ServerMessage, _) =

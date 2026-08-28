@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod agents;
+pub mod commands;
 pub mod common;
 pub mod events;
 pub mod integrations;
@@ -14,6 +15,7 @@ pub mod workspaces;
 pub mod worktrees;
 
 pub use agents::*;
+pub use commands::*;
 pub use common::*;
 pub use events::*;
 pub use integrations::*;
@@ -57,6 +59,8 @@ pub enum Method {
     ServerReloadAgentManifests(EmptyParams),
     #[serde(rename = "notification.show")]
     NotificationShow(NotificationShowParams),
+    #[serde(rename = "command.invoke")]
+    CommandInvoke(CommandInvokeParams),
     #[serde(rename = "client.window_title.set")]
     ClientWindowTitleSet(ClientWindowTitleSetParams),
     #[serde(rename = "client.window_title.clear")]

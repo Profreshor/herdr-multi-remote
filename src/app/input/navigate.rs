@@ -827,16 +827,7 @@ impl App {
     ) {
         let previous_mode = self.state.mode;
         let previous_toast = self.state.toast.clone();
-        let result = match binding.action {
-            crate::config::CustomCommandAction::Shell => self.spawn_custom_command(&binding),
-            crate::config::CustomCommandAction::Pane => {
-                self.spawn_pane_command(&binding.command, Vec::new())
-            }
-            crate::config::CustomCommandAction::Popup => self.spawn_custom_popup_command(&binding),
-            crate::config::CustomCommandAction::PluginAction => self
-                .invoke_plugin_action_from_keybind(binding.command.clone())
-                .map_err(std::io::Error::other),
-        };
+        let result = self.execute_custom_command_binding(&binding);
         match result {
             Ok(()) => finish_custom_command_context(&mut self.state, context, previous_mode),
             Err(err) => {
@@ -850,6 +841,22 @@ impl App {
                 self.sync_toast_deadline(previous_toast);
                 finish_custom_command_context(&mut self.state, context, previous_mode);
             }
+        }
+    }
+
+    pub(crate) fn execute_custom_command_binding(
+        &mut self,
+        binding: &crate::config::CustomCommandKeybind,
+    ) -> io::Result<()> {
+        match binding.action {
+            crate::config::CustomCommandAction::Shell => self.spawn_custom_command(binding),
+            crate::config::CustomCommandAction::Pane => {
+                self.spawn_pane_command(&binding.command, Vec::new())
+            }
+            crate::config::CustomCommandAction::Popup => self.spawn_custom_popup_command(binding),
+            crate::config::CustomCommandAction::PluginAction => self
+                .invoke_plugin_action_from_keybind(binding.command.clone())
+                .map_err(io::Error::other),
         }
     }
 

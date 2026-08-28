@@ -144,9 +144,47 @@ impl ClientShellState {
                 }
                 outcome.actions.push(ClientShellAction::Keybind(action));
             }
-            crate::input::KeybindMatch::Command(command) => outcome
-                .actions
-                .push(ClientShellAction::CustomCommand(Box::new(command))),
+            crate::input::KeybindMatch::Command(command) => {
+                let Ok(action) =
+                    crate::protocol::ClientShellCommandAction::try_from(command.action)
+                else {
+                    self.endpoint_error = Some(
+                        "popup commands require the client-owned popup terminal surface".to_owned(),
+                    );
+                    outcome.repaint = true;
+                    return;
+                };
+                let command_id = self.snapshot.as_deref().and_then(|snapshot| {
+                    snapshot
+                        .commands
+                        .iter()
+                        .find(|candidate| {
+                            candidate.binding_label == command.label && candidate.action == action
+                        })
+                        .map(|candidate| candidate.command_id.clone())
+                });
+                let Some(command_id) = command_id else {
+                    self.endpoint_error = Some(
+                        "custom command is not available on this endpoint; reload configuration"
+                            .to_owned(),
+                    );
+                    outcome.repaint = true;
+                    return;
+                };
+                let Some(snapshot) = self.snapshot.as_deref() else {
+                    return;
+                };
+                let params = crate::api::schema::CommandInvokeParams {
+                    command_id,
+                    workspace_id: snapshot.focused_workspace_id.clone(),
+                    tab_id: snapshot.focused_tab_id.clone(),
+                    pane_id: snapshot.focused_pane_id.clone(),
+                };
+                self.push_endpoint_method(
+                    crate::api::schema::Method::CommandInvoke(params),
+                    outcome,
+                );
+            }
         }
     }
 

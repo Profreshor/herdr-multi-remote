@@ -1473,9 +1473,6 @@ fn dispatch_client_shell_actions(
                     "client shell action awaits its presentation family"
                 );
             }
-            shell::ClientShellAction::CustomCommand(command) => {
-                debug!(command = %command.label, "client shell custom command awaits endpoint manifest routing");
-            }
         }
     }
 }

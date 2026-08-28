@@ -159,6 +159,7 @@ pub(super) fn snapshot(
         tabs,
         panes,
         agents,
+        commands: app.client_shell_command_manifest(),
     }
 }
 

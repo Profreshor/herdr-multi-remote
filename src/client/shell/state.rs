@@ -172,7 +172,6 @@ pub(crate) enum ClientShellAction {
         request: Box<crate::api::schema::Request>,
     },
     Keybind(crate::input::KeybindAction),
-    CustomCommand(Box<crate::config::CustomCommandKeybind>),
 }
 
 #[derive(Default)]

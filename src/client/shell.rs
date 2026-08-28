@@ -292,6 +292,7 @@ mod tests {
                 right_click_passthrough: false,
             }],
             agents: Vec::new(),
+            commands: Vec::new(),
         }
     }
 
@@ -2165,6 +2166,71 @@ detach = "prefix+x"
                 ..
             })) if integration_messages == &["installed codex"]
         ));
+    }
+
+    #[test]
+    fn custom_binding_invokes_only_the_endpoint_manifest_id() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        let binding = crate::config::CustomCommandKeybind {
+            bindings: crate::config::ActionKeybinds::prefix("z"),
+            label: "prefix+z".into(),
+            command: "secret-command --token hidden".into(),
+            action: crate::config::CustomCommandAction::Shell,
+            description: None,
+            width: None,
+            height: None,
+        };
+        let mut projection = snapshot();
+        projection
+            .commands
+            .push(crate::protocol::ClientShellCommand {
+                command_id: "cmd_0123456789abcdef0123456789abcdef".into(),
+                binding_label: binding.label.clone(),
+                action: crate::protocol::ClientShellCommandAction::Shell,
+            });
+        state.set_snapshot(Box::new(projection));
+
+        let mut outcome = ClientShellInput::default();
+        state.record_binding(crate::input::KeybindMatch::Command(binding), &mut outcome);
+
+        let [ClientShellAction::Endpoint { request, .. }] = &outcome.actions[..] else {
+            panic!("expected endpoint command invocation");
+        };
+        let crate::api::schema::Method::CommandInvoke(params) = &request.method else {
+            panic!("expected command.invoke");
+        };
+        assert_eq!(params.command_id, "cmd_0123456789abcdef0123456789abcdef");
+        assert_eq!(params.workspace_id.as_deref(), Some("ws_1"));
+        assert_eq!(params.tab_id.as_deref(), Some("tab_1"));
+        assert_eq!(params.pane_id.as_deref(), Some("pane_1"));
+        assert!(!serde_json::to_string(request)
+            .unwrap()
+            .contains("secret-command"));
+    }
+
+    #[test]
+    fn custom_binding_missing_from_endpoint_manifest_is_not_forwarded() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        let binding = crate::config::CustomCommandKeybind {
+            bindings: crate::config::ActionKeybinds::prefix("z"),
+            label: "prefix+z".into(),
+            command: "secret-command".into(),
+            action: crate::config::CustomCommandAction::Shell,
+            description: None,
+            width: None,
+            height: None,
+        };
+
+        let mut outcome = ClientShellInput::default();
+        state.record_binding(crate::input::KeybindMatch::Command(binding), &mut outcome);
+
+        assert!(outcome.actions.is_empty());
+        assert!(outcome.repaint);
+        assert!(state
+            .endpoint_error
+            .as_deref()
+            .is_some_and(|error| error.contains("not available")));
     }
 
     #[test]

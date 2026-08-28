@@ -14,6 +14,7 @@ mod api_helpers;
 pub(crate) use api_helpers::limit_snapshot_lines;
 mod config_io;
 mod creation;
+mod custom_commands;
 mod git_refresh;
 mod ids;
 mod input;
@@ -164,6 +165,7 @@ pub struct App {
     /// even when an App-internal drain consumes the event before the forwarding drain.
     pub(crate) local_input_source_switch: bool,
     pub(crate) config_reloaded_from_disk: bool,
+    endpoint_commands: custom_commands::EndpointCommandRegistry,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
@@ -777,6 +779,8 @@ impl App {
                 .get(idx)
                 .and_then(|ws| ws.focused_pane_id().map(|pane_id| (idx, pane_id)))
         });
+        let endpoint_commands =
+            custom_commands::EndpointCommandRegistry::new(&state.keybinds.custom_commands);
 
         let mut app = Self {
             config_diagnostic_deadline: None,
@@ -841,6 +845,7 @@ impl App {
             local_terminal_notifications: true,
             local_input_source_switch: true,
             config_reloaded_from_disk: false,
+            endpoint_commands,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         };
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
@@ -1454,6 +1459,8 @@ impl App {
                 }
             }
         };
+        self.endpoint_commands =
+            custom_commands::EndpointCommandRegistry::new(&self.state.keybinds.custom_commands);
         self.sync_toast_deadline(previous_toast);
         report
     }
@@ -4140,6 +4147,17 @@ mod tests {
                 crate::api::schema::AgentViewClearParams::default(),
             ),
         };
+        let command_invoke = crate::api::schema::Request {
+            id: "req_10".into(),
+            method: crate::api::schema::Method::CommandInvoke(
+                crate::api::schema::CommandInvokeParams {
+                    command_id: "cmd_boot_1_0".into(),
+                    workspace_id: Some("w1".into()),
+                    tab_id: Some("w1:t1".into()),
+                    pane_id: Some("w1:p1".into()),
+                },
+            ),
+        };
 
         assert!(!crate::api::request_changes_ui(&read_only));
         assert!(!crate::api::request_changes_ui(&worktree_list));
@@ -4150,6 +4168,7 @@ mod tests {
         assert!(crate::api::request_changes_ui(&pane_focus_direction));
         assert!(crate::api::request_changes_ui(&pane_resize));
         assert!(crate::api::request_changes_ui(&agent_view));
+        assert!(crate::api::request_changes_ui(&command_invoke));
     }
 
     #[test]
