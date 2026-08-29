@@ -308,6 +308,9 @@ impl App {
         let terminal_cwd_reported = matches!(ev, AppEvent::TerminalCwdReported { .. });
         let previous_toast = self.state.toast.clone();
         let pane_updates = self.state.handle_app_event(ev);
+        if update_ready.is_some() {
+            self.state.latest_release_notes = crate::release_notes::load_latest();
+        }
         if let Some(agents) = manifest_update_agents {
             self.reset_agent_detection_for_agents(&agents);
         }
@@ -1000,6 +1003,25 @@ impl App {
             Method::NotificationShow(params) => {
                 return self.handle_notification_show(request.id, params);
             }
+            Method::ReleaseNotesDismiss(params) => {
+                let Some(notes) = self.state.latest_release_notes.as_ref() else {
+                    return responses::encode_error(
+                        request.id,
+                        "stale_release_notes",
+                        "the release notes are no longer current",
+                    );
+                };
+                if notes.version != params.version {
+                    return responses::encode_error(
+                        request.id,
+                        "stale_release_notes",
+                        "the release notes are no longer current",
+                    );
+                }
+                let preview = notes.preview;
+                self.mark_release_notes_seen(preview);
+                return responses::encode_success(request.id, ResponseResult::Ok {});
+            }
             Method::ProductAnnouncementDismiss(params) => {
                 let matches_current =
                     self.state
@@ -1542,6 +1564,46 @@ mod tests {
         let dismissed: serde_json::Value = serde_json::from_str(&dismissed).unwrap();
         assert_eq!(dismissed["result"]["type"], "ok");
         assert!(app.state.product_announcement.is_none());
+    }
+
+    #[test]
+    fn release_notes_dismiss_requires_current_version() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.latest_release_notes = Some(crate::release_notes::ReleaseNotes {
+            version: "99.99.99".into(),
+            body: "release notes".into(),
+            preview: true,
+        });
+
+        let stale = app.handle_api_request(crate::api::schema::Request {
+            id: "stale".into(),
+            method: crate::api::schema::Method::ReleaseNotesDismiss(
+                crate::api::schema::ReleaseNotesDismissParams {
+                    version: "0.8.2".into(),
+                },
+            ),
+        });
+        let stale: serde_json::Value = serde_json::from_str(&stale).unwrap();
+        assert_eq!(stale["error"]["code"], "stale_release_notes");
+
+        let dismissed = app.handle_api_request(crate::api::schema::Request {
+            id: "dismiss".into(),
+            method: crate::api::schema::Method::ReleaseNotesDismiss(
+                crate::api::schema::ReleaseNotesDismissParams {
+                    version: "99.99.99".into(),
+                },
+            ),
+        });
+        let dismissed: serde_json::Value = serde_json::from_str(&dismissed).unwrap();
+        assert_eq!(dismissed["result"]["type"], "ok");
+        assert!(app.state.latest_release_notes.is_some());
     }
 
     #[tokio::test]

@@ -82,6 +82,7 @@ impl ClientShellState {
                         Some(
                             ClientShellOverlay::Onboarding
                                 | ClientShellOverlay::ProductAnnouncement(_)
+                                | ClientShellOverlay::ReleaseNotes(_)
                         )
                     ) {
                         continue;
@@ -112,6 +113,7 @@ impl ClientShellState {
                         Some(
                             ClientShellOverlay::Onboarding
                                 | ClientShellOverlay::ProductAnnouncement(_)
+                                | ClientShellOverlay::ReleaseNotes(_)
                         )
                     ) {
                         continue;
@@ -256,7 +258,11 @@ impl ClientShellState {
     ) -> Option<ClientInputTarget> {
         if matches!(
             self.overlay,
-            Some(ClientShellOverlay::Onboarding | ClientShellOverlay::ProductAnnouncement(_))
+            Some(
+                ClientShellOverlay::Onboarding
+                    | ClientShellOverlay::ProductAnnouncement(_)
+                    | ClientShellOverlay::ReleaseNotes(_)
+            )
         ) {
             if key.kind == KeyEventKind::Press {
                 self.route_overlay_key(key, outcome);

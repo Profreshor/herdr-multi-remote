@@ -58,6 +58,122 @@ impl ClientShellState {
         }
     }
 
+    pub(super) fn open_release_notes(&mut self) {
+        let Some(notes) = self
+            .snapshot
+            .as_deref()
+            .and_then(|snapshot| snapshot.release_notes.as_ref())
+        else {
+            return;
+        };
+        self.overlay = Some(ClientShellOverlay::ReleaseNotes(release_notes_state(notes)));
+        self.chrome_drag = None;
+    }
+
+    pub(super) fn dismiss_release_notes(&mut self, outcome: &mut ClientShellInput) {
+        let notes = match self.overlay.take() {
+            Some(ClientShellOverlay::ReleaseNotes(notes)) => notes,
+            other => {
+                self.overlay = other;
+                return;
+            }
+        };
+        self.chrome_drag = None;
+        self.mode = if self
+            .snapshot
+            .as_deref()
+            .and_then(|snapshot| snapshot.focused_workspace_id.as_deref())
+            .is_some()
+        {
+            ClientShellMode::Terminal
+        } else {
+            ClientShellMode::Navigate
+        };
+        self.push_endpoint_method_with_kind(
+            crate::api::schema::Method::ReleaseNotesDismiss(
+                crate::api::schema::ReleaseNotesDismissParams {
+                    version: notes.version.clone(),
+                },
+            ),
+            PendingEndpointKind::ReleaseNotesDismiss,
+            outcome,
+        );
+        outcome.repaint = true;
+    }
+
+    pub(super) fn current_release_notes_input_geometry(
+        &self,
+    ) -> Option<(Rect, Option<Rect>, crate::pane::ScrollMetrics)> {
+        let notes = match self.overlay.as_ref()? {
+            ClientShellOverlay::ReleaseNotes(notes) => notes,
+            _ => return None,
+        };
+        let (cols, rows) = self.last_composed_size?;
+        let outer = crate::ui::centered_popup_rect(
+            Rect::new(0, 0, cols, rows),
+            crate::ui::RELEASE_NOTES_MODAL_SIZE.0,
+            crate::ui::RELEASE_NOTES_MODAL_SIZE.1,
+        )?;
+        let inner = Rect::new(
+            outer.x.saturating_add(1),
+            outer.y.saturating_add(1),
+            outer.width.saturating_sub(2),
+            outer.height.saturating_sub(2),
+        );
+        if inner.height < 8 || inner.width < 20 {
+            return None;
+        }
+        let stack = crate::ui::modal_stack_areas(inner, 2, 1, 0, 1);
+        let close = crate::ui::release_notes_close_button_rect(Rect::new(
+            stack.header.x,
+            stack.header.y,
+            stack.header.width,
+            1,
+        ));
+        let install_command = self
+            .snapshot
+            .as_deref()
+            .map(|snapshot| snapshot.update_install_command.as_str())
+            .unwrap_or_default();
+        let metrics = crate::ui::release_notes_scroll_metrics(
+            notes,
+            install_command,
+            stack.content,
+            &self.config.palette,
+        );
+        let track = crate::ui::release_notes_scrollbar_rect(stack.content, metrics);
+        Some((close, track, metrics))
+    }
+
+    fn current_release_notes_max_scroll(&self) -> usize {
+        self.current_release_notes_input_geometry()
+            .map(|(_, _, metrics)| metrics.max_offset_from_bottom)
+            .unwrap_or(self.hits.release_notes_max_scroll)
+    }
+
+    pub(super) fn scroll_release_notes(&mut self, delta: isize) {
+        let max_scroll = self.current_release_notes_max_scroll();
+        if let Some(ClientShellOverlay::ReleaseNotes(notes)) = self.overlay.as_mut() {
+            let current = usize::from(notes.scroll);
+            let next = if delta.is_negative() {
+                current.saturating_sub(delta.unsigned_abs())
+            } else {
+                current.saturating_add(delta as usize)
+            }
+            .min(max_scroll);
+            notes.scroll = u16::try_from(next).unwrap_or(u16::MAX);
+        }
+    }
+
+    pub(super) fn set_release_notes_offset_from_bottom(&mut self, offset_from_bottom: usize) {
+        let max_scroll = self.current_release_notes_max_scroll();
+        if let Some(ClientShellOverlay::ReleaseNotes(notes)) = self.overlay.as_mut() {
+            notes.scroll =
+                u16::try_from(max_scroll.saturating_sub(offset_from_bottom.min(max_scroll)))
+                    .unwrap_or(u16::MAX);
+        }
+    }
+
     pub(super) fn complete_onboarding(&mut self, outcome: &mut ClientShellInput) {
         if self.snapshot.is_none() {
             return;
@@ -370,6 +486,43 @@ impl ClientShellState {
                         announcement.scroll =
                             u16::try_from(self.hits.product_announcement_max_scroll)
                                 .unwrap_or(u16::MAX);
+                    }
+                    outcome.repaint = true;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if matches!(self.overlay, Some(ClientShellOverlay::ReleaseNotes(_))) {
+            match key.code {
+                KeyCode::Enter | KeyCode::Esc => self.dismiss_release_notes(outcome),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.scroll_release_notes(-1);
+                    outcome.repaint = true;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.scroll_release_notes(1);
+                    outcome.repaint = true;
+                }
+                KeyCode::PageUp => {
+                    self.scroll_release_notes(-8);
+                    outcome.repaint = true;
+                }
+                KeyCode::PageDown => {
+                    self.scroll_release_notes(8);
+                    outcome.repaint = true;
+                }
+                KeyCode::Home => {
+                    if let Some(ClientShellOverlay::ReleaseNotes(notes)) = self.overlay.as_mut() {
+                        notes.scroll = 0;
+                    }
+                    outcome.repaint = true;
+                }
+                KeyCode::End => {
+                    let max_scroll = self.current_release_notes_max_scroll();
+                    if let Some(ClientShellOverlay::ReleaseNotes(notes)) = self.overlay.as_mut() {
+                        notes.scroll = u16::try_from(max_scroll).unwrap_or(u16::MAX);
                     }
                     outcome.repaint = true;
                 }

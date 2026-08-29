@@ -155,12 +155,26 @@ pub(super) fn snapshot(
             preview: announcement.preview,
         }
     });
+    let release_notes =
+        app.state
+            .latest_release_notes
+            .as_ref()
+            .map(|notes| protocol::ClientShellReleaseNotes {
+                version: notes.version.clone(),
+                body: notes.body.clone(),
+                preview: notes.preview,
+            });
 
     protocol::ClientShellSnapshot {
         boot_id: boot_id.to_owned(),
         revision,
         config_diagnostic: config_diagnostic.map(str::to_owned),
         product_announcement,
+        update_available: app.state.update_available.clone(),
+        update_install_command: app.state.update_install_command.clone(),
+        latest_release_notes_available: app.state.latest_release_notes_available,
+        integration_updates_available: app.state.integration_updates_available(),
+        release_notes,
         focused_workspace_id: snapshot.focused_workspace_id,
         focused_tab_id: snapshot.focused_tab_id,
         focused_pane_id: snapshot.focused_pane_id,
@@ -456,6 +470,41 @@ fn split_hit_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_projects_cached_release_and_update_facts() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.update_available = Some("0.8.3".into());
+        app.state.update_install_command = "herdr update".into();
+        app.state.latest_release_notes_available = true;
+        app.state.latest_release_notes = Some(crate::release_notes::ReleaseNotes {
+            version: "0.8.3".into(),
+            body: "### Changed\n- Client shell".into(),
+            preview: true,
+        });
+
+        let snapshot = snapshot(&app, "boot", 7, None);
+
+        assert_eq!(snapshot.update_available.as_deref(), Some("0.8.3"));
+        assert_eq!(snapshot.update_install_command, "herdr update");
+        assert!(snapshot.latest_release_notes_available);
+        assert!(!snapshot.integration_updates_available);
+        assert_eq!(
+            snapshot.release_notes.as_ref().map(|notes| (
+                notes.version.as_str(),
+                notes.body.as_str(),
+                notes.preview
+            )),
+            Some(("0.8.3", "### Changed\n- Client shell", true))
+        );
+    }
 
     #[test]
     fn split_hits_follow_released_border_and_gap_geometry() {

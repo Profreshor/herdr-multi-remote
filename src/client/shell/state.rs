@@ -95,6 +95,9 @@ pub(super) struct ShellHitMap {
     pub(super) product_announcement_scrollbar: Rect,
     pub(super) product_announcement_scroll_metrics: Option<crate::pane::ScrollMetrics>,
     pub(super) product_announcement_max_scroll: usize,
+    pub(super) release_notes_scrollbar: Rect,
+    pub(super) release_notes_scroll_metrics: Option<crate::pane::ScrollMetrics>,
+    pub(super) release_notes_max_scroll: usize,
 }
 
 #[derive(Clone)]
@@ -153,6 +156,9 @@ pub(super) enum ClientChromeDrag {
         grab_row_offset: u16,
     },
     ProductAnnouncementScrollbar {
+        grab_row_offset: u16,
+    },
+    ReleaseNotesScrollbar {
         grab_row_offset: u16,
     },
     Tab {
@@ -219,6 +225,7 @@ pub(super) enum ClientShellMode {
 pub(super) enum ClientShellOverlayKind {
     Onboarding,
     ProductAnnouncement,
+    ReleaseNotes,
     Rename,
     ConfirmClose,
     Help,
@@ -502,6 +509,7 @@ pub(super) struct ClientConfirmCloseOverlay {
 pub(super) enum ClientShellOverlay {
     Onboarding,
     ProductAnnouncement(crate::app::state::ProductAnnouncementState),
+    ReleaseNotes(crate::app::state::ReleaseNotesState),
     Rename(ClientRenameOverlay),
     ConfirmClose(ClientConfirmCloseOverlay),
     Help(ClientHelpOverlay),
@@ -519,6 +527,7 @@ impl ClientShellOverlay {
         match self {
             Self::Onboarding => ClientShellOverlayKind::Onboarding,
             Self::ProductAnnouncement(_) => ClientShellOverlayKind::ProductAnnouncement,
+            Self::ReleaseNotes(_) => ClientShellOverlayKind::ReleaseNotes,
             Self::Rename(_) => ClientShellOverlayKind::Rename,
             Self::ConfirmClose(_) => ClientShellOverlayKind::ConfirmClose,
             Self::Help(_) => ClientShellOverlayKind::Help,
@@ -540,6 +549,7 @@ pub(super) enum PendingEndpointKind {
         version: String,
         id: String,
     },
+    ReleaseNotesDismiss,
     PopupCommand,
     ReloadConfig,
     IntegrationList,
@@ -750,6 +760,7 @@ pub(crate) struct ClientShellState {
     pub(super) tab_scroll: usize,
     pub(super) reveal_focused_tab: bool,
     pub(super) last_tab_bar_width: Option<u16>,
+    pub(super) last_composed_size: Option<(u16, u16)>,
     pub(super) hits: ShellHitMap,
     pub(super) mode: ClientShellMode,
     pub(super) navigate_workspace_id: Option<String>,
@@ -800,6 +811,17 @@ pub(super) fn product_announcement_state(
         body: announcement.body.clone(),
         scroll: 0,
         preview: announcement.preview,
+    }
+}
+
+pub(super) fn release_notes_state(
+    notes: &crate::protocol::ClientShellReleaseNotes,
+) -> crate::app::state::ReleaseNotesState {
+    crate::app::state::ReleaseNotesState {
+        version: notes.version.clone(),
+        body: notes.body.clone(),
+        scroll: 0,
+        preview: notes.preview,
     }
 }
 
@@ -859,6 +881,7 @@ impl ClientShellState {
             tab_scroll: 0,
             reveal_focused_tab: true,
             last_tab_bar_width: None,
+            last_composed_size: None,
             hits: ShellHitMap::default(),
             mode: ClientShellMode::Terminal,
             navigate_workspace_id: None,
@@ -959,6 +982,7 @@ impl ClientShellState {
             self.tab_scroll = 0;
             self.reveal_focused_tab = true;
             self.last_tab_bar_width = None;
+            self.last_composed_size = None;
             self.pending_requests.clear();
             self.pane_scroll_in_flight.clear();
             self.pane_scroll_queued.clear();
@@ -1134,6 +1158,24 @@ impl ClientShellState {
                 None => {
                     self.dismissed_product_announcement = None;
                 }
+            }
+        }
+        if let Some(ClientShellOverlay::ReleaseNotes(current)) = self.overlay.as_ref() {
+            match snapshot.release_notes.as_ref() {
+                Some(notes)
+                    if current.version != notes.version
+                        || current.body != notes.body
+                        || current.preview != notes.preview =>
+                {
+                    self.overlay =
+                        Some(ClientShellOverlay::ReleaseNotes(release_notes_state(notes)));
+                    self.chrome_drag = None;
+                }
+                None => {
+                    self.overlay = None;
+                    self.chrome_drag = None;
+                }
+                Some(_) => {}
             }
         }
         self.snapshot = Some(snapshot);

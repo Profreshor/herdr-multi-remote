@@ -1389,6 +1389,7 @@ pub struct CopyFeedback {
     pub message: String,
 }
 
+#[derive(Debug)]
 pub struct ReleaseNotesState {
     pub version: String,
     pub body: String,
@@ -1483,6 +1484,8 @@ pub struct AppState {
     pub name_input: String,
     pub name_input_replace_on_type: bool,
     pub release_notes: Option<ReleaseNotesState>,
+    /// Latest endpoint-owned release notes, cached outside render paths.
+    pub latest_release_notes: Option<crate::release_notes::ReleaseNotes>,
     pub product_announcement: Option<ProductAnnouncementState>,
     pub keybind_help: KeybindHelpState,
     pub navigator: NavigatorState,
@@ -1868,6 +1871,7 @@ impl AppState {
             name_input: String::new(),
             name_input_replace_on_type: false,
             release_notes: None,
+            latest_release_notes: None,
             product_announcement: None,
             keybind_help: KeybindHelpState::default(),
             navigator: NavigatorState::default(),

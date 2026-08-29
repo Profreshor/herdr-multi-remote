@@ -369,6 +369,26 @@ impl ClientShellState {
                     }
                 };
             }
+            PendingEndpointKind::ReleaseNotesDismiss => {
+                return match result {
+                    Ok(_) => (false, Vec::new()),
+                    Err(error) => {
+                        if self.overlay.is_none() {
+                            if let Some(notes) = self
+                                .snapshot
+                                .as_deref()
+                                .and_then(|snapshot| snapshot.release_notes.as_ref())
+                            {
+                                self.overlay = Some(ClientShellOverlay::ReleaseNotes(
+                                    release_notes_state(notes),
+                                ));
+                            }
+                        }
+                        self.endpoint_error = Some(error.message);
+                        (true, Vec::new())
+                    }
+                };
+            }
             PendingEndpointKind::PopupCommand => {
                 return match result {
                     Ok(_) => {

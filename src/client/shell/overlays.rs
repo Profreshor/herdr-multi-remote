@@ -23,6 +23,9 @@ pub(crate) struct OverlayRender {
     pub(crate) product_announcement_scrollbar: Rect,
     pub(crate) product_announcement_scroll_metrics: Option<crate::pane::ScrollMetrics>,
     pub(crate) product_announcement_max_scroll: usize,
+    pub(crate) release_notes_scrollbar: Rect,
+    pub(crate) release_notes_scroll_metrics: Option<crate::pane::ScrollMetrics>,
+    pub(crate) release_notes_max_scroll: usize,
     pub(crate) cursor: Option<crate::protocol::CursorState>,
 }
 
@@ -49,11 +52,16 @@ pub(crate) fn render_client_overlay(
     match o {
         ClientShellOverlay::Onboarding => render_onboarding_overlay(b, p),
         ClientShellOverlay::ProductAnnouncement(v) => render_product_announcement_overlay(b, v, p),
+        ClientShellOverlay::ReleaseNotes(v) => {
+            render_release_notes_overlay(b, v, &s.update_install_command, p)
+        }
         ClientShellOverlay::Rename(v) => render_rename_overlay(b, v, p),
         ClientShellOverlay::ConfirmClose(v) => render_confirm_close_overlay(b, v, p),
         ClientShellOverlay::Help(v) => render_help_overlay(b, v, k, p),
         ClientShellOverlay::Navigator(v) => render_navigator_overlay(b, v, s, p),
-        ClientShellOverlay::Settings(v) => settings_overlay::render_settings_overlay(b, v, p),
+        ClientShellOverlay::Settings(v) => {
+            settings_overlay::render_settings_overlay(b, v, s.integration_updates_available, p)
+        }
         ClientShellOverlay::WorktreeCreate(v) => {
             worktree_overlays::render_worktree_create_overlay(b, v, p)
         }
@@ -71,17 +79,24 @@ pub(crate) fn render_global_menu(
     buffer: &mut Buffer,
     launcher: Rect,
     menu: &ClientGlobalMenuOverlay,
+    snapshot: &ClientShellSnapshot,
     palette: &Palette,
 ) -> Option<Vec<(Rect, usize)>> {
+    let items = super::super::global_menu::global_menu_items(snapshot);
     let screen = buffer.area;
-    let width = super::super::global_menu::GLOBAL_MENU_ITEMS
+    let width = items
         .iter()
-        .map(|(label, _)| display_width(label))
+        .map(|(label, action)| {
+            display_width(label)
+                + u16::from(super::super::global_menu::global_menu_item_has_badge(
+                    snapshot, *action,
+                )) * 2
+        })
         .max()
         .unwrap_or(8)
         .saturating_add(4)
         .min(screen.width.max(1));
-    let height = (super::super::global_menu::GLOBAL_MENU_ITEMS.len() as u16)
+    let height = (items.len() as u16)
         .saturating_add(2)
         .min(screen.height.max(1));
     let x = launcher
@@ -96,10 +111,7 @@ pub(crate) fn render_global_menu(
         palette.panel_bg,
     )?;
     let mut rows = Vec::new();
-    for (index, (label, _)) in super::super::global_menu::GLOBAL_MENU_ITEMS
-        .iter()
-        .enumerate()
-    {
+    for (index, (label, action)) in items.iter().enumerate() {
         let row_y = inner.y.saturating_add(index as u16);
         if row_y >= inner.bottom() {
             break;
@@ -115,7 +127,28 @@ pub(crate) fn render_global_menu(
             Style::default().fg(palette.text).bg(palette.panel_bg)
         };
         buffer.set_style(row, style);
-        put_text(buffer, row.x, row.y, row.width, &format!(" {label}"), style);
+        let has_badge = super::super::global_menu::global_menu_item_has_badge(snapshot, *action);
+        if has_badge {
+            let badge_style = if highlighted {
+                style
+            } else {
+                Style::default()
+                    .fg(palette.accent)
+                    .bg(palette.panel_bg)
+                    .add_modifier(Modifier::BOLD)
+            };
+            put_text(buffer, row.x, row.y, row.width.min(2), " ●", badge_style);
+            put_text(
+                buffer,
+                row.x.saturating_add(2),
+                row.y,
+                row.width.saturating_sub(2),
+                &format!(" {label}"),
+                style,
+            );
+        } else {
+            put_text(buffer, row.x, row.y, row.width, &format!(" {label}"), style);
+        }
         rows.push((row, index));
     }
     Some(rows)
@@ -256,6 +289,118 @@ fn contrast(p: &Palette) -> ratatui::style::Color {
         c => c,
     }
 }
+fn render_release_notes_overlay(
+    b: &mut Buffer,
+    notes: &crate::app::state::ReleaseNotesState,
+    install_command: &str,
+    p: &Palette,
+) -> Option<OverlayRender> {
+    let outer = popup(
+        b.area,
+        crate::ui::RELEASE_NOTES_MODAL_SIZE.0,
+        crate::ui::RELEASE_NOTES_MODAL_SIZE.1,
+    )?;
+    let inner = panel(b, outer, p.accent, p.panel_bg)?;
+    if inner.height < 8 || inner.width < 20 {
+        return Some(OverlayRender::default());
+    }
+
+    let stack = crate::ui::modal_stack_areas(inner, 2, 1, 0, 1);
+    let title_area = Rect::new(
+        stack.header.x.saturating_add(1),
+        stack.header.y,
+        stack.header.width.saturating_sub(2),
+        1,
+    );
+    let subtitle_area = Rect::new(
+        stack.header.x.saturating_add(1),
+        stack.header.y.saturating_add(1),
+        stack.header.width.saturating_sub(2),
+        1,
+    );
+    let base = Style::default()
+        .bg(p.panel_bg)
+        .remove_modifier(Modifier::DIM);
+    put_text(
+        b,
+        title_area.x,
+        title_area.y,
+        title_area.width,
+        &format!("v{}", notes.version),
+        base.fg(p.text).add_modifier(Modifier::BOLD),
+    );
+    put_text(
+        b,
+        subtitle_area.x,
+        subtitle_area.y,
+        subtitle_area.width,
+        if notes.preview {
+            "update ready"
+        } else {
+            "what's new in this release"
+        },
+        base.fg(p.overlay1),
+    );
+    let close = crate::ui::release_notes_close_button_rect(Rect::new(
+        stack.header.x,
+        stack.header.y,
+        stack.header.width,
+        1,
+    ));
+    button(
+        b,
+        close,
+        " esc close ",
+        Style::default()
+            .fg(contrast(p))
+            .bg(p.accent)
+            .add_modifier(Modifier::BOLD)
+            .remove_modifier(Modifier::DIM),
+    );
+
+    let body = stack.content;
+    let lines = crate::ui::release_notes_display_lines(notes, install_command, p);
+    let metrics = crate::ui::release_notes_scroll_metrics(notes, install_command, body, p);
+    let max_scroll = metrics.max_offset_from_bottom;
+    let scroll = usize::from(notes.scroll).min(max_scroll);
+    let track = crate::ui::release_notes_scrollbar_rect(body, metrics);
+    let text_area = track
+        .map(|_| Rect::new(body.x, body.y, body.width.saturating_sub(1), body.height))
+        .unwrap_or(body);
+    let paragraph = ratatui::widgets::Paragraph::new(
+        lines.into_iter().map(|(_, line)| line).collect::<Vec<_>>(),
+    )
+    .wrap(ratatui::widgets::Wrap { trim: false })
+    .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0));
+    ratatui::widgets::Widget::render(paragraph, text_area, b);
+    if let Some(track) = track {
+        crate::ui::render_scrollbar_buffer(b, metrics, track, p.overlay0, p.overlay1, "▐");
+    }
+
+    if let Some(footer_area) = stack.footer {
+        let footer_line = ratatui::text::Line::from(vec![
+            ratatui::text::Span::styled(" scroll ", base.fg(p.overlay0)),
+            ratatui::text::Span::styled("wheel ↑↓", base.fg(p.text)),
+            ratatui::text::Span::styled("  ·  ", base.fg(p.overlay0)),
+            ratatui::text::Span::styled("close", base.fg(p.overlay0)),
+            ratatui::text::Span::styled(" esc / enter ", base.fg(p.text)),
+        ]);
+        ratatui::widgets::Widget::render(
+            ratatui::widgets::Paragraph::new(footer_line),
+            footer_area,
+            b,
+        );
+    }
+
+    Some(OverlayRender {
+        primary: close,
+        release_notes_scrollbar: track.unwrap_or_default(),
+        release_notes_scroll_metrics: Some(metrics),
+        release_notes_max_scroll: max_scroll,
+        ..OverlayRender::default()
+    })
+}
+
 fn render_product_announcement_overlay(
     b: &mut Buffer,
     announcement: &crate::app::state::ProductAnnouncementState,

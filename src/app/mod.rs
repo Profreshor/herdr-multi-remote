@@ -612,6 +612,7 @@ impl App {
             name_input: String::new(),
             name_input_replace_on_type: false,
             release_notes: None,
+            latest_release_notes,
             product_announcement: startup_product_announcement.map(|announcement| {
                 state::ProductAnnouncementState {
                     version: announcement.version,
@@ -1303,6 +1304,16 @@ impl App {
         }
     }
 
+    fn mark_release_notes_seen(&mut self, preview: bool) {
+        if !preview {
+            if let Err(err) = crate::release_notes::mark_current_version_seen() {
+                self.state.config_diagnostic =
+                    Some(format!("failed to update release notes status: {err}"));
+                self.config_diagnostic_deadline = Some(Instant::now() + Duration::from_secs(5));
+            }
+        }
+    }
+
     pub(crate) fn dismiss_release_notes(&mut self) {
         let preview = self
             .state
@@ -1311,13 +1322,7 @@ impl App {
             .is_some_and(|notes| notes.preview);
 
         self.state.release_notes = None;
-        if !preview {
-            if let Err(err) = crate::release_notes::mark_current_version_seen() {
-                self.state.config_diagnostic =
-                    Some(format!("failed to update release notes status: {err}"));
-                self.config_diagnostic_deadline = Some(Instant::now() + Duration::from_secs(5));
-            }
-        }
+        self.mark_release_notes_seen(preview);
 
         if self.state.product_announcement.is_some() {
             self.state.mode = Mode::ProductAnnouncement;
@@ -2999,6 +3004,81 @@ mod tests {
 
         assert_eq!(app.state.update_available.as_deref(), Some("99.99.99"));
         assert!(app.state.latest_release_notes_available);
+        assert_eq!(
+            app.state
+                .latest_release_notes
+                .as_ref()
+                .map(|notes| notes.version.as_str()),
+            Some("99.99.99")
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn update_ready_refreshes_cached_release_notes() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("update-ready-refreshes-release-notes");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        let mut app = test_app();
+        assert!(app.state.latest_release_notes.is_none());
+
+        crate::release_notes::save_pending("99.99.99", "### Changed\n- One").unwrap();
+        app.handle_internal_event(AppEvent::UpdateReady {
+            version: "99.99.99".into(),
+            install_command: "herdr update".into(),
+        });
+
+        assert_eq!(
+            app.state.latest_release_notes.as_ref().map(|notes| (
+                notes.version.as_str(),
+                notes.body.as_str(),
+                notes.preview
+            )),
+            Some(("99.99.99", "### Changed\n- One", true))
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn release_notes_dismiss_api_marks_current_seen_but_keeps_preview_unseen() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("release-notes-dismiss-persistence");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let dismiss = |app: &mut App, version: &str| {
+            let response = app.handle_api_request(crate::api::schema::Request {
+                id: format!("dismiss-{version}"),
+                method: crate::api::schema::Method::ReleaseNotesDismiss(
+                    crate::api::schema::ReleaseNotesDismissParams {
+                        version: version.to_owned(),
+                    },
+                ),
+            });
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["result"]["type"], "ok");
+        };
+        let show_on_startup = || {
+            let stored: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(crate::release_notes::pending_path()).unwrap(),
+            )
+            .unwrap();
+            stored["show_on_startup"].as_bool()
+        };
+
+        let current = env!("CARGO_PKG_VERSION");
+        crate::release_notes::save_pending(current, "### Changed\n- Current").unwrap();
+        let mut app = test_app();
+        dismiss(&mut app, current);
+        assert_eq!(show_on_startup(), Some(false));
+
+        crate::release_notes::save_pending("99.99.99", "### Changed\n- Preview").unwrap();
+        let mut app = test_app();
+        dismiss(&mut app, "99.99.99");
+        assert_eq!(show_on_startup(), Some(true));
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -4167,6 +4247,14 @@ mod tests {
                 },
             ),
         };
+        let release_notes_dismiss = crate::api::schema::Request {
+            id: "req_12".into(),
+            method: crate::api::schema::Method::ReleaseNotesDismiss(
+                crate::api::schema::ReleaseNotesDismissParams {
+                    version: "0.8.2".into(),
+                },
+            ),
+        };
 
         assert!(!crate::api::request_changes_ui(&read_only));
         assert!(!crate::api::request_changes_ui(&worktree_list));
@@ -4179,6 +4267,7 @@ mod tests {
         assert!(crate::api::request_changes_ui(&agent_view));
         assert!(crate::api::request_changes_ui(&command_invoke));
         assert!(crate::api::request_changes_ui(&announcement_dismiss));
+        assert!(crate::api::request_changes_ui(&release_notes_dismiss));
     }
 
     #[test]

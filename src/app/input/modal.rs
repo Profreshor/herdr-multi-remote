@@ -107,13 +107,13 @@ pub(super) fn open_keybind_help(state: &mut AppState) {
 }
 
 fn open_update_release_notes(state: &mut AppState) {
-    let Some(notes) = crate::release_notes::load_latest() else {
+    let Some(notes) = state.latest_release_notes.as_ref() else {
         return;
     };
 
     state.release_notes = Some(crate::app::state::ReleaseNotesState {
-        version: notes.version,
-        body: notes.body,
+        version: notes.version.clone(),
+        body: notes.body.clone(),
         scroll: 0,
         preview: notes.preview,
     });
@@ -1539,6 +1539,7 @@ mod tests {
 
         let mut state = state_with_workspaces(&["test"]);
         state.latest_release_notes_available = true;
+        state.latest_release_notes = crate::release_notes::load_latest();
 
         assert!(global_menu_actions(&state).contains(&GlobalMenuAction::WhatsNew));
 

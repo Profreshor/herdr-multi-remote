@@ -1,12 +1,22 @@
 use super::*;
 
-fn diagnostic_overlap_rows(diagnostic_area: Rect, target: Rect, rendered_rows: u16) -> u16 {
-    let diagnostic_bottom = diagnostic_area
-        .y
-        .saturating_add(rendered_rows.min(diagnostic_area.height));
-    diagnostic_bottom
-        .min(target.bottom())
-        .saturating_sub(diagnostic_area.y.max(target.y))
+fn restore_mode_bar(
+    frame: &mut FrameData,
+    bar: Option<Rect>,
+    cells: Option<&[crate::protocol::CellData]>,
+) {
+    let (Some(bar), Some(cells)) = (bar, cells) else {
+        return;
+    };
+    let start = usize::from(bar.y) * usize::from(frame.width) + usize::from(bar.x);
+    frame.cells[start..start + usize::from(bar.width)].clone_from_slice(cells);
+    if frame
+        .cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.y == bar.y)
+    {
+        frame.cursor = None;
+    }
 }
 
 fn clipboard_feedback_starts_at_top(position: crate::config::ToastClipboardPosition) -> bool {
@@ -20,6 +30,7 @@ fn clipboard_feedback_starts_at_top(position: crate::config::ToastClipboardPosit
 
 impl ClientShellState {
     pub(crate) fn compose(&mut self, cols: u16, rows: u16) -> Option<FrameData> {
+        self.last_composed_size = Some((cols, rows));
         let snapshot = self.snapshot.as_deref()?;
         let surface = self.pane_surface.as_ref()?;
         if snapshot.revision != surface.projection_revision {
@@ -138,32 +149,44 @@ impl ClientShellState {
         if !self.config.mouse_capture {
             self.hits.pane_splits.clear();
         }
-        let mode_bar = render::render_mode_bar(
-            &mut buffer,
-            layout.pane_surface,
-            self.mode,
-            self.copy_mode.as_ref(),
-            self.endpoint_error.as_deref(),
-            &self.config.keybinds,
-            &self.config.palette,
-        );
+        let mode_bar_area = if layout.mobile_header.is_empty()
+            && self.config.tab_bar_position == TabBarPositionConfig::Bottom
+            && !layout.tab_bar.is_empty()
+        {
+            layout.tab_bar
+        } else {
+            layout.pane_surface
+        };
+        let mobile_navigate_panel = !layout.mobile_header.is_empty()
+            && self.mode == ClientShellMode::Navigate
+            && self.endpoint_error.is_none();
+        let mode_bar = if mobile_navigate_panel || self.overlay.is_some() {
+            None
+        } else {
+            render::render_mode_bar(
+                &mut buffer,
+                mode_bar_area,
+                self.mode,
+                self.copy_mode.as_ref(),
+                self.endpoint_error.as_deref(),
+                snapshot.update_available.is_some(),
+                &self.config.keybinds,
+                &self.config.palette,
+            )
+        };
+        if mode_bar == Some(layout.tab_bar) {
+            self.hits.tabs.clear();
+            self.hits.new_tab = Rect::default();
+            self.hits.tab_scroll_left = Rect::default();
+            self.hits.tab_scroll_right = Rect::default();
+        }
         let mut frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
         let mode_bar_cells = mode_bar.map(|bar| {
             let start = usize::from(bar.y) * usize::from(frame.width) + usize::from(bar.x);
             frame.cells[start..start + usize::from(bar.width)].to_vec()
         });
         blit_pane_surface(&mut frame, &surface.frame, layout.pane_surface);
-        if let (Some(bar), Some(cells)) = (mode_bar, mode_bar_cells.as_ref()) {
-            let start = usize::from(bar.y) * usize::from(frame.width) + usize::from(bar.x);
-            frame.cells[start..start + usize::from(bar.width)].clone_from_slice(cells);
-            if frame
-                .cursor
-                .as_ref()
-                .is_some_and(|cursor| cursor.y == bar.y)
-            {
-                frame.cursor = None;
-            }
-        }
+        restore_mode_bar(&mut frame, mode_bar, mode_bar_cells.as_deref());
         let has_selection = self
             .selection
             .as_ref()
@@ -252,20 +275,10 @@ impl ClientShellState {
                 }
             }
         }
-        if let (Some(bar), Some(cells)) = (mode_bar, mode_bar_cells.as_ref()) {
-            let start = usize::from(bar.y) * usize::from(frame.width) + usize::from(bar.x);
-            frame.cells[start..start + usize::from(bar.width)].clone_from_slice(cells);
-            if frame
-                .cursor
-                .as_ref()
-                .is_some_and(|cursor| cursor.y == bar.y)
-            {
-                frame.cursor = None;
-            }
-        }
+        restore_mode_bar(&mut frame, mode_bar, mode_bar_cells.as_deref());
         self.hits.notification_toast = Rect::default();
-        let mut diagnostic_pane_overlap = 0;
-        if self.config_diagnostic.is_some() || self.visible_notification.is_some() {
+        let has_config_diagnostic = self.config_diagnostic.is_some();
+        if has_config_diagnostic || self.visible_notification.is_some() {
             let cursor = frame.cursor.clone();
             let mut composed = frame.to_ratatui_buffer()?;
             if let Some(diagnostic) = self.config_diagnostic.as_deref() {
@@ -274,22 +287,25 @@ impl ClientShellState {
                 } else {
                     layout.pane_surface
                 };
-                let rendered_rows = crate::ui::render_config_diagnostic_buffer(
+                crate::ui::render_config_diagnostic_buffer(
                     &mut composed,
                     diagnostic_area,
                     diagnostic,
                     &self.config.palette,
                 );
-                diagnostic_pane_overlap =
-                    diagnostic_overlap_rows(diagnostic_area, layout.pane_surface, rendered_rows);
             }
             if let Some(notification) = self.visible_notification.as_ref() {
+                let notification_area = if layout.mobile_header.is_empty() {
+                    Rect::new(0, 0, cols, rows)
+                } else {
+                    layout.pane_surface
+                };
                 self.hits.notification_toast = notifications::render_visible_notification(
                     &mut composed,
-                    layout.pane_surface,
+                    notification_area,
                     notification,
                     self.config.toast_position,
-                    diagnostic_pane_overlap,
+                    u16::from(has_config_diagnostic),
                     &self.config.palette,
                 );
             }
@@ -300,7 +316,7 @@ impl ClientShellState {
             let mut composed = frame.to_ratatui_buffer()?;
             let base_offset =
                 if clipboard_feedback_starts_at_top(self.config.clipboard_toast_position) {
-                    diagnostic_pane_overlap
+                    u16::from(has_config_diagnostic)
                 } else {
                     0
                 };
@@ -356,6 +372,7 @@ impl ClientShellState {
                 });
             }
         }
+        restore_mode_bar(&mut frame, mode_bar, mode_bar_cells.as_deref());
         if let Some(overlay) = self.overlay.as_ref() {
             let mut composed = frame.to_ratatui_buffer()?;
             let cursor = if let ClientShellOverlay::ContextMenu(menu) = overlay {
@@ -367,6 +384,7 @@ impl ClientShellState {
                     &mut composed,
                     self.hits.global_launcher,
                     menu,
+                    snapshot,
                     &self.config.palette,
                 )?;
                 None
@@ -398,6 +416,9 @@ impl ClientShellState {
                     rendered.product_announcement_scroll_metrics;
                 self.hits.product_announcement_max_scroll =
                     rendered.product_announcement_max_scroll;
+                self.hits.release_notes_scrollbar = rendered.release_notes_scrollbar;
+                self.hits.release_notes_scroll_metrics = rendered.release_notes_scroll_metrics;
+                self.hits.release_notes_max_scroll = rendered.release_notes_max_scroll;
                 rendered.cursor
             };
             frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
@@ -409,6 +430,11 @@ impl ClientShellState {
             announcement.scroll = announcement
                 .scroll
                 .min(u16::try_from(self.hits.product_announcement_max_scroll).unwrap_or(u16::MAX));
+        }
+        if let Some(ClientShellOverlay::ReleaseNotes(notes)) = self.overlay.as_mut() {
+            notes.scroll = notes
+                .scroll
+                .min(u16::try_from(self.hits.release_notes_max_scroll).unwrap_or(u16::MAX));
         }
         Some(frame)
     }

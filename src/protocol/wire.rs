@@ -800,6 +800,16 @@ pub struct ClientShellSnapshot {
     pub config_diagnostic: Option<String>,
     /// Unseen announcement owned and persisted by this endpoint.
     pub product_announcement: Option<ClientShellProductAnnouncement>,
+    /// Future-version update advertised by the endpoint.
+    pub update_available: Option<String>,
+    /// Endpoint-specific command shown in update instructions.
+    pub update_install_command: String,
+    /// Whether the endpoint has a What's New entry, even if its body is unavailable.
+    pub latest_release_notes_available: bool,
+    /// Whether endpoint-owned integration assets need an update.
+    pub integration_updates_available: bool,
+    /// Cached endpoint-owned notes used by the client-rendered overlay.
+    pub release_notes: Option<ClientShellReleaseNotes>,
     pub focused_workspace_id: Option<String>,
     pub focused_tab_id: Option<String>,
     pub focused_pane_id: Option<String>,
@@ -819,6 +829,13 @@ pub struct ClientShellProductAnnouncement {
     pub version: String,
     pub id: String,
     pub title: String,
+    pub body: String,
+    pub preview: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientShellReleaseNotes {
+    pub version: String,
     pub body: String,
     pub preview: bool,
 }
@@ -1936,6 +1953,15 @@ mod tests {
                 title: "Client shell".into(),
                 body: "### New\n- Client-owned chrome".into(),
                 preview: false,
+            }),
+            update_available: Some("0.8.3".into()),
+            update_install_command: "herdr update".into(),
+            latest_release_notes_available: true,
+            integration_updates_available: true,
+            release_notes: Some(ClientShellReleaseNotes {
+                version: "0.8.3".into(),
+                body: "### New\n- Update ready".into(),
+                preview: true,
             }),
             focused_workspace_id: Some("w1".into()),
             focused_tab_id: Some("w1:t1".into()),

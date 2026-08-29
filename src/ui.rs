@@ -47,7 +47,7 @@ pub(crate) use self::panes::{popup_pane_rects, render_selection_highlight};
 use self::panes::{render_empty, render_popup_pane, resize_popup_pane};
 pub(crate) use self::release_notes::{
     product_announcement_display_lines, product_announcement_scroll_metrics,
-    release_notes_close_button_rect, release_notes_display_lines, release_notes_wrapped_line_count,
+    release_notes_close_button_rect, release_notes_display_lines, release_notes_scroll_metrics,
     PRODUCT_ANNOUNCEMENT_MODAL_SIZE, RELEASE_NOTES_MODAL_SIZE,
 };
 use self::release_notes::{render_product_announcement_overlay, render_release_notes_overlay};

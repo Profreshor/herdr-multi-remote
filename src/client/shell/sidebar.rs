@@ -167,7 +167,13 @@ pub(crate) fn render_collapsed_sidebar(
         hits.sidebar_toggle.y,
         hits.sidebar_toggle.width,
         "»",
-        Style::default().fg(palette.overlay0),
+        if super::super::global_menu::global_menu_attention(snapshot) {
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.overlay0)
+        },
     );
 }
 
@@ -350,20 +356,43 @@ pub(crate) fn render_sidebar(
             " new",
             Style::default().fg(palette.overlay0),
         );
-        let launcher_width = 6.min(workspace_area.width);
+        let attention = super::super::global_menu::global_menu_attention(snapshot);
+        let launcher_width = if attention { 8 } else { 6 }.min(workspace_area.width);
         hits.global_launcher = Rect::new(
             workspace_area.right().saturating_sub(launcher_width),
             footer_y,
             launcher_width,
             1,
         );
-        put_right_text(
-            buffer,
-            workspace_area,
-            footer_y,
-            "menu",
-            Style::default().fg(palette.overlay0),
-        );
+        if attention {
+            let start_x = workspace_area.right().saturating_sub(6);
+            put_text(
+                buffer,
+                start_x,
+                footer_y,
+                2,
+                "● ",
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            );
+            put_text(
+                buffer,
+                start_x.saturating_add(2),
+                footer_y,
+                4,
+                "menu",
+                Style::default().fg(palette.overlay0),
+            );
+        } else {
+            put_right_text(
+                buffer,
+                workspace_area,
+                footer_y,
+                "menu",
+                Style::default().fg(palette.overlay0),
+            );
+        }
     }
 
     super::render_agent_panel(

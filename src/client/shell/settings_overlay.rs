@@ -36,6 +36,7 @@ fn draw_choice(
 pub(super) fn render_settings_overlay(
     buffer: &mut Buffer,
     settings: &ClientSettingsOverlay,
+    integration_updates_available: bool,
     palette: &Palette,
 ) -> Option<OverlayRender> {
     let integration_height = 14u16
@@ -64,10 +65,11 @@ pub(super) fn render_settings_overlay(
             .add_modifier(Modifier::BOLD),
     );
 
-    let integration_badge = settings
-        .integrations
-        .iter()
-        .any(|integration| integration.state == crate::api::schema::IntegrationState::Outdated);
+    let integration_badge = integration_updates_available
+        || settings
+            .integrations
+            .iter()
+            .any(|integration| integration.state == crate::api::schema::IntegrationState::Outdated);
     let mut tab_x = inner.x;
     let mut tab_hits = Vec::new();
     for section in ClientSettingsSection::ALL {
@@ -86,16 +88,23 @@ pub(super) fn render_settings_overlay(
                 .bg(palette.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
-                .fg(if badge {
-                    palette.accent
-                } else {
-                    palette.overlay1
-                })
-                .bg(palette.panel_bg)
+            Style::default().fg(palette.overlay1).bg(palette.panel_bg)
         };
         buffer.set_style(rect, style);
         put_text(buffer, rect.x, rect.y, rect.width, &label, style);
+        if badge && !active {
+            put_text(
+                buffer,
+                rect.x.saturating_add(1),
+                rect.y,
+                rect.width.saturating_sub(1).min(2),
+                "● ",
+                Style::default()
+                    .fg(palette.accent)
+                    .bg(palette.panel_bg)
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
         tab_hits.push((rect, *section));
         tab_x = tab_x.saturating_add(width.saturating_add(1));
         if tab_x >= inner.right() {

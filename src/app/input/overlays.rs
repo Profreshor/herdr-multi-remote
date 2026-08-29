@@ -408,34 +408,12 @@ impl AppState {
     }
 
     fn release_notes_scroll_metrics(&self) -> Option<crate::pane::ScrollMetrics> {
-        let notes = self.release_notes.as_ref()?;
-        let body = self.release_notes_body_rect()?;
-        let viewport_rows = body.height.max(1) as usize;
-        let lines = crate::ui::release_notes_display_lines(
-            notes,
+        Some(crate::ui::release_notes_scroll_metrics(
+            self.release_notes.as_ref()?,
             &self.update_install_command,
+            self.release_notes_body_rect()?,
             &self.palette,
-        );
-
-        let rows_for_width = |wrap_width: u16| {
-            crate::ui::release_notes_wrapped_line_count(&lines, wrap_width.max(1))
-        };
-
-        let full_width = body.width.max(1);
-        let mut total_rows = rows_for_width(full_width);
-        let wrap_width = if total_rows > viewport_rows && full_width > 1 {
-            body.width.saturating_sub(1).max(1)
-        } else {
-            full_width
-        };
-        total_rows = rows_for_width(wrap_width);
-
-        let max_offset_from_bottom = total_rows.saturating_sub(viewport_rows);
-        Some(crate::pane::ScrollMetrics {
-            offset_from_bottom: max_offset_from_bottom.saturating_sub(notes.scroll as usize),
-            max_offset_from_bottom,
-            viewport_rows,
-        })
+        ))
     }
 
     pub(crate) fn release_notes_max_scroll(&self) -> u16 {

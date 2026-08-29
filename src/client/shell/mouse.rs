@@ -663,6 +663,69 @@ impl ClientShellState {
             }
             return;
         }
+        if matches!(self.overlay, Some(ClientShellOverlay::ReleaseNotes(_))) {
+            let (close, track, metrics) = self
+                .current_release_notes_input_geometry()
+                .map(|(close, track, metrics)| (close, track, Some(metrics)))
+                .unwrap_or((
+                    self.hits.overlay_primary,
+                    (!self.hits.release_notes_scrollbar.is_empty())
+                        .then_some(self.hits.release_notes_scrollbar),
+                    self.hits.release_notes_scroll_metrics,
+                ));
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) if super::contains(close, point) => {
+                    self.dismiss_release_notes(outcome);
+                }
+                MouseEventKind::Down(MouseButton::Left)
+                    if track.is_some_and(|track| super::contains(track, point)) =>
+                {
+                    if let (Some(track), Some(metrics)) = (track, metrics) {
+                        if let Some(grab_row_offset) =
+                            crate::ui::scrollbar_thumb_grab_offset(metrics, track, mouse.row)
+                        {
+                            self.chrome_drag =
+                                Some(ClientChromeDrag::ReleaseNotesScrollbar { grab_row_offset });
+                        } else {
+                            let offset =
+                                crate::ui::scrollbar_offset_from_row(metrics, track, mouse.row);
+                            self.set_release_notes_offset_from_bottom(offset);
+                            outcome.repaint = true;
+                        }
+                    }
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let (
+                        Some(ClientChromeDrag::ReleaseNotesScrollbar { grab_row_offset }),
+                        Some(track),
+                        Some(metrics),
+                    ) = (self.chrome_drag.as_ref(), track, metrics)
+                    {
+                        let offset = crate::ui::scrollbar_offset_from_drag_row(
+                            metrics,
+                            track,
+                            mouse.row,
+                            *grab_row_offset,
+                        );
+                        self.set_release_notes_offset_from_bottom(offset);
+                        outcome.repaint = true;
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.chrome_drag = None;
+                }
+                MouseEventKind::ScrollUp => {
+                    self.scroll_release_notes(-3);
+                    outcome.repaint = true;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.scroll_release_notes(3);
+                    outcome.repaint = true;
+                }
+                _ => {}
+            }
+            return;
+        }
         if let Some(gesture) = self.pane_mouse_gesture.as_ref() {
             let gesture_event = matches!(
                 mouse.kind,
@@ -733,6 +796,11 @@ impl ClientShellState {
             return;
         }
         if self.overlay.is_none()
+            && self.mode == ClientShellMode::Terminal
+            && self
+                .visible_notification
+                .as_ref()
+                .is_some_and(|notification| notification.event.pane_id.is_some())
             && mouse.kind == MouseEventKind::Down(MouseButton::Left)
             && super::contains(self.hits.notification_toast, point)
         {
@@ -799,7 +867,10 @@ impl ClientShellState {
                     }
                     return;
                 }
-                Some(ClientChromeDrag::ProductAnnouncementScrollbar { .. }) => {
+                Some(
+                    ClientChromeDrag::ProductAnnouncementScrollbar { .. }
+                    | ClientChromeDrag::ReleaseNotesScrollbar { .. },
+                ) => {
                     self.chrome_drag = None;
                     return;
                 }
@@ -1077,7 +1148,8 @@ impl ClientShellState {
                     ClientChromeDrag::WorkspaceScrollbar { .. }
                     | ClientChromeDrag::AgentScrollbar { .. }
                     | ClientChromeDrag::HelpScrollbar { .. }
-                    | ClientChromeDrag::ProductAnnouncementScrollbar { .. } => {}
+                    | ClientChromeDrag::ProductAnnouncementScrollbar { .. }
+                    | ClientChromeDrag::ReleaseNotesScrollbar { .. } => {}
                 }
                 return;
             }

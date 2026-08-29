@@ -3859,6 +3859,17 @@
           ],
           "type": "string"
         },
+        "ReleaseNotesDismissParams": {
+          "properties": {
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "version"
+          ],
+          "type": "object"
+        },
         "ServerLiveHandoffParams": {
           "properties": {
             "expected_protocol": {
@@ -4785,6 +4796,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/ProductAnnouncementDismissParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "release_notes.dismiss",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ReleaseNotesDismissParams"
             }
           },
           "required": [

@@ -42,6 +42,11 @@ pub struct ProductAnnouncementDismissParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ReleaseNotesDismissParams {
+    pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TabTarget {
     pub tab_id: String,
 }

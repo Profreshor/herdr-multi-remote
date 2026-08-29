@@ -31,14 +31,16 @@ pub(super) fn render_visible_notification(
         crate::config::ToastHerdrPosition::TopRight
         | crate::config::ToastHerdrPosition::BottomRight => area.right().saturating_sub(width),
     };
+    let max_y = area.bottom().saturating_sub(height).max(area.y);
     let y = match position {
         crate::config::ToastHerdrPosition::TopLeft
-        | crate::config::ToastHerdrPosition::TopRight => area
-            .y
-            .saturating_add(top_offset.min(area.height.saturating_sub(height))),
+        | crate::config::ToastHerdrPosition::TopRight => area.y.saturating_add(top_offset),
         crate::config::ToastHerdrPosition::BottomLeft
-        | crate::config::ToastHerdrPosition::BottomRight => area.bottom().saturating_sub(height),
-    };
+        | crate::config::ToastHerdrPosition::BottomRight => area
+            .bottom()
+            .saturating_sub(height.saturating_add(top_offset)),
+    }
+    .clamp(area.y, max_y);
     let rect = Rect::new(x, y, width, height);
     Clear.render(rect, buffer);
     let block = Block::default()
@@ -240,6 +242,52 @@ impl ClientShellState {
                 crate::api::schema::AgentStatus::Idle | crate::api::schema::AgentStatus::Done
             ),
             SemanticNotificationKind::UpdateInstalled | SemanticNotificationKind::Custom => true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn notification() -> ClientVisibleNotification {
+        ClientVisibleNotification {
+            event: SemanticNotification {
+                kind: SemanticNotificationKind::Custom,
+                title: "notice".into(),
+                body: None,
+                sound: None,
+                agent: None,
+                workspace_id: None,
+                tab_id: None,
+                pane_id: None,
+                position: None,
+            },
+            deadline: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn notification_rect_stays_inside_short_nonzero_area() {
+        let palette = crate::app::client_palette_from_config(&Config::default());
+        for height in [1, 2] {
+            let area = Rect::new(3, 4, 8, height);
+            for position in [
+                crate::config::ToastHerdrPosition::TopRight,
+                crate::config::ToastHerdrPosition::BottomRight,
+            ] {
+                let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 10));
+                let rect = render_visible_notification(
+                    &mut buffer,
+                    area,
+                    &notification(),
+                    position,
+                    1,
+                    &palette,
+                );
+                assert!(rect.y >= area.y);
+                assert!(rect.bottom() <= area.bottom());
+            }
         }
     }
 }
