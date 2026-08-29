@@ -76,7 +76,6 @@ impl HeadlessServer {
                             .and_then(crate::app::pane_graphics::Layer::direct_lease)
                             .map(|lease| {
                                 (
-                                    slot.host_image_id,
                                     lease.path().to_string_lossy().into_owned(),
                                     lease.len() as u64,
                                     lease.fingerprint(),
@@ -84,21 +83,53 @@ impl HeadlessServer {
                             })
                     })
                 });
-                if let (Some(key), Some((image_id, path, expected_len, transfer_id))) =
+                if let (Some(key), Some((path, expected_len, transfer_id))) =
                     (direct_key.clone(), direct_frame)
                 {
-                    let command = self.clients.get(&client_id).and_then(|client| {
-                        crate::kitty_graphics::prepare_direct_file(
-                            &self.app.state,
-                            &self.app.pane_graphics,
-                            self.app.state.view.tab_surface(),
-                            client.cell_size,
-                            !internal_changed,
-                            &client.graphics_cache,
-                            &key,
-                        )
+                    let prepared = self.clients.get(&client_id).and_then(|client| {
+                        if matches!(client.mode, ClientConnectionMode::ClientShell) {
+                            let layer = self
+                                .app
+                                .pane_graphics
+                                .slots
+                                .get(&key)
+                                .and_then(|slot| slot.layer.as_ref())?;
+                            let asset = crate::kitty_graphics::surface::pane_layer_asset_key(
+                                &self.app, &key, layer,
+                            )?;
+                            let (image_id, control) =
+                                crate::kitty_graphics::surface::direct_upload_control(
+                                    &self.client_shell_boot_id,
+                                    &asset,
+                                );
+                            Some((
+                                crate::kitty_graphics::DirectFileCommand {
+                                    leading: Vec::new(),
+                                    control,
+                                },
+                                Some(asset),
+                                image_id,
+                            ))
+                        } else {
+                            let image_id = self
+                                .app
+                                .pane_graphics
+                                .slots
+                                .get(&key)
+                                .map(|slot| slot.host_image_id)?;
+                            crate::kitty_graphics::prepare_direct_file(
+                                &self.app.state,
+                                &self.app.pane_graphics,
+                                self.app.state.view.tab_surface(),
+                                client.cell_size,
+                                !internal_changed,
+                                &client.graphics_cache,
+                                &key,
+                            )
+                            .map(|command| (command, None, image_id))
+                        }
                     });
-                    let Some(command) = command else {
+                    let Some((command, surface_asset, image_id)) = prepared else {
                         if self.install_inline_fallback(&key) {
                             if msg.respond_to.send(response).is_err() {
                                 self.retire_direct_gate(&key);
@@ -123,6 +154,7 @@ impl HeadlessServer {
                         transfer_id,
                         leading: command.leading,
                         control: command.control,
+                        surface_asset,
                     };
                     let send =
                         Self::frame_server_message_with_max(&message, MAX_GRAPHICS_FRAME_SIZE)
@@ -144,6 +176,7 @@ impl HeadlessServer {
                             if let Some(slot) = self.app.pane_graphics.slots.get_mut(&key) {
                                 slot.direct_gate = Some(crate::app::pane_graphics::DirectGate {
                                     transfer_id,
+                                    image_id,
                                     client_id,
                                     deadline: std::time::Instant::now()
                                         + crate::app::pane_graphics::DIRECT_DELIVERY_TIMEOUT,
@@ -267,10 +300,14 @@ impl HeadlessServer {
         image_id: u32,
     ) -> bool {
         if let Some(gate) = self.app.pane_graphics.slots.values_mut().find_map(|slot| {
-            (slot.host_image_id == image_id && slot.stream_is_active())
+            slot.stream_is_active()
                 .then_some(slot.direct_gate.as_mut())
                 .flatten()
-                .filter(|gate| gate.client_id == client_id && gate.transfer_id == transfer_id)
+                .filter(|gate| {
+                    gate.client_id == client_id
+                        && gate.transfer_id == transfer_id
+                        && gate.image_id == image_id
+                })
         }) {
             gate.written = true;
             gate.deadline =
@@ -297,7 +334,7 @@ impl HeadlessServer {
                     slot.stream_is_active()
                         && gate.client_id == client_id
                         && gate.transfer_id == transfer_id
-                        && slot.host_image_id == image_id
+                        && gate.image_id == image_id
                         && (!success || gate.written)
                 })
                 .then(|| key.clone())
@@ -335,7 +372,9 @@ impl HeadlessServer {
                 )
             };
             if let (Some(client), Some(layer)) = (
-                self.clients.get_mut(&client_id),
+                self.clients
+                    .get_mut(&client_id)
+                    .filter(|client| matches!(client.mode, ClientConnectionMode::App)),
                 self.app
                     .pane_graphics
                     .slots
@@ -362,8 +401,19 @@ impl HeadlessServer {
             self.retire_all_direct_graphics();
             return true;
         }
-        if let Some(client) = self.clients.get_mut(&client_id) {
-            client.graphics_cache.forget_pane_layer(&key, image_id);
+        if let Some(client) = self
+            .clients
+            .get_mut(&client_id)
+            .filter(|client| matches!(client.mode, ClientConnectionMode::App))
+        {
+            let host_image_id = self
+                .app
+                .pane_graphics
+                .slots
+                .get(&key)
+                .map(|slot| slot.host_image_id)
+                .unwrap_or(image_id);
+            client.graphics_cache.forget_pane_layer(&key, host_image_id);
         }
         let gate = self
             .app
@@ -404,7 +454,7 @@ impl HeadlessServer {
                         *client_id,
                         ServerMessage::GraphicsTransmissionRetired {
                             transfer_id: gate.transfer_id,
-                            image_id: slot.host_image_id,
+                            image_id: gate.image_id,
                         },
                     );
                 }

@@ -560,6 +560,7 @@ pub enum ClientMessage {
         requested_encoding: RenderEncoding,
         surface_size: ClientSurfaceSize,
         pixel_mouse: bool,
+        direct_graphics: bool,
     },
 
     /// Resize the outer terminal and pane viewport of a client-owned shell.
@@ -996,6 +997,78 @@ impl From<ratatui::layout::Rect> for SurfaceRect {
     }
 }
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SurfaceGraphicsTarget {
+    Pane { pane_id: String },
+    Popup { terminal_id: String },
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SurfaceGraphicsSource {
+    Terminal {
+        target: SurfaceGraphicsTarget,
+        image_id: u32,
+    },
+    PaneLayer {
+        pane_id: String,
+        layer_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SurfaceGraphicsFormat {
+    Rgb,
+    Rgba,
+    Png,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceGraphicsAssetKey {
+    pub source: SurfaceGraphicsSource,
+    pub image_width: u32,
+    pub image_height: u32,
+    pub format: SurfaceGraphicsFormat,
+    pub data_len: u64,
+    pub data_fingerprint: u64,
+}
+
+/// Image bytes newly needed by this connection's complete desired scene.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceGraphicsAsset {
+    pub key: SurfaceGraphicsAssetKey,
+    pub data: Vec<u8>,
+}
+
+/// One already-clipped desired placement relative to its target surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceGraphicsPlacement {
+    pub asset: SurfaceGraphicsAssetKey,
+    pub logical_placement_id: u32,
+    pub x: u16,
+    pub y: u16,
+    pub cols: u32,
+    pub rows: u32,
+    pub source_x: u32,
+    pub source_y: u32,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub x_offset: u32,
+    pub y_offset: u32,
+    pub z: i32,
+    pub scrollback_offset: u32,
+}
+
+/// Complete desired placements plus only the image bytes not already sent for
+/// the current live scene on this connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceGraphicsScene {
+    pub assets: Vec<SurfaceGraphicsAsset>,
+    pub placements: Vec<SurfaceGraphicsPlacement>,
+    /// Direct-uploaded assets that remain live for this client even while their
+    /// pane is outside the selected scene.
+    pub retained_assets: Vec<SurfaceGraphicsAssetKey>,
+}
+
 /// One server-rendered active-tab surface without sidebar, tab bar, or overlays.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSurfaceFrame {
@@ -1005,6 +1078,7 @@ pub struct PaneSurfaceFrame {
     pub panes: Vec<PaneSurfacePane>,
     pub splits: Vec<PaneSurfaceSplit>,
     pub popup: Option<Box<ClientShellPopupSurface>>,
+    pub graphics: SurfaceGraphicsScene,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1174,6 +1248,8 @@ pub enum ServerMessage {
         transfer_id: u64,
         leading: Vec<u8>,
         control: String,
+        /// ClientShell upload identity. `None` retains the released App path.
+        surface_asset: Option<SurfaceGraphicsAssetKey>,
     },
 
     /// Suppress a direct command that expired before terminal delivery.
@@ -2168,6 +2244,7 @@ mod tests {
             transfer_id: 7,
             leading: b"\x1b[2;3H".to_vec(),
             control: "a=T,f=32,i=42,q=0".into(),
+            surface_asset: None,
         };
         let encoded = bincode::serde::encode_to_vec(&server, bincode::config::standard()).unwrap();
         let (decoded, _): (ServerMessage, _) =

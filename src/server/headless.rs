@@ -1563,7 +1563,9 @@ impl HeadlessServer {
         self.app_client_count() == 1
             && self.foreground_client_id.is_some_and(|id| {
                 self.clients.get(&id).is_some_and(|client| {
-                    client.is_full_app_client() && client.writer.is_some() && client.direct_graphics
+                    client.is_app_surface_client()
+                        && client.writer.is_some()
+                        && client.direct_graphics
                 })
             })
     }
@@ -3256,6 +3258,7 @@ impl HeadlessServer {
                 cell_width_px,
                 cell_height_px,
                 pixel_mouse,
+                direct_graphics,
                 writer,
             } => {
                 if self.handoff_in_progress {
@@ -3296,6 +3299,7 @@ impl HeadlessServer {
                     Some(writer),
                 );
                 connection.pixel_mouse = pixel_mouse;
+                connection.direct_graphics = direct_graphics;
                 connection.shell_projection_revision = 1;
                 let snapshot = client_shell_snapshot(
                     &self.app,
@@ -4918,6 +4922,11 @@ impl HeadlessServer {
                 }
                 shell_projection_revision = client.shell_projection_revision;
             }
+            let shell_graphics_delivery = self
+                .clients
+                .get(&client_id)
+                .map(|client| client.shell_graphics_delivery.clone())
+                .unwrap_or_default();
             let mut surface_parts = None;
             let mut frame = match mode {
                 ClientConnectionMode::App => {
@@ -4977,17 +4986,26 @@ impl HeadlessServer {
                     } else {
                         crate::kitty_graphics::HostCellSize::default()
                     };
-                    let (frame, panes, splits, popup) = render_client_shell_pane_surface(
+                    let crate::server::client_shell::RenderedPaneSurface {
+                        frame,
+                        panes,
+                        splits,
+                        popup,
+                        graphics,
+                        graphics_delivery: next_graphics_delivery,
+                    } = render_client_shell_pane_surface(
                         &mut self.app,
                         area,
                         is_foreground,
                         render_cell_size,
+                        &shell_graphics_delivery,
+                        client_id,
                     );
                     crate::render_prof::duration_since(
                         "full_render.render_tab_surface_virtual",
                         render_started,
                     );
-                    surface_parts = Some((panes, splits, popup));
+                    surface_parts = Some((panes, splits, popup, graphics, next_graphics_delivery));
                     frame
                 }
                 ClientConnectionMode::TerminalAttach { terminal_id }
@@ -5086,8 +5104,17 @@ impl HeadlessServer {
                 commit_graphics_cache = false;
                 encoded.incomplete = false;
             }
-            let has_graphics = !frame.graphics.is_empty();
-            let prepared = if let Some((panes, splits, popup)) = surface_parts {
+            let has_graphics = !frame.graphics.is_empty()
+                || surface_parts
+                    .as_ref()
+                    .is_some_and(|(_, _, _, graphics, _)| {
+                        !graphics.assets.is_empty()
+                            || !graphics.placements.is_empty()
+                            || !graphics.retained_assets.is_empty()
+                    });
+            let mut next_shell_graphics_delivery = None;
+            let prepared = if let Some((panes, splits, popup, graphics, delivery)) = surface_parts {
+                next_shell_graphics_delivery = Some(delivery);
                 client
                     .render_state
                     .prepare_pane_surface(protocol::PaneSurfaceFrame {
@@ -5096,6 +5123,7 @@ impl HeadlessServer {
                         panes,
                         splits,
                         popup,
+                        graphics,
                     })
             } else {
                 client.render_state.prepare_frame(frame)
@@ -5119,6 +5147,7 @@ impl HeadlessServer {
             } else {
                 crate::protocol::MAX_FRAME_SIZE
             };
+            let mut shell_assets_deferred = false;
             let serialized = match Self::frame_server_message_with_max(prepared.message(), max) {
                 Ok(frame) => frame,
                 Err(protocol::FramingError::Oversized { claimed, max }) if has_graphics => {
@@ -5126,19 +5155,28 @@ impl HeadlessServer {
                         client_id,
                         claimed, max, "dropping graphics from oversized frame for client"
                     );
-                    let Some(mut text_only_frame) = prepared.into_frame() else {
-                        crate::render_prof::event("full_render.serialize_error");
-                        continue;
+                    let framed = if prepared.strip_pane_surface_assets() {
+                        next_shell_graphics_delivery = None;
+                        shell_assets_deferred = true;
+                        Self::frame_server_message(prepared.message())
+                    } else {
+                        let Some(mut text_only_frame) = prepared.into_frame() else {
+                            crate::render_prof::event("full_render.serialize_error");
+                            continue;
+                        };
+                        text_only_frame.graphics.clear();
+                        let Some(text_only_prepared) =
+                            client.render_state.prepare_frame(text_only_frame)
+                        else {
+                            client.clear_deferred_render();
+                            crate::render_prof::event("full_render.skip_identical_text_only");
+                            continue;
+                        };
+                        let result = Self::frame_server_message(text_only_prepared.message());
+                        prepared = text_only_prepared;
+                        result
                     };
-                    text_only_frame.graphics.clear();
-                    let Some(text_only_prepared) =
-                        client.render_state.prepare_frame(text_only_frame)
-                    else {
-                        client.clear_deferred_render();
-                        crate::render_prof::event("full_render.skip_identical_text_only");
-                        continue;
-                    };
-                    let framed = match Self::frame_server_message(text_only_prepared.message()) {
+                    let framed = match framed {
                         Ok(framed) => framed,
                         Err(err) => {
                             warn!(client_id, err = %err, "failed to serialize text-only frame for client");
@@ -5147,7 +5185,6 @@ impl HeadlessServer {
                             continue;
                         }
                     };
-                    prepared = text_only_prepared;
                     commit_graphics_cache = false;
                     encoded.incomplete = false;
                     framed
@@ -5167,14 +5204,20 @@ impl HeadlessServer {
                     continue;
                 }
             };
+            let shell_graphics_pending = next_shell_graphics_delivery
+                .as_ref()
+                .is_some_and(crate::kitty_graphics::surface::DeliveryCache::has_pending);
             match writer.render.try_send(serialized) {
                 Ok(()) => {
                     if commit_graphics_cache {
                         client.graphics_cache = next_graphics_cache;
                         client.graphics_surface_reset_pending = false;
                     }
+                    if let Some(delivery) = next_shell_graphics_delivery {
+                        client.shell_graphics_delivery = delivery;
+                    }
                     client.render_state.commit_sent_frame(prepared);
-                    if encoded.incomplete {
+                    if encoded.incomplete || shell_graphics_pending || shell_assets_deferred {
                         client.defer_full_render();
                         deferred_frame = true;
                     } else {
@@ -6529,6 +6572,7 @@ mod tests {
                 cell_width_px: 0,
                 cell_height_px: 0,
                 pixel_mouse: false,
+                direct_graphics: false,
                 writer,
             })
         );
@@ -6576,6 +6620,7 @@ mod tests {
                 cell_width_px: 10,
                 cell_height_px: 20,
                 pixel_mouse: true,
+                direct_graphics: false,
                 writer,
             })
         );
@@ -6647,6 +6692,7 @@ mod tests {
                 cell_width_px: 0,
                 cell_height_px: 0,
                 pixel_mouse: false,
+                direct_graphics: false,
                 writer,
             })
         );
@@ -6789,7 +6835,7 @@ mod tests {
                 40,
                 12,
                 0,
-                b"POPUP_SHELL_LIVE",
+                b"POPUP_SHELL_LIVE\x1b_Ga=T,f=32,t=d,i=9,p=4,s=1,v=1,c=1,r=1,q=2;/wAA/w==\x1b\\",
                 4,
             );
         let (_, popup_terminal_id) = server.app.install_test_popup_runtime(popup_runtime);
@@ -6800,9 +6846,10 @@ mod tests {
                 client_id: 12,
                 surface_cols: 80,
                 surface_rows: 23,
-                cell_width_px: 0,
-                cell_height_px: 0,
+                cell_width_px: 10,
+                cell_height_px: 20,
                 pixel_mouse: false,
+                direct_graphics: false,
                 writer,
             })
         );
@@ -6821,6 +6868,15 @@ mod tests {
         assert_eq!(popup.terminal_id, popup_terminal_id.as_str());
         assert!(frame_text(&popup.frame).contains("POPUP_SHELL_LIVE"));
         assert_eq!((popup.frame.width, popup.frame.height), (37, 9));
+        assert_eq!(surface.graphics.assets.len(), 1);
+        assert_eq!(surface.graphics.placements.len(), 1);
+        assert!(matches!(
+            surface.graphics.placements[0].asset.source,
+            crate::protocol::SurfaceGraphicsSource::Terminal {
+                target: crate::protocol::SurfaceGraphicsTarget::Popup { .. },
+                image_id: 9,
+            }
+        ));
 
         assert!(
             !server.handle_server_event(ServerEvent::ClientShellPaneInput {

@@ -54,8 +54,10 @@ pub(crate) struct ClientConnection {
     pub(crate) last_activity: u64,
     /// Render baseline for the negotiated client encoding.
     pub(crate) render_state: ClientRenderState,
-    /// Client-local host Kitty graphics cache.
+    /// Client-local host Kitty graphics cache for the legacy server-rendered app path.
     pub(crate) graphics_cache: crate::kitty_graphics::HostGraphicsCache,
+    /// Image assets already included in the selected ClientShell scene.
+    pub(crate) shell_graphics_delivery: crate::kitty_graphics::surface::DeliveryCache,
     /// Passive eligibility for audited local Kitty regular-file graphics.
     pub(crate) direct_graphics: bool,
     /// Whether this frontend preserves exact SGR pixel reports.
@@ -133,6 +135,7 @@ impl ClientConnection {
             last_activity,
             render_state: ClientRenderState::new(render_encoding),
             graphics_cache: crate::kitty_graphics::HostGraphicsCache::default(),
+            shell_graphics_delivery: crate::kitty_graphics::surface::DeliveryCache::default(),
             direct_graphics: false,
             pixel_mouse: false,
             graphics_surface_reset_pending: false,

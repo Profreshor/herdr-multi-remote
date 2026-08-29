@@ -757,6 +757,8 @@ pub(crate) struct ClientShellState {
     pub(super) config: ClientShellConfig,
     pub(super) snapshot: Option<Box<ClientShellSnapshot>>,
     pub(super) pane_surface: Option<PaneSurfaceFrame>,
+    pub(super) graphics: crate::kitty_graphics::surface::ClientState,
+    pub(super) graphics_cell_size: crate::kitty_graphics::HostCellSize,
     pub(super) popup_terminal_id: Option<String>,
     pub(super) sidebar_collapsed: bool,
     pub(super) sidebar_collapsed_manual: bool,
@@ -881,6 +883,11 @@ impl ClientShellState {
             config,
             snapshot: None,
             pane_surface: None,
+            graphics: crate::kitty_graphics::surface::ClientState::default(),
+            graphics_cell_size: crate::kitty_graphics::HostCellSize {
+                width_px: 1,
+                height_px: 1,
+            },
             popup_terminal_id: None,
             sidebar_collapsed,
             sidebar_collapsed_manual: preferences.sidebar_collapsed.is_some(),
@@ -1011,6 +1018,7 @@ impl ClientShellState {
     }
 
     pub(crate) fn set_snapshot(&mut self, snapshot: Box<ClientShellSnapshot>) {
+        self.graphics.set_scope(&snapshot.boot_id);
         self.config_diagnostic = super::config::merged_config_diagnostic(
             self.local_config_diagnostic.as_deref(),
             snapshot.config_diagnostic.as_deref(),
@@ -1242,7 +1250,7 @@ impl ClientShellState {
         self.resume_mobile_switcher_if_ready();
     }
 
-    pub(crate) fn set_pane_surface(&mut self, surface: PaneSurfaceFrame) {
+    pub(crate) fn set_pane_surface(&mut self, mut surface: PaneSurfaceFrame) {
         if self
             .snapshot
             .as_ref()
@@ -1372,6 +1380,8 @@ impl ClientShellState {
             self.selection_highlight_clear_deadline = None;
         }
         self.popup_terminal_id = next_popup;
+        self.graphics
+            .set_scene(std::mem::take(&mut surface.graphics));
         self.pane_surface = Some(surface);
         self.resume_mobile_switcher_if_ready();
     }

@@ -49,6 +49,173 @@ async fn cold_redraw_advances_one_bounded_layer_after_each_send() {
     assert_eq!(server.clients[&1].deferred_render(), DeferredRender::None);
 }
 
+#[tokio::test]
+async fn client_shell_surface_sends_complete_placements_and_each_live_asset_once() {
+    let (mut server, client_rx, pane_id) = retained_test_server(b"client shell graphics");
+    let client = server.clients.get_mut(&1).unwrap();
+    client.mode = ClientConnectionMode::ClientShell;
+    client.render_state =
+        crate::server::render_stream::ClientRenderState::new(RenderEncoding::SemanticFrame);
+    client.cell_size = crate::kitty_graphics::HostCellSize {
+        width_px: 10,
+        height_px: 20,
+    };
+    set_graphics_layer(&mut server, pane_id, vec![1, 2, 3, 4]);
+
+    server.render_and_stream();
+    let first = read_server_message(receive_render(&client_rx, Duration::from_millis(100)));
+    let ServerMessage::PaneSurface(first) = first else {
+        panic!("expected client shell pane surface");
+    };
+    assert_eq!(first.graphics.placements.len(), 1);
+    assert_eq!(first.graphics.assets.len(), 1);
+    assert_eq!(first.graphics.assets[0].data, vec![1, 2, 3, 4]);
+    assert!(matches!(
+        first.graphics.placements[0].asset.source,
+        crate::protocol::SurfaceGraphicsSource::PaneLayer { .. }
+    ));
+
+    server.clients.get_mut(&1).unwrap().request_repaint();
+    server.render_and_stream();
+    let second = read_server_message(receive_render(&client_rx, Duration::from_millis(100)));
+    let ServerMessage::PaneSurface(second) = second else {
+        panic!("expected replacement client shell pane surface");
+    };
+    assert_eq!(second.graphics.placements, first.graphics.placements);
+    assert!(second.graphics.assets.is_empty());
+}
+
+#[tokio::test]
+async fn client_shell_asset_delivery_is_bounded_to_the_current_live_scene() {
+    let (mut server, client_rx, pane_id) = retained_test_server(b"client shell graphics");
+    let client = server.clients.get_mut(&1).unwrap();
+    client.mode = ClientConnectionMode::ClientShell;
+    client.render_state =
+        crate::server::render_stream::ClientRenderState::new(RenderEncoding::SemanticFrame);
+    client.cell_size = crate::kitty_graphics::HostCellSize {
+        width_px: 10,
+        height_px: 20,
+    };
+    set_graphics_layer(&mut server, pane_id, vec![1, 2, 3, 4]);
+
+    server.render_and_stream();
+    let _first = receive_render(&client_rx, Duration::from_millis(100));
+    server.app.pane_graphics.slots.clear();
+    server.app.pane_graphics.mark_changed();
+    server.clients.get_mut(&1).unwrap().request_repaint();
+    server.render_and_stream();
+    let removed = read_server_message(receive_render(&client_rx, Duration::from_millis(100)));
+    let ServerMessage::PaneSurface(removed) = removed else {
+        panic!("expected removed client shell scene");
+    };
+    assert!(removed.graphics.placements.is_empty());
+
+    set_graphics_layer(&mut server, pane_id, vec![1, 2, 3, 4]);
+    server.clients.get_mut(&1).unwrap().request_repaint();
+    server.render_and_stream();
+    let restored = read_server_message(receive_render(&client_rx, Duration::from_millis(100)));
+    let ServerMessage::PaneSurface(restored) = restored else {
+        panic!("expected restored client shell scene");
+    };
+    assert_eq!(restored.graphics.assets.len(), 1);
+    assert_eq!(restored.graphics.assets[0].data, vec![1, 2, 3, 4]);
+}
+
+#[tokio::test]
+async fn client_shell_surface_projects_terminal_kitty_images_from_authoritative_runtime() {
+    let (mut server, client_rx, _pane_id) =
+        retained_test_server(b"\x1b_Ga=T,f=32,t=d,i=7,p=3,s=1,v=1,c=1,r=1,q=2;/wAA/w==\x1b\\");
+    let client = server.clients.get_mut(&1).unwrap();
+    client.mode = ClientConnectionMode::ClientShell;
+    client.render_state =
+        crate::server::render_stream::ClientRenderState::new(RenderEncoding::SemanticFrame);
+    client.cell_size = crate::kitty_graphics::HostCellSize {
+        width_px: 10,
+        height_px: 20,
+    };
+
+    server.render_and_stream();
+    let message = read_server_message(receive_render(&client_rx, Duration::from_millis(100)));
+    let ServerMessage::PaneSurface(surface) = message else {
+        panic!("expected client shell pane surface");
+    };
+    assert_eq!(surface.graphics.placements.len(), 1);
+    assert_eq!(surface.graphics.assets.len(), 1);
+    assert!(matches!(
+        surface.graphics.placements[0].asset.source,
+        crate::protocol::SurfaceGraphicsSource::Terminal {
+            target: crate::protocol::SurfaceGraphicsTarget::Pane { .. },
+            image_id: 7,
+        }
+    ));
+    assert_eq!(surface.graphics.assets[0].data, vec![255, 0, 0, 255]);
+}
+
+#[tokio::test]
+async fn client_shell_delivers_equal_pixels_for_distinct_terminal_image_ids() {
+    let (mut server, client_rx, _pane_id) = retained_test_server(
+        b"\x1b_Ga=T,f=32,t=d,i=7,p=3,s=1,v=1,c=1,r=1,q=2;/wAA/w==\x1b\\\x1b_Ga=T,f=32,t=d,i=8,p=4,s=1,v=1,c=1,r=1,q=2;/wAA/w==\x1b\\",
+    );
+    let client = server.clients.get_mut(&1).unwrap();
+    client.mode = ClientConnectionMode::ClientShell;
+    client.render_state =
+        crate::server::render_stream::ClientRenderState::new(RenderEncoding::SemanticFrame);
+    client.cell_size = crate::kitty_graphics::HostCellSize {
+        width_px: 10,
+        height_px: 20,
+    };
+
+    server.render_and_stream();
+    let message = read_server_message(receive_render(&client_rx, Duration::from_millis(100)));
+    let ServerMessage::PaneSurface(surface) = message else {
+        panic!("expected client shell pane surface");
+    };
+    assert_eq!(surface.graphics.placements.len(), 2);
+    assert_eq!(surface.graphics.assets.len(), 2);
+    assert_ne!(
+        surface.graphics.assets[0].key,
+        surface.graphics.assets[1].key
+    );
+    assert_eq!(
+        surface.graphics.assets[0].data,
+        surface.graphics.assets[1].data
+    );
+
+    server.clients.get_mut(&1).unwrap().request_repaint();
+    server.render_and_stream();
+    let message = read_server_message(receive_render(&client_rx, Duration::from_millis(100)));
+    let ServerMessage::PaneSurface(surface) = message else {
+        panic!("expected replacement client shell pane surface");
+    };
+    assert_eq!(surface.graphics.placements.len(), 2);
+    assert!(surface.graphics.assets.is_empty());
+}
+
+#[tokio::test]
+async fn full_client_shell_render_lane_does_not_commit_graphics_delivery() {
+    let (mut server, client_rx, pane_id) = retained_test_server(b"client shell graphics");
+    let client = server.clients.get_mut(&1).unwrap();
+    client.mode = ClientConnectionMode::ClientShell;
+    client.render_state =
+        crate::server::render_stream::ClientRenderState::new(RenderEncoding::SemanticFrame);
+    client.cell_size = crate::kitty_graphics::HostCellSize {
+        width_px: 10,
+        height_px: 20,
+    };
+    set_graphics_layer(&mut server, pane_id, vec![5, 6, 7, 8]);
+
+    fill_render_lane(&server);
+    server.render_and_stream();
+    let _older = receive_render(&client_rx, Duration::from_millis(100));
+    server.render_and_stream();
+    let message = read_server_message(receive_render(&client_rx, Duration::from_millis(100)));
+    let ServerMessage::PaneSurface(surface) = message else {
+        panic!("expected client shell pane surface");
+    };
+    assert_eq!(surface.graphics.assets.len(), 1);
+    assert_eq!(surface.graphics.assets[0].data, vec![5, 6, 7, 8]);
+}
+
 fn enable_graphics_and_render(
     server: &mut HeadlessServer,
     client_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
@@ -730,6 +897,106 @@ fn rejected_or_stale_requests_do_not_schedule_rendering() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn client_shell_direct_graphics_uploads_without_server_authored_coordinates() {
+    let (mut server, client_rx, pane_id) = retained_test_server(b"client shell direct");
+    server.app.state.kitty_graphics_enabled = true;
+    let client = server.clients.get_mut(&1).unwrap();
+    client.mode = ClientConnectionMode::ClientShell;
+    client.render_state =
+        crate::server::render_stream::ClientRenderState::new(RenderEncoding::SemanticFrame);
+    client.cell_size = crate::kitty_graphics::HostCellSize {
+        width_px: 10,
+        height_px: 20,
+    };
+    client.direct_graphics = true;
+    server.app.direct_graphics_available = true;
+    set_stream_owner(&mut server, pane_id, "browser");
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    let path = sparse_direct_frame(&server, "client-shell-direct.rgba", 1, 1);
+    let (message, response_rx) =
+        direct_stream_message("shell-direct", &public_pane_id, "browser", path, 1, 1);
+
+    assert_eq!(
+        server.handle_pane_graphics_stream_frame(message),
+        RenderImpact::None
+    );
+    let (transfer_id, image_id, asset) = match read_server_message(
+        client_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("client shell direct upload"),
+    ) {
+        ServerMessage::GraphicsFile {
+            transfer_id,
+            image_id,
+            leading,
+            control,
+            surface_asset: Some(asset),
+            ..
+        } => {
+            assert!(leading.is_empty());
+            assert!(control.starts_with("a=t,"), "{control}");
+            assert!(!control.contains("\u{1b}["), "{control}");
+            (transfer_id, image_id, asset)
+        }
+        other => panic!("expected client shell graphics file, got {other:?}"),
+    };
+    assert_eq!(
+        image_id,
+        crate::kitty_graphics::surface::host_image_id(&server.client_shell_boot_id, &asset)
+    );
+    let (pending, _) = crate::server::client_shell_graphics::collect(
+        &server.app,
+        &[],
+        &[],
+        None,
+        crate::kitty_graphics::HostCellSize {
+            width_px: 10,
+            height_px: 20,
+        },
+        &crate::kitty_graphics::surface::DeliveryCache::default(),
+        1,
+    );
+    assert_eq!(pending.retained_assets, vec![asset.clone()]);
+
+    server.start_direct_graphics_response(1, transfer_id, image_id);
+    assert!(server.complete_direct_graphics(1, transfer_id, image_id, true));
+    assert!(serde_json::from_str::<api::schema::SuccessResponse>(
+        &response_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+    )
+    .is_ok());
+    server.clients.get_mut(&1).unwrap().request_repaint();
+    server.render_and_stream();
+    let surface = read_server_message(
+        client_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("resident client shell scene"),
+    );
+    let ServerMessage::PaneSurface(surface) = surface else {
+        panic!("expected client shell pane surface");
+    };
+    assert_eq!(surface.graphics.placements.len(), 1);
+    assert!(surface.graphics.assets.is_empty());
+    assert_eq!(surface.graphics.placements[0].asset, asset);
+    assert_eq!(surface.graphics.retained_assets, vec![asset.clone()]);
+
+    let (hidden, _) = crate::server::client_shell_graphics::collect(
+        &server.app,
+        &[],
+        &[],
+        None,
+        crate::kitty_graphics::HostCellSize {
+            width_px: 10,
+            height_px: 20,
+        },
+        &crate::kitty_graphics::surface::DeliveryCache::default(),
+        1,
+    );
+    assert!(hidden.placements.is_empty());
+    assert_eq!(hidden.retained_assets, vec![asset]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn hidden_large_direct_frame_uploads_then_replays_placement_without_closing_stream() {
     let (mut server, client_rx, _) = retained_test_server(b"active");
     enable_graphics_and_render(&mut server, &client_rx);
@@ -1029,6 +1296,7 @@ fn direct_gate_server_with_file(
     slot.stream_active = Some(active_gate());
     slot.direct_gate = Some(crate::app::pane_graphics::DirectGate {
         transfer_id: lease.fingerprint(),
+        image_id: (1 << 31) | 900,
         client_id: 7,
         deadline: std::time::Instant::now() + Duration::from_secs(1),
         written: true,
@@ -1042,10 +1310,8 @@ fn direct_gate_server_with_file(
 #[cfg(unix)]
 fn direct_ids(server: &HeadlessServer, key: &crate::app::pane_graphics::Key) -> (u64, u32) {
     let slot = &server.app.pane_graphics.slots[key];
-    (
-        slot.direct_gate.as_ref().unwrap().transfer_id,
-        slot.host_image_id,
-    )
+    let gate = slot.direct_gate.as_ref().unwrap();
+    (gate.transfer_id, gate.image_id)
 }
 
 #[cfg(unix)]

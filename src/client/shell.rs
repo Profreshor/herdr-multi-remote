@@ -7,6 +7,7 @@ mod config;
 mod context_menu;
 mod copy_mode;
 mod global_menu;
+mod graphics;
 mod input;
 mod mobile;
 mod mouse;
@@ -392,6 +393,7 @@ mod tests {
             }],
             splits: Vec::new(),
             popup: None,
+            graphics: crate::protocol::SurfaceGraphicsScene::default(),
         }
     }
 
@@ -497,6 +499,65 @@ mod tests {
             frame.cursor.as_ref().map(|cursor| (cursor.x, cursor.y)),
             Some((27, 2))
         );
+    }
+
+    #[test]
+    fn client_shell_graphics_follow_final_shell_origin_and_local_overlay_visibility() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        let mut pane_surface = surface();
+        let key = crate::protocol::SurfaceGraphicsAssetKey {
+            source: crate::protocol::SurfaceGraphicsSource::Terminal {
+                target: crate::protocol::SurfaceGraphicsTarget::Pane {
+                    pane_id: "pane_1".into(),
+                },
+                image_id: 1,
+            },
+            image_width: 1,
+            image_height: 1,
+            format: crate::protocol::SurfaceGraphicsFormat::Rgba,
+            data_len: 4,
+            data_fingerprint: 17,
+        };
+        pane_surface.graphics = crate::protocol::SurfaceGraphicsScene {
+            assets: vec![crate::protocol::SurfaceGraphicsAsset {
+                key: key.clone(),
+                data: vec![1, 2, 3, 4],
+            }],
+            placements: vec![crate::protocol::SurfaceGraphicsPlacement {
+                asset: key,
+                logical_placement_id: 1,
+                x: 0,
+                y: 0,
+                cols: 1,
+                rows: 1,
+                source_x: 0,
+                source_y: 0,
+                source_width: 1,
+                source_height: 1,
+                x_offset: 0,
+                y_offset: 0,
+                z: 0,
+                scrollback_offset: 0,
+            }],
+            retained_assets: Vec::new(),
+        };
+        state.set_pane_surface(pane_surface);
+
+        let visible = state.compose(106, 20).expect("visible graphics frame");
+        let visible = String::from_utf8_lossy(&visible.graphics);
+        assert!(visible.contains("a=t,t=d"));
+        assert!(visible.contains("\u{1b}[2;27H"));
+
+        state.overlay = Some(ClientShellOverlay::Onboarding);
+        let hidden = state.compose(106, 20).expect("overlay frame");
+        assert!(String::from_utf8_lossy(&hidden.graphics).contains("a=d,d=i"));
+
+        state.overlay = None;
+        let restored = state.compose(106, 20).expect("restored graphics frame");
+        let restored = String::from_utf8_lossy(&restored.graphics);
+        assert!(restored.contains("a=p"));
+        assert!(!restored.contains("a=t,t=d"));
     }
 
     #[test]

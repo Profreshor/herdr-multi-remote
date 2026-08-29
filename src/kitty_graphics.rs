@@ -17,6 +17,8 @@ use crate::ghostty::{
 use crate::layout::{PaneId, PaneInfo};
 use crate::terminal::TerminalRuntimeRegistry;
 
+pub(crate) mod surface;
+
 const KITTY_CHUNK_BYTES: usize = 3072;
 const MAX_OVERSIZED_SOURCES: usize = 256;
 pub(crate) const HEADLESS_GRAPHICS_TRANSACTION_BUDGET: usize =
@@ -87,8 +89,18 @@ struct HostPlacement {
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 enum HostSourceKey {
-    Terminal { pane_id: PaneId, image_id: u32 },
-    PaneLayer { pane_id: PaneId, layer_id: String },
+    Terminal {
+        pane_id: PaneId,
+        image_id: u32,
+    },
+    PaneLayer {
+        pane_id: PaneId,
+        layer_id: String,
+    },
+    ClientSurface {
+        scope: String,
+        source: crate::protocol::SurfaceGraphicsSource,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -703,10 +715,13 @@ fn image_transaction_fits(placement: &HostPlacement, budget: Option<usize>) -> b
     let Some(budget) = budget else {
         return true;
     };
-    let data = placement.placement.data_len;
-    let encoded = data.div_ceil(3).saturating_mul(4);
-    let command_overhead = data.div_ceil(KITTY_CHUNK_BYTES).saturating_mul(16) + 1024;
-    encoded.saturating_add(command_overhead) <= budget
+    image_transfer_estimated_size(placement.placement.data_len) <= budget
+}
+
+pub(crate) fn image_transfer_estimated_size(data_len: usize) -> usize {
+    let encoded = data_len.div_ceil(3).saturating_mul(4);
+    let command_overhead = data_len.div_ceil(KITTY_CHUNK_BYTES).saturating_mul(16) + 1024;
+    encoded.saturating_add(command_overhead)
 }
 
 fn placement_identity(placement: &HostPlacement) -> (HostSourceKey, u32) {
@@ -720,6 +735,12 @@ fn source_order(source: &HostSourceKey) -> (u32, String) {
     match source {
         HostSourceKey::Terminal { pane_id, .. } => (pane_id.raw(), String::new()),
         HostSourceKey::PaneLayer { pane_id, layer_id } => (pane_id.raw(), layer_id.clone()),
+        HostSourceKey::ClientSurface { scope, source } => {
+            let mut hasher = DefaultHasher::new();
+            scope.hash(&mut hasher);
+            source.hash(&mut hasher);
+            (hasher.finish() as u32, format!("{source:?}"))
+        }
     }
 }
 
@@ -1283,6 +1304,11 @@ fn host_placement_id(source_key: &HostSourceKey, placement: &KittyImagePlacement
             "pane.graphics".hash(&mut hasher);
             pane_id.raw().hash(&mut hasher);
             layer_id.hash(&mut hasher);
+        }
+        HostSourceKey::ClientSurface { scope, source } => {
+            "client.surface".hash(&mut hasher);
+            scope.hash(&mut hasher);
+            source.hash(&mut hasher);
         }
     }
     placement.image_id.hash(&mut hasher);

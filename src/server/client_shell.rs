@@ -196,17 +196,23 @@ pub(super) fn snapshot(
     }
 }
 
+pub(super) struct RenderedPaneSurface {
+    pub(super) frame: FrameData,
+    pub(super) panes: Vec<protocol::PaneSurfacePane>,
+    pub(super) splits: Vec<protocol::PaneSurfaceSplit>,
+    pub(super) popup: Option<Box<protocol::ClientShellPopupSurface>>,
+    pub(super) graphics: protocol::SurfaceGraphicsScene,
+    pub(super) graphics_delivery: crate::kitty_graphics::surface::DeliveryCache,
+}
+
 pub(super) fn render_pane_surface(
     app: &mut app::App,
     area: Rect,
     is_foreground: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
-) -> (
-    FrameData,
-    Vec<protocol::PaneSurfacePane>,
-    Vec<protocol::PaneSurfaceSplit>,
-    Option<Box<protocol::ClientShellPopupSurface>>,
-) {
+    graphics_delivery: &crate::kitty_graphics::surface::DeliveryCache,
+    client_id: u64,
+) -> RenderedPaneSurface {
     let content_revisions_before = app
         .state
         .active
@@ -331,12 +337,23 @@ pub(super) fn render_pane_surface(
         })
         .collect();
     let popup = render_popup_surface(app, area, is_foreground, cell_size);
-    (
-        FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, cursor, &hyperlinks),
+    let (graphics, next_graphics_delivery) = crate::server::client_shell_graphics::collect(
+        app,
+        &layout.pane_infos,
+        &layout.split_borders,
+        popup.as_deref(),
+        cell_size,
+        graphics_delivery,
+        client_id,
+    );
+    RenderedPaneSurface {
+        frame: FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, cursor, &hyperlinks),
         panes,
         splits,
         popup,
-    )
+        graphics,
+        graphics_delivery: next_graphics_delivery,
+    }
 }
 
 fn render_popup_surface(

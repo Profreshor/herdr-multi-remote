@@ -17,6 +17,8 @@ mod direct_graphics;
 mod input;
 mod shell;
 
+#[cfg(unix)]
+use std::collections::HashMap;
 use std::collections::HashSet;
 #[cfg(unix)]
 use std::io::IsTerminal as _;
@@ -77,6 +79,8 @@ struct ClientState {
     keyboard_report_all_active: bool,
     /// The terminal size we reported to the server in our last Hello/Resize.
     reported_size: (u16, u16),
+    /// Last exact host cell size used by client-rendered surfaces.
+    reported_cell_size: (u32, u32),
     /// Client-local sound playback config, refreshed on server request.
     sound_config: crate::config::SoundConfig,
     /// Whether this client may write Kitty graphics bytes to its host terminal.
@@ -87,6 +91,9 @@ struct ClientState {
     /// One server-retired direct transfer to suppress if it was still queued.
     #[cfg(unix)]
     retired_direct_graphics: Option<(u64, u32)>,
+    /// ClientShell assets waiting for the host terminal's direct-upload response.
+    #[cfg(unix)]
+    pending_surface_graphics: HashMap<u64, crate::protocol::SurfaceGraphicsAssetKey>,
     /// Direct attach prefix escape state. None for full-app clients.
     attach_escape: Option<AttachEscapeState>,
     /// Rows scrolled for one direct-attach wheel notch.
@@ -244,6 +251,15 @@ fn attach_scroll_action(
 impl ClientState {
     fn request_repaint(&mut self) {
         self.repaint_pending = true;
+    }
+
+    fn present_graphics(&mut self, graphics: &[u8]) {
+        if graphics.is_empty() || !self.kitty_graphics_enabled {
+            return;
+        }
+        let mut stdout = io::stdout();
+        let _ = write_encoded_frame_with_graphics(&mut stdout, &[], graphics);
+        let _ = stdout.flush();
     }
 
     fn present_frame(&mut self, frame_data: FrameData) {
@@ -894,6 +910,10 @@ fn do_handshake(
             requested_encoding,
             surface_size,
             pixel_mouse: exact_cell_size && cfg!(unix),
+            direct_graphics: exact_cell_size
+                && cell_width_px > 0
+                && cell_height_px > 0
+                && direct_graphics_profile_allowed(false),
         }
     } else {
         ClientMessage::Hello {
@@ -1299,9 +1319,8 @@ fn run_client_with_mode(
     let host_cursor = loaded_config.config.ui.host_cursor;
     let direct_attach_requested = attach_request.is_some();
     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
-    let kitty_graphics_enabled = loaded_config.config.experimental.kitty_graphics
-        && !direct_attach_requested
-        && !client_rendered_shell;
+    let kitty_graphics_enabled =
+        loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
     let loop_config = ClientLoopConfig {
         sound_config: loaded_config.config.ui.sound,
         mouse_scroll_lines,
@@ -1513,8 +1532,13 @@ fn finish_client_shell_input(
     }
     if outcome.resize {
         let shell = state.shell.as_ref().expect("shell mode remains active");
-        let resize =
-            client_shell_resize_message(shell, state.reported_size.0, state.reported_size.1, 0, 0);
+        let resize = client_shell_resize_message(
+            shell,
+            state.reported_size.0,
+            state.reported_size.1,
+            state.reported_cell_size.0,
+            state.reported_cell_size.1,
+        );
         write_to_server(write_stream, &resize).map_err(ClientError::ConnectionLost)?;
     }
     #[cfg(not(windows))]
@@ -1559,12 +1583,15 @@ async fn run_client_loop(
         mouse_capture_active: config.mouse_capture_active,
         keyboard_report_all_active: false,
         reported_size: (cols, rows),
+        reported_cell_size: (initial_cell_width_px, initial_cell_height_px),
         sound_config: config.sound_config,
         kitty_graphics_enabled: config.kitty_graphics_enabled,
         #[cfg(unix)]
         direct_graphics_response: Arc::new(Mutex::new(direct_graphics::ResponseMatcher::default())),
         #[cfg(unix)]
         retired_direct_graphics: None,
+        #[cfg(unix)]
+        pending_surface_graphics: HashMap::new(),
         attach_escape,
         #[cfg(unix)]
         mouse_scroll_lines: config.mouse_scroll_lines,
@@ -1574,6 +1601,9 @@ async fn run_client_loop(
         draw_host_cursor,
         shell: config.shell_config.map(shell::ClientShellState::new),
     };
+    if let Some(shell) = state.shell.as_mut() {
+        shell.set_graphics_cell_size(initial_cell_width_px, initial_cell_height_px);
+    }
     debug!(?negotiated_encoding, "client render encoding active");
     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
     // Cell size reported by the host terminal, packed as width<<32 | height.
@@ -1856,6 +1886,17 @@ async fn run_client_loop(
             }
             #[cfg(unix)]
             ClientLoopEvent::DirectGraphicsResponse(response) => {
+                let composed = state
+                    .pending_surface_graphics
+                    .remove(&response.transfer_id)
+                    .filter(|_| response.success)
+                    .and_then(|asset| {
+                        let shell = state.shell.as_mut()?;
+                        shell
+                            .trust_direct_graphics_asset(&asset, response.image_id)
+                            .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
+                            .flatten()
+                    });
                 let message = ClientMessage::GraphicsTransmissionResult {
                     transfer_id: response.transfer_id,
                     image_id: response.image_id,
@@ -1863,6 +1904,9 @@ async fn run_client_loop(
                 };
                 if let Err(err) = write_to_server(&mut write_stream, &message) {
                     return Err(ClientError::ConnectionLost(err));
+                }
+                if let Some(frame) = composed {
+                    state.present_frame(frame);
                 }
             }
             #[cfg(unix)]
@@ -1977,9 +2021,11 @@ async fn run_client_loop(
             }
             ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
                 state.reported_size = (new_cols, new_rows);
+                state.reported_cell_size = (cell_width_px, cell_height_px);
                 // Resizing invalidates both the host-side blit baseline and pane hit geometry.
                 state.request_repaint();
                 if let Some(shell) = state.shell.as_mut() {
+                    shell.set_graphics_cell_size(cell_width_px, cell_height_px);
                     shell.invalidate_pane_surface();
                 }
                 let msg = if let Some(shell) = &state.shell {
@@ -2005,10 +2051,12 @@ async fn run_client_loop(
             ClientLoopEvent::ServerMessage(msg) => match msg {
                 ServerMessage::Frame(frame_data) => state.present_frame(frame_data),
                 ServerMessage::ClientShellSnapshot(snapshot) => {
-                    let (composed, resize) = if let Some(shell) = &mut state.shell {
+                    let (composed, resize, graphics_cleanup) = if let Some(shell) = &mut state.shell
+                    {
                         let previous_size =
                             shell.surface_size(state.reported_size.0, state.reported_size.1);
                         shell.set_snapshot(snapshot);
+                        let graphics_cleanup = shell.take_pending_graphics_cleanup();
                         let next_size =
                             shell.surface_size(state.reported_size.0, state.reported_size.1);
                         (
@@ -2018,14 +2066,16 @@ async fn run_client_loop(
                                     shell,
                                     state.reported_size.0,
                                     state.reported_size.1,
-                                    0,
-                                    0,
+                                    state.reported_cell_size.0,
+                                    state.reported_cell_size.1,
                                 )
                             }),
+                            graphics_cleanup,
                         )
                     } else {
-                        (None, None)
+                        (None, None, Vec::new())
                     };
+                    state.present_graphics(&graphics_cleanup);
                     if let Some(resize) = resize {
                         if let Err(err) = write_to_server(&mut write_stream, &resize) {
                             return Err(ClientError::ConnectionLost(err));
@@ -2076,13 +2126,25 @@ async fn run_client_loop(
                     transfer_id,
                     leading,
                     control,
+                    surface_asset,
                 } => {
                     #[cfg(unix)]
                     {
                         if state.retired_direct_graphics.take() == Some((transfer_id, image_id)) {
                             continue;
                         }
+                        let surface_asset_valid = match (state.shell.as_ref(), &surface_asset) {
+                            (Some(shell), Some(asset)) => {
+                                crate::kitty_graphics::surface::host_image_id(
+                                    shell.graphics_scope(),
+                                    asset,
+                                ) == image_id
+                            }
+                            (None, None) => true,
+                            _ => false,
+                        };
                         let valid = state.kitty_graphics_enabled
+                            && surface_asset_valid
                             && usize::try_from(expected_len).ok().is_some_and(|len| {
                                 crate::pane_graphics_files::validate_direct_source(
                                     std::path::Path::new(&path),
@@ -2116,6 +2178,9 @@ async fn run_client_loop(
                             false
                         };
                         if sent {
+                            if let Some(asset) = surface_asset {
+                                state.pending_surface_graphics.insert(transfer_id, asset);
+                            }
                             if let Ok(mut matcher) = state.direct_graphics_response.lock() {
                                 matcher.start(transfer_id);
                             }
@@ -2127,6 +2192,7 @@ async fn run_client_loop(
                                 return Err(ClientError::ConnectionLost(err));
                             }
                         } else {
+                            state.pending_surface_graphics.remove(&transfer_id);
                             if let Ok(mut matcher) = state.direct_graphics_response.lock() {
                                 if valid {
                                     matcher.retire(transfer_id);
@@ -2145,7 +2211,15 @@ async fn run_client_loop(
                         }
                     }
                     #[cfg(not(unix))]
-                    let _ = (path, expected_len, image_id, transfer_id, leading, control);
+                    let _ = (
+                        path,
+                        expected_len,
+                        image_id,
+                        transfer_id,
+                        leading,
+                        control,
+                        surface_asset,
+                    );
                 }
                 ServerMessage::GraphicsTransmissionRetired {
                     transfer_id,
@@ -2154,6 +2228,15 @@ async fn run_client_loop(
                     #[cfg(unix)]
                     {
                         state.retired_direct_graphics = Some((transfer_id, image_id));
+                        state.pending_surface_graphics.remove(&transfer_id);
+                        let cleanup = state.shell.as_mut().map_or_else(Vec::new, |shell| {
+                            shell.retire_direct_graphics_image(image_id);
+                            shell
+                                .compose(state.reported_size.0, state.reported_size.1)
+                                .map(|frame| frame.graphics)
+                                .unwrap_or_else(|| shell.take_pending_graphics_cleanup())
+                        });
+                        state.present_graphics(&cleanup);
                         if let Ok(mut matcher) = state.direct_graphics_response.lock() {
                             matcher.retire(transfer_id);
                         }

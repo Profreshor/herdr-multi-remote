@@ -19,6 +19,8 @@ pub(crate) enum ClientRenderState {
         last_frame: Option<FrameData>,
         last_surface_panes: Option<Vec<PaneSurfacePane>>,
         last_surface_popup: Option<Box<ClientShellPopupSurface>>,
+        last_surface_graphics_placements: Option<Vec<crate::protocol::SurfaceGraphicsPlacement>>,
+        last_surface_graphics_retained: Option<Vec<crate::protocol::SurfaceGraphicsAssetKey>>,
         last_surface_projection_revision: Option<u64>,
     },
     /// Terminal-ANSI clients keep a terminal diff encoder and sequence number.
@@ -36,6 +38,8 @@ impl ClientRenderState {
                 last_frame: None,
                 last_surface_panes: None,
                 last_surface_popup: None,
+                last_surface_graphics_placements: None,
+                last_surface_graphics_retained: None,
                 last_surface_projection_revision: None,
             },
             RenderEncoding::TerminalAnsi => Self::TerminalAnsi {
@@ -52,11 +56,15 @@ impl ClientRenderState {
                 last_frame,
                 last_surface_panes,
                 last_surface_popup,
+                last_surface_graphics_placements,
+                last_surface_graphics_retained,
                 last_surface_projection_revision,
             } => {
                 *last_frame = None;
                 *last_surface_panes = None;
                 *last_surface_popup = None;
+                *last_surface_graphics_placements = None;
+                *last_surface_graphics_retained = None;
                 *last_surface_projection_revision = None;
             }
             Self::TerminalAnsi {
@@ -76,11 +84,15 @@ impl ClientRenderState {
                 last_frame,
                 last_surface_panes,
                 last_surface_popup,
+                last_surface_graphics_placements,
+                last_surface_graphics_retained,
                 last_surface_projection_revision,
             } => {
                 *last_frame = None;
                 *last_surface_panes = None;
                 *last_surface_popup = None;
+                *last_surface_graphics_placements = None;
+                *last_surface_graphics_retained = None;
                 *last_surface_projection_revision = None;
             }
             Self::TerminalAnsi {
@@ -94,12 +106,16 @@ impl ClientRenderState {
             last_frame,
             last_surface_panes,
             last_surface_popup,
+            last_surface_graphics_placements,
+            last_surface_graphics_retained,
             last_surface_projection_revision,
         } = self
         {
             *last_frame = None;
             *last_surface_panes = None;
             *last_surface_popup = None;
+            *last_surface_graphics_placements = None;
+            *last_surface_graphics_retained = None;
             *last_surface_projection_revision = None;
         }
     }
@@ -165,14 +181,19 @@ impl ClientRenderState {
             last_frame,
             last_surface_panes,
             last_surface_popup,
+            last_surface_graphics_placements,
+            last_surface_graphics_retained,
             last_surface_projection_revision,
         } = self
         else {
             return None;
         };
-        if last_frame.as_ref() == Some(&surface.frame)
+        if surface.graphics.assets.is_empty()
+            && last_frame.as_ref() == Some(&surface.frame)
             && last_surface_panes.as_ref() == Some(&surface.panes)
             && *last_surface_popup == surface.popup
+            && last_surface_graphics_placements.as_ref() == Some(&surface.graphics.placements)
+            && last_surface_graphics_retained.as_ref() == Some(&surface.graphics.retained_assets)
             && *last_surface_projection_revision == Some(surface.projection_revision)
         {
             return None;
@@ -196,6 +217,8 @@ impl ClientRenderState {
                     last_frame,
                     last_surface_panes,
                     last_surface_popup,
+                    last_surface_graphics_placements,
+                    last_surface_graphics_retained,
                     last_surface_projection_revision,
                 },
                 PreparedRender::Semantic {
@@ -205,6 +228,8 @@ impl ClientRenderState {
                 *last_frame = Some(frame);
                 *last_surface_panes = None;
                 *last_surface_popup = None;
+                *last_surface_graphics_placements = None;
+                *last_surface_graphics_retained = None;
                 *last_surface_projection_revision = None;
             }
             (
@@ -212,6 +237,8 @@ impl ClientRenderState {
                     last_frame,
                     last_surface_panes,
                     last_surface_popup,
+                    last_surface_graphics_placements,
+                    last_surface_graphics_retained,
                     last_surface_projection_revision,
                 },
                 PreparedRender::Semantic {
@@ -222,6 +249,8 @@ impl ClientRenderState {
                 *last_frame = Some(surface.frame);
                 *last_surface_panes = Some(surface.panes);
                 *last_surface_popup = surface.popup;
+                *last_surface_graphics_placements = Some(surface.graphics.placements);
+                *last_surface_graphics_retained = Some(surface.graphics.retained_assets);
             }
             (
                 Self::TerminalAnsi {
@@ -275,6 +304,7 @@ mod tests {
                 pixel_width: 0,
                 pixel_height: 0,
             })),
+            graphics: crate::protocol::SurfaceGraphicsScene::default(),
         }
     }
 
@@ -321,6 +351,20 @@ impl PreparedRender {
         match self {
             Self::Semantic { message } | Self::TerminalAnsi { message, .. } => message,
         }
+    }
+
+    pub(crate) fn strip_pane_surface_assets(&mut self) -> bool {
+        let Self::Semantic {
+            message: ServerMessage::PaneSurface(surface),
+        } = self
+        else {
+            return false;
+        };
+        if surface.graphics.assets.is_empty() {
+            return false;
+        }
+        surface.graphics.assets.clear();
+        true
     }
 
     pub(crate) fn into_frame(self) -> Option<FrameData> {

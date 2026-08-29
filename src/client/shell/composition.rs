@@ -452,6 +452,7 @@ impl ClientShellState {
                 .scroll
                 .min(u16::try_from(self.hits.release_notes_max_scroll).unwrap_or(u16::MAX));
         }
+        self.compose_graphics(&mut frame, layout);
         Some(frame)
     }
 }

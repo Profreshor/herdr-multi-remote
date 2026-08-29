@@ -326,6 +326,7 @@ pub(crate) enum ServerEvent {
         cell_width_px: u32,
         cell_height_px: u32,
         pixel_mouse: bool,
+        direct_graphics: bool,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -704,6 +705,7 @@ pub(crate) fn handle_client_handshake(
             requested_encoding,
             surface_size,
             pixel_mouse,
+            direct_graphics,
         } => {
             if let protocol::VersionCheck::Incompatible(reason) =
                 protocol::check_client_version(version)
@@ -739,7 +741,7 @@ pub(crate) fn handle_client_handshake(
                 requested_encoding,
                 None,
                 false,
-                false,
+                direct_graphics,
                 pixel_mouse,
                 true,
             )
@@ -803,6 +805,7 @@ pub(crate) fn handle_client_handshake(
             cell_width_px,
             cell_height_px,
             pixel_mouse,
+            direct_graphics,
             writer,
         }
     } else {
@@ -1650,6 +1653,7 @@ new_tab = "ctrl+notakey"
                 requested_encoding: RenderEncoding::SemanticFrame,
                 surface_size: crate::protocol::ClientSurfaceSize { cols: 80, rows: 29 },
                 pixel_mouse: true,
+                direct_graphics: true,
             },
         )
         .expect("write shell hello");
@@ -1675,12 +1679,14 @@ new_tab = "ctrl+notakey"
                 cell_width_px,
                 cell_height_px,
                 pixel_mouse,
+                direct_graphics,
                 writer,
             } => {
                 assert_eq!(client_id, 43);
                 assert_eq!((surface_cols, surface_rows), (80, 29));
                 assert_eq!((cell_width_px, cell_height_px), (8, 16));
                 assert!(pixel_mouse);
+                assert!(direct_graphics);
                 drop(writer);
             }
             other => panic!("expected ClientShellConnected, got {other:?}"),
