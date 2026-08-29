@@ -44,6 +44,7 @@ pub(crate) fn render_client_overlay(
         }
     }
     match o {
+        ClientShellOverlay::Onboarding => render_onboarding_overlay(b, p),
         ClientShellOverlay::Rename(v) => render_rename_overlay(b, v, p),
         ClientShellOverlay::ConfirmClose(v) => render_confirm_close_overlay(b, v, p),
         ClientShellOverlay::Help(v) => render_help_overlay(b, v, k, p),
@@ -251,6 +252,96 @@ fn contrast(p: &Palette) -> ratatui::style::Color {
         c => c,
     }
 }
+fn render_onboarding_overlay(b: &mut Buffer, p: &Palette) -> Option<OverlayRender> {
+    let outer = popup(b.area, 64, 16)?;
+    let inner = panel(b, outer, p.accent, p.panel_bg)?;
+    if inner.height < 11 {
+        return Some(OverlayRender::default());
+    }
+    let stack = crate::ui::modal_stack_areas(inner, 2, 0, 1, 1);
+    let base = Style::default()
+        .bg(p.panel_bg)
+        .remove_modifier(Modifier::DIM);
+    let title = base.fg(p.text).add_modifier(Modifier::BOLD);
+    let muted = base.fg(p.overlay0);
+    let text = base.fg(p.overlay1);
+    let accent = base.fg(p.accent).add_modifier(Modifier::BOLD);
+
+    put_text(
+        b,
+        stack.header.x,
+        stack.header.y,
+        stack.header.width,
+        crate::ui::ONBOARDING_TITLE,
+        title,
+    );
+    put_text(
+        b,
+        stack.header.x,
+        stack.header.y.saturating_add(1),
+        stack.header.width,
+        crate::ui::ONBOARDING_SUBTITLE,
+        muted,
+    );
+
+    let content = stack.content;
+    for (offset, line) in crate::ui::ONBOARDING_DESCRIPTION.iter().enumerate() {
+        put_text(
+            b,
+            content.x,
+            content.y.saturating_add(offset as u16),
+            content.width,
+            line,
+            text,
+        );
+    }
+
+    let key_y = content.y.saturating_add(4);
+    let mut key_x = content.x;
+    for (value, style) in [
+        ("  ", base),
+        (crate::ui::ONBOARDING_PREFIX_LABEL, accent),
+        (crate::ui::ONBOARDING_PREFIX_SUFFIX, text),
+        (crate::ui::ONBOARDING_HELP_LABEL, accent),
+        (crate::ui::ONBOARDING_HELP_SUFFIX, text),
+    ] {
+        let width = display_width(value);
+        put_text(
+            b,
+            key_x,
+            key_y,
+            content.right().saturating_sub(key_x),
+            value,
+            style,
+        );
+        key_x = key_x.saturating_add(width);
+    }
+    put_text(
+        b,
+        content.x,
+        content.y.saturating_add(5),
+        content.width,
+        crate::ui::ONBOARDING_NEXT,
+        text,
+    );
+
+    let primary = crate::ui::onboarding_welcome_continue_rect(stack.actions.unwrap_or_default());
+    button(
+        b,
+        primary,
+        " ↵ continue ",
+        Style::default()
+            .fg(contrast(p))
+            .bg(p.accent)
+            .add_modifier(Modifier::BOLD)
+            .remove_modifier(Modifier::DIM),
+    );
+    Some(OverlayRender {
+        primary,
+        ..OverlayRender::default()
+    })
+}
+
 fn render_rename_overlay(
     b: &mut Buffer,
     v: &ClientRenameOverlay,

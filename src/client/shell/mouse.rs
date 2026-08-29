@@ -588,6 +588,14 @@ impl ClientShellState {
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent, outcome: &mut ClientShellInput) {
         let point = (mouse.column, mouse.row);
+        if matches!(self.overlay, Some(ClientShellOverlay::Onboarding)) {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                && super::contains(self.hits.overlay_primary, point)
+            {
+                self.complete_onboarding(outcome);
+            }
+            return;
+        }
         if let Some(gesture) = self.pane_mouse_gesture.as_ref() {
             let gesture_event = matches!(
                 mouse.kind,

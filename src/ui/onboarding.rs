@@ -12,7 +12,19 @@ use super::widgets::{
 };
 use crate::app::AppState;
 
-const ONBOARDING_PREFIX_LABEL: &str = "ctrl+b";
+pub(crate) const ONBOARDING_TITLE: &str = "  herdr";
+pub(crate) const ONBOARDING_SUBTITLE: &str = "  terminal workspace manager for coding agents";
+pub(crate) const ONBOARDING_DESCRIPTION: [&str; 3] = [
+    "  this is a mouse-first terminal.",
+    "  click the sidebar to switch workspaces, drag pane",
+    "  borders to resize, right-click for context menus.",
+];
+pub(crate) const ONBOARDING_PREFIX_LABEL: &str = "ctrl+b";
+pub(crate) const ONBOARDING_PREFIX_SUFFIX: &str = " enters prefix mode · ";
+pub(crate) const ONBOARDING_HELP_LABEL: &str = "?";
+pub(crate) const ONBOARDING_HELP_SUFFIX: &str = " shows keybinds and settings";
+pub(crate) const ONBOARDING_NEXT: &str =
+    "  next: install optional agent integrations for more reliable state";
 
 pub(super) fn render_onboarding_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
     super::dim_background(frame, area);
@@ -48,7 +60,7 @@ fn render_onboarding_welcome(app: &AppState, frame: &mut Frame, area: Rect) {
     .areas::<4>(stack.content);
 
     frame.render_widget(
-        Paragraph::new("  herdr").style(
+        Paragraph::new(ONBOARDING_TITLE).style(
             Style::default()
                 .fg(app.palette.text)
                 .add_modifier(Modifier::BOLD),
@@ -56,16 +68,13 @@ fn render_onboarding_welcome(app: &AppState, frame: &mut Frame, area: Rect) {
         header_rows[0],
     );
     frame.render_widget(
-        Paragraph::new("  terminal workspace manager for coding agents")
-            .style(Style::default().fg(app.palette.overlay0)),
+        Paragraph::new(ONBOARDING_SUBTITLE).style(Style::default().fg(app.palette.overlay0)),
         header_rows[1],
     );
 
     frame.render_widget(
-        Paragraph::new(
-            "  this is a mouse-first terminal.\n  click the sidebar to switch workspaces, drag pane\n  borders to resize, right-click for context menus.",
-        )
-        .style(Style::default().fg(app.palette.overlay1)),
+        Paragraph::new(ONBOARDING_DESCRIPTION.join("\n"))
+            .style(Style::default().fg(app.palette.overlay1)),
         content_rows[0],
     );
 
@@ -78,25 +87,24 @@ fn render_onboarding_welcome(app: &AppState, frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            " enters prefix mode · ",
+            ONBOARDING_PREFIX_SUFFIX,
             Style::default().fg(app.palette.overlay1),
         ),
         Span::styled(
-            "?",
+            ONBOARDING_HELP_LABEL,
             Style::default()
                 .fg(app.palette.accent)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            " shows keybinds and settings",
+            ONBOARDING_HELP_SUFFIX,
             Style::default().fg(app.palette.overlay1),
         ),
     ]);
     frame.render_widget(Paragraph::new(key_line), content_rows[2]);
 
     frame.render_widget(
-        Paragraph::new("  next: install optional agent integrations for more reliable state")
-            .style(Style::default().fg(app.palette.overlay1)),
+        Paragraph::new(ONBOARDING_NEXT).style(Style::default().fg(app.palette.overlay1)),
         content_rows[3],
     );
 

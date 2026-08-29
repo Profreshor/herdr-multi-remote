@@ -1,6 +1,20 @@
 use super::*;
 
 impl ClientShellState {
+    pub(super) fn complete_onboarding(&mut self, outcome: &mut ClientShellInput) {
+        if self.snapshot.is_none() {
+            return;
+        }
+        if let Err(error) = crate::config::update_file("onboarding setting", |content| {
+            crate::config::upsert_top_level_bool(content, "onboarding", false)
+        }) {
+            self.set_local_config_diagnostic(Some(error));
+        }
+        self.config.startup_onboarding = false;
+        self.open_settings_overlay();
+        self.select_settings_section(ClientSettingsSection::Integrations, outcome);
+    }
+
     pub(super) fn open_navigator_overlay(&mut self) {
         let Some(snapshot) = self.snapshot.as_deref() else {
             return;
@@ -251,6 +265,16 @@ impl ClientShellState {
         outcome: &mut ClientShellInput,
     ) {
         use crossterm::event::KeyModifiers;
+
+        if matches!(self.overlay, Some(ClientShellOverlay::Onboarding)) {
+            if matches!(
+                key.code,
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l')
+            ) {
+                self.complete_onboarding(outcome);
+            }
+            return;
+        }
 
         if matches!(self.overlay, Some(ClientShellOverlay::GlobalMenu(_))) {
             match key.code {

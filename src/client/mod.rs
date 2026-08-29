@@ -1290,6 +1290,7 @@ fn run_client_with_mode(
             .with_startup_config_diagnostic(crate::config::config_diagnostic_summary(
                 &loaded_config.diagnostics,
             ))
+            .with_startup_onboarding(loaded_config.config.should_show_onboarding())
             .with_local_endpoint(&socket_path)
     });
     let mouse_capture = loaded_config.config.ui.mouse_capture;

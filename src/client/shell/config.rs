@@ -16,7 +16,7 @@ pub(super) fn merged_config_diagnostic(
 }
 
 impl ClientShellState {
-    fn set_local_config_diagnostic(&mut self, diagnostic: Option<String>) {
+    pub(super) fn set_local_config_diagnostic(&mut self, diagnostic: Option<String>) {
         self.local_config_diagnostic = diagnostic;
         self.config_diagnostic = merged_config_diagnostic(
             self.local_config_diagnostic.as_deref(),
@@ -121,11 +121,17 @@ impl ClientShellConfig {
             preferences_path: None,
             preferences: preferences::ClientChromePreferences::default(),
             startup_config_diagnostic: None,
+            startup_onboarding: false,
         }
     }
 
     pub(crate) fn with_startup_config_diagnostic(mut self, diagnostic: Option<String>) -> Self {
         self.startup_config_diagnostic = diagnostic;
+        self
+    }
+
+    pub(crate) fn with_startup_onboarding(mut self, show: bool) -> Self {
+        self.startup_onboarding = show;
         self
     }
 

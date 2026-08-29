@@ -37,8 +37,12 @@ use self::mobile::{
     render_mobile_toast_banner,
 };
 use self::navigator::render_navigator_overlay;
-pub(crate) use self::onboarding::onboarding_welcome_continue_rect;
 use self::onboarding::render_onboarding_overlay;
+pub(crate) use self::onboarding::{
+    onboarding_welcome_continue_rect, ONBOARDING_DESCRIPTION, ONBOARDING_HELP_LABEL,
+    ONBOARDING_HELP_SUFFIX, ONBOARDING_NEXT, ONBOARDING_PREFIX_LABEL, ONBOARDING_PREFIX_SUFFIX,
+    ONBOARDING_SUBTITLE, ONBOARDING_TITLE,
+};
 pub(crate) use self::panes::{popup_pane_rects, render_selection_highlight};
 use self::panes::{render_empty, render_popup_pane, resize_popup_pane};
 pub(crate) use self::release_notes::{

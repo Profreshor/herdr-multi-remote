@@ -38,6 +38,7 @@ pub(crate) struct ClientShellConfig {
     pub(super) preferences_path: Option<std::path::PathBuf>,
     pub(super) preferences: preferences::ClientChromePreferences,
     pub(super) startup_config_diagnostic: Option<String>,
+    pub(super) startup_onboarding: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +211,7 @@ pub(super) enum ClientShellMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ClientShellOverlayKind {
+    Onboarding,
     Rename,
     ConfirmClose,
     Help,
@@ -491,6 +493,7 @@ pub(super) struct ClientConfirmCloseOverlay {
 
 #[derive(Debug)]
 pub(super) enum ClientShellOverlay {
+    Onboarding,
     Rename(ClientRenameOverlay),
     ConfirmClose(ClientConfirmCloseOverlay),
     Help(ClientHelpOverlay),
@@ -506,6 +509,7 @@ pub(super) enum ClientShellOverlay {
 impl ClientShellOverlay {
     pub(super) fn kind(&self) -> ClientShellOverlayKind {
         match self {
+            Self::Onboarding => ClientShellOverlayKind::Onboarding,
             Self::Rename(_) => ClientShellOverlayKind::Rename,
             Self::ConfirmClose(_) => ClientShellOverlayKind::ConfirmClose,
             Self::Help(_) => ClientShellOverlayKind::Help,
@@ -783,6 +787,9 @@ impl ClientShellState {
     pub(crate) fn new(mut config: ClientShellConfig) -> Self {
         let preferences = config.preferences;
         let local_config_diagnostic = config.startup_config_diagnostic.take();
+        let overlay = config
+            .startup_onboarding
+            .then_some(ClientShellOverlay::Onboarding);
         let sidebar_collapsed = preferences
             .sidebar_collapsed
             .unwrap_or(config.sidebar_start_collapsed);
@@ -828,7 +835,7 @@ impl ClientShellState {
             hits: ShellHitMap::default(),
             mode: ClientShellMode::Terminal,
             navigate_workspace_id: None,
-            overlay: None,
+            overlay,
             previous_pane_id: None,
             pane_mouse_gesture: None,
             selection: None,
@@ -935,7 +942,10 @@ impl ClientShellState {
             self.visible_notification = None;
             self.endpoint_error = None;
             self.navigate_workspace_id = None;
-            self.overlay = None;
+            self.overlay = self
+                .config
+                .startup_onboarding
+                .then_some(ClientShellOverlay::Onboarding);
             self.previous_pane_id = None;
             self.pane_mouse_gesture = None;
             self.selection = None;
@@ -1082,7 +1092,10 @@ impl ClientShellState {
             }
             self.mode = ClientShellMode::Terminal;
             self.navigate_workspace_id = None;
-            self.overlay = None;
+            self.overlay = self
+                .config
+                .startup_onboarding
+                .then_some(ClientShellOverlay::Onboarding);
             self.selection = None;
             self.last_pane_click = None;
             self.selection_autoscroll = None;

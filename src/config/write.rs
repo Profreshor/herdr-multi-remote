@@ -71,7 +71,15 @@ pub(crate) fn update_file(
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create config directory: {error}"))?;
     }
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(format!(
+                "failed to read config before saving {description}: {error}"
+            ));
+        }
+    };
     std::fs::write(&path, update(&content))
         .map_err(|error| format!("failed to save {description}: {error}"))
 }

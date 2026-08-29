@@ -491,6 +491,180 @@ mod tests {
     }
 
     #[test]
+    fn startup_onboarding_is_client_rendered_and_modal() {
+        let config =
+            ClientShellConfig::from_config(&Config::default()).with_startup_onboarding(true);
+        let mut state = ClientShellState::new(config);
+        let early = state.handle_input_bytes(b"\r");
+        assert!(early.actions.is_empty());
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::Onboarding)
+        ));
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface());
+
+        let frame = state.compose(106, 20).expect("onboarding frame");
+        let text = frame
+            .cells
+            .chunks(frame.width as usize)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("terminal workspace manager for coding agents"));
+        assert!(text.contains("this is a mouse-first terminal"));
+        assert!(text.contains("ctrl+b enters prefix mode"));
+        assert!(text.contains("install optional agent integrations"));
+        assert_eq!(state.hits.overlay_primary.width, 12);
+
+        let ignored = state.handle_input_bytes(b"x");
+        assert!(ignored.requests.is_empty());
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::Onboarding)
+        ));
+        let outside =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })]);
+        assert!(outside.actions.is_empty());
+        assert!(outside.requests.is_empty());
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::Onboarding)
+        ));
+
+        state.set_pane_surface(surface_with_popup());
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::Onboarding)
+        ));
+        let popup_input = state.handle_input_bytes(b"hidden-popup-input");
+        assert!(popup_input.requests.is_empty());
+        let popup_paste = state.handle_raw_events(vec![RawInputEvent::Paste("secret".into())]);
+        assert!(popup_paste.requests.is_empty());
+    }
+
+    #[test]
+    fn onboarding_completion_persists_and_opens_endpoint_integrations() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-client-onboarding-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let original_config_path = std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR);
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        std::fs::write(&path, "[terminal]\ndefault_shell = \"fish\"\n")
+            .expect("write onboarding config");
+
+        let config =
+            ClientShellConfig::from_config(&Config::default()).with_startup_onboarding(true);
+        let mut state = ClientShellState::new(config);
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface());
+        let outcome = state.handle_input_bytes(b"\r");
+
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::Settings(ClientSettingsOverlay {
+                section: ClientSettingsSection::Integrations,
+                loading_integrations: true,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            &outcome.actions[..],
+            [ClientShellAction::Endpoint { request, .. }]
+                if matches!(request.method, crate::api::schema::Method::IntegrationList(_))
+        ));
+        let persisted = std::fs::read_to_string(&path).expect("read onboarding config");
+        assert!(persisted.contains("onboarding = false"));
+        assert!(persisted.contains("default_shell = \"fish\""));
+
+        for input in [b"\x1b[C".as_slice(), b"l".as_slice()] {
+            let config =
+                ClientShellConfig::from_config(&Config::default()).with_startup_onboarding(true);
+            let mut state = ClientShellState::new(config);
+            state.set_snapshot(Box::new(snapshot()));
+            state.set_pane_surface(surface());
+            let outcome = state.handle_input_bytes(input);
+            assert!(matches!(
+                state.overlay,
+                Some(ClientShellOverlay::Settings(ClientSettingsOverlay {
+                    section: ClientSettingsSection::Integrations,
+                    ..
+                }))
+            ));
+            assert_eq!(outcome.actions.len(), 1);
+        }
+
+        let config =
+            ClientShellConfig::from_config(&Config::default()).with_startup_onboarding(true);
+        let mut state = ClientShellState::new(config);
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface());
+        state.compose(106, 20).expect("onboarding mouse frame");
+        let button = state.hits.overlay_primary;
+        let click =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: button.x,
+                row: button.y,
+                modifiers: KeyModifiers::NONE,
+            })]);
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::Settings(ClientSettingsOverlay {
+                section: ClientSettingsSection::Integrations,
+                ..
+            }))
+        ));
+        assert_eq!(click.actions.len(), 1);
+
+        let unreadable_path = path.with_extension("dir");
+        std::fs::create_dir(&unreadable_path).expect("create unreadable config path");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &unreadable_path);
+        let config =
+            ClientShellConfig::from_config(&Config::default()).with_startup_onboarding(true);
+        let mut state = ClientShellState::new(config);
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface());
+        let failed_write = state.handle_input_bytes(b"\r");
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::Settings(ClientSettingsOverlay {
+                section: ClientSettingsSection::Integrations,
+                ..
+            }))
+        ));
+        assert_eq!(failed_write.actions.len(), 1);
+        assert!(state
+            .config_diagnostic
+            .as_deref()
+            .is_some_and(|diagnostic| diagnostic.contains("failed to read config")));
+        assert!(unreadable_path.is_dir());
+        std::fs::remove_dir(&unreadable_path).expect("remove unreadable config path");
+
+        if let Some(original) = original_config_path {
+            std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, original);
+        } else {
+            std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        }
+        std::fs::remove_file(path).expect("remove onboarding config");
+    }
+
+    #[test]
     fn startup_config_diagnostics_are_client_rendered_and_persist_until_replaced() {
         let config = ClientShellConfig::from_config(&Config::default())
             .with_startup_config_diagnostic(Some("local config warning".into()));

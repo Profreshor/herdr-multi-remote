@@ -3270,6 +3270,13 @@ impl HeadlessServer {
                     }
                     return false;
                 }
+                if self.app.state.mode == app::Mode::Onboarding
+                    && self.app.state.workspaces.is_empty()
+                {
+                    self.app.state.mode = app::Mode::Navigate;
+                    self.app.ensure_default_workspace();
+                    self.app.state.mode = app::Mode::Onboarding;
+                }
                 let first_app_client = self.app_client_count() == 0;
                 let last_activity = self.allocate_activity_stamp();
                 let mut connection = ClientConnection::new_with_mode(
@@ -6503,6 +6510,32 @@ mod tests {
             control_rx,
             render_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn client_shell_attach_seeds_workspace_without_consuming_legacy_onboarding() {
+        let mut server = test_headless_server();
+        server.app.state.workspaces.clear();
+        server.app.state.active = None;
+        server.app.state.mode = crate::app::Mode::Onboarding;
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+
+        assert!(
+            server.handle_server_event(ServerEvent::ClientShellConnected {
+                client_id: 6,
+                surface_cols: 80,
+                surface_rows: 23,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                pixel_mouse: false,
+                writer,
+            })
+        );
+
+        assert_eq!(server.app.state.mode, crate::app::Mode::Onboarding);
+        assert_eq!(server.app.state.workspaces.len(), 1);
+        assert_eq!(server.app.state.active, Some(0));
+        shutdown_test_runtimes(&mut server);
     }
 
     #[tokio::test]
