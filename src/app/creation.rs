@@ -81,6 +81,13 @@ impl App {
         resolve_new_terminal_cwd(&self.state.new_terminal_cwd, follow_cwd)
     }
 
+    pub(crate) fn resolved_new_workspace_cwd_from(&self, ws_idx: usize) -> PathBuf {
+        let follow_cwd = self
+            .focused_pane_cwd_in_workspace(ws_idx)
+            .or_else(|| self.seed_cwd_from_workspace(ws_idx));
+        self.resolve_new_terminal_cwd(follow_cwd)
+    }
+
     pub(super) fn workspace_creation_source(&self) -> Option<usize> {
         if self.state.mode == Mode::Navigate
             && self.state.workspaces.get(self.state.selected).is_some()
@@ -110,6 +117,7 @@ impl App {
         self.runtime_workspace_create(
             request_id,
             crate::api::schema::WorkspaceCreateParams {
+                source_workspace_id: None,
                 cwd: None,
                 focus: true,
                 label: None,

@@ -49,6 +49,16 @@ pub(super) struct ClientShellLayout {
     pub pane_surface: Rect,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ClientMobileTarget {
+    NewWorkspace,
+    Workspace(String),
+    NewTab,
+    Tab(String),
+    Agent(String),
+    Menu(usize),
+}
+
 #[derive(Default)]
 pub(super) struct ShellHitMap {
     pub(super) workspaces: Vec<WorkspaceHit>,
@@ -73,6 +83,10 @@ pub(super) struct ShellHitMap {
     pub(super) new_tab: Rect,
     pub(super) tab_scroll_left: Rect,
     pub(super) tab_scroll_right: Rect,
+    pub(super) mobile_switch: Rect,
+    pub(super) mobile_close: Rect,
+    pub(super) mobile_targets: Vec<(Rect, ClientMobileTarget)>,
+    pub(super) mobile_max_scroll: usize,
     pub(super) global_launcher: Rect,
     pub(super) notification_toast: Rect,
     pub(super) global_menu_rows: Vec<(Rect, usize)>,
@@ -241,6 +255,7 @@ pub(super) enum ClientShellOverlayKind {
 #[derive(Debug)]
 pub(super) enum ClientRenameTarget {
     NewWorkspace {
+        source_workspace_id: Option<String>,
         cwd: Option<String>,
         suggested_name: String,
     },
@@ -758,6 +773,9 @@ pub(crate) struct ClientShellState {
     pub(super) workspace_scroll: usize,
     pub(super) agent_scroll: usize,
     pub(super) tab_scroll: usize,
+    pub(super) mobile_switcher_scroll: usize,
+    pub(super) reveal_mobile_workspace: bool,
+    pub(super) mobile_switcher_suspended: bool,
     pub(super) reveal_focused_tab: bool,
     pub(super) last_tab_bar_width: Option<u16>,
     pub(super) last_composed_size: Option<(u16, u16)>,
@@ -879,6 +897,9 @@ impl ClientShellState {
             workspace_scroll: 0,
             agent_scroll: 0,
             tab_scroll: 0,
+            mobile_switcher_scroll: 0,
+            reveal_mobile_workspace: false,
+            mobile_switcher_suspended: false,
             reveal_focused_tab: true,
             last_tab_bar_width: None,
             last_composed_size: None,
@@ -936,6 +957,41 @@ impl ClientShellState {
             .count()
     }
 
+    pub(super) fn resume_mobile_switcher_if_ready(&mut self) -> bool {
+        if !self.mobile_switcher_suspended || self.overlay.is_some() {
+            return false;
+        }
+        self.mobile_switcher_suspended = false;
+        if self
+            .snapshot
+            .as_deref()
+            .and_then(|snapshot| snapshot.focused_workspace_id.as_ref())
+            .is_some()
+        {
+            self.mode = self.copy_or_terminal_mode();
+            self.navigate_workspace_id = None;
+        } else {
+            self.mode = ClientShellMode::Navigate;
+        }
+        true
+    }
+
+    pub(super) fn mobile_layout_active(&self) -> bool {
+        self.last_composed_size
+            .is_some_and(|(cols, rows)| !self.layout(cols, rows).mobile_header.is_empty())
+    }
+
+    pub(super) fn navigation_workspace_entries(
+        &self,
+        snapshot: &ClientShellSnapshot,
+    ) -> Vec<WorkspaceEntry> {
+        if self.mobile_layout_active() {
+            render::workspace_entries(snapshot, &HashSet::new())
+        } else {
+            render::workspace_entries(snapshot, &self.collapsed_groups)
+        }
+    }
+
     pub(super) fn layout(&self, cols: u16, rows: u16) -> ClientShellLayout {
         self.config.layout(
             cols,
@@ -980,6 +1036,9 @@ impl ClientShellState {
             self.workspace_scroll = 0;
             self.agent_scroll = 0;
             self.tab_scroll = 0;
+            self.mobile_switcher_scroll = 0;
+            self.reveal_mobile_workspace = false;
+            self.mobile_switcher_suspended = false;
             self.reveal_focused_tab = true;
             self.last_tab_bar_width = None;
             self.last_composed_size = None;
@@ -1113,6 +1172,7 @@ impl ClientShellState {
             })
         {
             self.navigate_workspace_id = snapshot.focused_workspace_id.clone();
+            self.reveal_mobile_workspace = self.mobile_layout_active();
         }
         let pane_exists =
             |pane_id: &String| snapshot.panes.iter().any(|pane| &pane.pane_id == pane_id);
@@ -1179,6 +1239,7 @@ impl ClientShellState {
             }
         }
         self.snapshot = Some(snapshot);
+        self.resume_mobile_switcher_if_ready();
     }
 
     pub(crate) fn set_pane_surface(&mut self, surface: PaneSurfaceFrame) {
@@ -1312,6 +1373,7 @@ impl ClientShellState {
         }
         self.popup_terminal_id = next_popup;
         self.pane_surface = Some(surface);
+        self.resume_mobile_switcher_if_ready();
     }
 
     pub(crate) fn tick_popup_pending(&mut self, now: std::time::Instant) {

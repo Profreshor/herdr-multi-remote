@@ -875,6 +875,8 @@ pub struct ClientShellTabStatusSegment {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientShellWorkspace {
     pub workspace_id: String,
+    pub active_tab_id: String,
+    pub new_workspace_cwd: String,
     pub number: usize,
     pub label: String,
     pub custom_label: bool,
@@ -1975,6 +1977,8 @@ mod tests {
             agent_order: Vec::new(),
             workspaces: vec![ClientShellWorkspace {
                 workspace_id: "w1".into(),
+                active_tab_id: "w1:t1".into(),
+                new_workspace_cwd: "/tmp".into(),
                 number: 1,
                 label: "shell".into(),
                 custom_label: false,

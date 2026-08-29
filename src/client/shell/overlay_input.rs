@@ -294,10 +294,14 @@ impl ClientShellState {
     }
 
     pub(super) fn open_new_workspace_overlay(&mut self) {
+        let source_workspace_id = self.workspace_action_id();
         let cwd = self.snapshot.as_deref().and_then(|snapshot| {
-            let pane_id = snapshot.focused_pane_id.as_deref()?;
-            let pane = snapshot.panes.iter().find(|pane| pane.pane_id == pane_id)?;
-            pane.foreground_cwd.clone().or_else(|| pane.cwd.clone())
+            let workspace_id = source_workspace_id.as_deref()?;
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == workspace_id)
+                .map(|workspace| workspace.new_workspace_cwd.clone())
         });
         let suggested_name = cwd
             .as_deref()
@@ -309,6 +313,7 @@ impl ClientShellState {
             input: suggested_name.clone(),
             replace_on_type: true,
             target: ClientRenameTarget::NewWorkspace {
+                source_workspace_id,
                 cwd,
                 suggested_name,
             },
@@ -960,10 +965,12 @@ impl ClientShellState {
         let trimmed = rename.input.trim();
         let method = match rename.target {
             ClientRenameTarget::NewWorkspace {
+                source_workspace_id,
                 cwd,
                 suggested_name,
             } => Some(crate::api::schema::Method::WorkspaceCreate(
                 crate::api::schema::WorkspaceCreateParams {
+                    source_workspace_id,
                     cwd,
                     focus: true,
                     label: (!trimmed.is_empty() && trimmed != suggested_name)

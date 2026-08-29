@@ -1025,6 +1025,7 @@ impl App {
                 self.runtime_workspace_create(
                     "tui.workspace.create",
                     crate::api::schema::WorkspaceCreateParams {
+                        source_workspace_id: None,
                         cwd: None,
                         focus: true,
                         label: None,
@@ -1064,6 +1065,7 @@ impl App {
                 self.runtime_workspace_create(
                     "tui.workspace.create_cwd",
                     crate::api::schema::WorkspaceCreateParams {
+                        source_workspace_id: None,
                         cwd: Some(cwd.display().to_string()),
                         focus: true,
                         label: None,

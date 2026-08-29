@@ -993,6 +993,7 @@ impl HeadlessServer {
         self.dispatch_headless_runtime_mutation(
             id,
             api::schema::Method::WorkspaceCreate(api::schema::WorkspaceCreateParams {
+                source_workspace_id: None,
                 cwd,
                 focus: true,
                 label,

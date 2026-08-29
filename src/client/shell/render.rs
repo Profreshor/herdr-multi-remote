@@ -218,7 +218,13 @@ pub(super) fn render_shell(
 ) -> ShellHitMap {
     let mut hits = ShellHitMap::default();
     if layout.mobile_header.height > 0 {
-        render_mobile_header(buffer, layout.mobile_header, snapshot, &config.palette);
+        super::mobile::render_mobile_header(
+            buffer,
+            layout.mobile_header,
+            snapshot,
+            config,
+            &mut hits,
+        );
     }
     if layout.sidebar.width > 0 {
         if state.sidebar_collapsed {
@@ -270,48 +276,6 @@ pub(super) fn render_shell(
     hits
 }
 
-fn render_mobile_header(
-    buffer: &mut Buffer,
-    area: Rect,
-    snapshot: &ClientShellSnapshot,
-    palette: &Palette,
-) {
-    buffer.set_style(area, Style::default().bg(palette.panel_bg));
-    let workspace = snapshot
-        .focused_workspace_id
-        .as_deref()
-        .and_then(|id| snapshot.workspaces.iter().find(|ws| ws.workspace_id == id))
-        .map(|ws| ws.label.as_str())
-        .unwrap_or("Herdr");
-    put_text(
-        buffer,
-        area.x,
-        area.y,
-        area.width,
-        &format!(" ☰  {workspace}"),
-        Style::default()
-            .fg(palette.text)
-            .bg(palette.panel_bg)
-            .add_modifier(Modifier::BOLD),
-    );
-    if area.height > 1 {
-        let tab = snapshot
-            .focused_tab_id
-            .as_deref()
-            .and_then(|id| snapshot.tabs.iter().find(|tab| tab.tab_id == id))
-            .map(|tab| tab.label.as_str())
-            .unwrap_or("terminal");
-        put_text(
-            buffer,
-            area.x + 1,
-            area.y + 1,
-            area.width.saturating_sub(1),
-            tab,
-            Style::default().fg(palette.overlay1).bg(palette.panel_bg),
-        );
-    }
-}
-
 fn put_right_text(buffer: &mut Buffer, area: Rect, y: u16, text: &str, style: Style) {
     let width = display_width(text).min(area.width);
     put_text(
@@ -324,19 +288,26 @@ fn put_right_text(buffer: &mut Buffer, area: Rect, y: u16, text: &str, style: St
     );
 }
 
-fn put_segment(buffer: &mut Buffer, x: u16, y: u16, right: u16, text: &str, style: Style) -> u16 {
+pub(super) fn put_segment(
+    buffer: &mut Buffer,
+    x: u16,
+    y: u16,
+    right: u16,
+    text: &str,
+    style: Style,
+) -> u16 {
     let width = display_width(text).min(right.saturating_sub(x));
     put_text(buffer, x, y, width, text, style);
     x.saturating_add(width)
 }
 
-fn put_text(buffer: &mut Buffer, x: u16, y: u16, width: u16, text: &str, style: Style) {
+pub(super) fn put_text(buffer: &mut Buffer, x: u16, y: u16, width: u16, text: &str, style: Style) {
     if width == 0 || y >= buffer.area.bottom() || x >= buffer.area.right() {
         return;
     }
     buffer.set_stringn(x, y, text, width as usize, style);
 }
 
-fn display_width(text: &str) -> u16 {
+pub(super) fn display_width(text: &str) -> u16 {
     UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16
 }

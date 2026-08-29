@@ -72,6 +72,7 @@ impl ClientShellState {
                         self.push_endpoint_method(
                             crate::api::schema::Method::WorkspaceCreate(
                                 crate::api::schema::WorkspaceCreateParams {
+                                    source_workspace_id: self.workspace_action_id(),
                                     cwd: None,
                                     focus: true,
                                     label: None,
@@ -125,6 +126,8 @@ impl ClientShellState {
                     return;
                 }
                 if action == crate::input::KeybindAction::WorkspacePicker {
+                    self.mobile_switcher_scroll = 0;
+                    self.reveal_mobile_workspace = false;
                     self.mode = ClientShellMode::Navigate;
                     self.navigate_workspace_id = self
                         .snapshot
@@ -704,7 +707,7 @@ impl ClientShellState {
                 }))
             }
             KeybindAction::SwitchWorkspace(index) => {
-                let entries = render::workspace_entries(snapshot, &self.collapsed_groups);
+                let entries = self.navigation_workspace_entries(snapshot);
                 Some(Method::WorkspaceFocus(WorkspaceTarget {
                     workspace_id: snapshot
                         .workspaces
@@ -714,7 +717,7 @@ impl ClientShellState {
                 }))
             }
             KeybindAction::PreviousWorkspace | KeybindAction::NextWorkspace => {
-                let entries = render::workspace_entries(snapshot, &self.collapsed_groups);
+                let entries = self.navigation_workspace_entries(snapshot);
                 let current = entries.iter().position(|entry| {
                     snapshot.workspaces[entry.index].workspace_id == focused_workspace
                 })?;

@@ -20,6 +20,7 @@ mod status;
 mod tab_surface;
 mod tabs;
 mod text;
+pub(crate) use text::truncate_end;
 mod widgets;
 
 use self::dialogs::{

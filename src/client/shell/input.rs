@@ -159,6 +159,7 @@ impl ClientShellState {
                 | RawInputEvent::Unsupported => {}
             }
         }
+        outcome.repaint |= self.resume_mobile_switcher_if_ready();
         outcome
     }
 
@@ -373,7 +374,7 @@ impl ClientShellState {
         }
     }
 
-    fn copy_or_terminal_mode(&self) -> ClientShellMode {
+    pub(super) fn copy_or_terminal_mode(&self) -> ClientShellMode {
         if self.copy_mode.as_ref().is_some_and(|copy_mode| {
             self.focused_pane_id().as_deref() == Some(copy_mode.pane_id.as_str())
         }) {
@@ -431,7 +432,7 @@ impl ClientShellState {
             )
         }) {
             let valid = self.snapshot.as_deref().is_some_and(|snapshot| {
-                render::workspace_entries(snapshot, &self.collapsed_groups)
+                self.navigation_workspace_entries(snapshot)
                     .get(index)
                     .is_some()
             });
@@ -573,7 +574,7 @@ impl ClientShellState {
         let indexed_target_exists = match &binding {
             KeybindMatch::Action(KeybindAction::SwitchWorkspace(index)) => {
                 self.snapshot.as_deref().is_some_and(|snapshot| {
-                    render::workspace_entries(snapshot, &self.collapsed_groups)
+                    self.navigation_workspace_entries(snapshot)
                         .get(*index)
                         .is_some()
                 })
@@ -613,7 +614,6 @@ impl ClientShellState {
         } else {
             if !preserve_navigate {
                 self.mode = ClientShellMode::Terminal;
-                self.navigate_workspace_id = None;
             }
             self.record_binding(binding, outcome);
         }
@@ -630,7 +630,8 @@ impl ClientShellState {
         let Some(snapshot) = self.snapshot.as_deref() else {
             return;
         };
-        let entries = render::workspace_entries(snapshot, &self.collapsed_groups);
+        let mobile = self.mobile_layout_active();
+        let entries = self.navigation_workspace_entries(snapshot);
         if entries.is_empty() {
             return;
         }
@@ -643,12 +644,17 @@ impl ClientShellState {
                     .position(|entry| snapshot.workspaces[entry.index].workspace_id == selected)
             })
             .unwrap_or(0);
-        let next = (current as isize + delta).rem_euclid(entries.len() as isize) as usize;
+        let next = if mobile {
+            (current as isize + delta).clamp(0, entries.len().saturating_sub(1) as isize) as usize
+        } else {
+            (current as isize + delta).rem_euclid(entries.len() as isize) as usize
+        };
         self.navigate_workspace_id = Some(
             snapshot.workspaces[entries[next].index]
                 .workspace_id
                 .clone(),
         );
+        self.reveal_mobile_workspace = mobile;
     }
 
     fn cycle_pane(&mut self, reverse: bool, outcome: &mut ClientShellInput) {

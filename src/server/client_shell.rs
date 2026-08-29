@@ -14,11 +14,17 @@ pub(super) fn snapshot(
         .workspaces
         .into_iter()
         .zip(&app.state.workspaces)
-        .map(|(workspace, state)| {
+        .enumerate()
+        .map(|(workspace_index, (workspace, state))| {
             let mut tokens = workspace.tokens.into_iter().collect::<Vec<_>>();
             tokens.sort_by(|left, right| left.0.cmp(&right.0));
             protocol::ClientShellWorkspace {
                 workspace_id: workspace.workspace_id,
+                active_tab_id: workspace.active_tab_id,
+                new_workspace_cwd: app
+                    .resolved_new_workspace_cwd_from(workspace_index)
+                    .display()
+                    .to_string(),
                 number: workspace.number,
                 label: workspace.label,
                 custom_label: state.custom_name.is_some(),

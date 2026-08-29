@@ -50,6 +50,7 @@ fn request_uses_dot_method_names() {
     let request = Request {
         id: "req_1".into(),
         method: Method::WorkspaceCreate(WorkspaceCreateParams {
+            source_workspace_id: None,
             cwd: Some("/tmp".into()),
             focus: true,
             label: Some("api".into()),

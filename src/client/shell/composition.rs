@@ -19,15 +19,6 @@ fn restore_mode_bar(
     }
 }
 
-fn clipboard_feedback_starts_at_top(position: crate::config::ToastClipboardPosition) -> bool {
-    matches!(
-        position,
-        crate::config::ToastClipboardPosition::TopLeft
-            | crate::config::ToastClipboardPosition::TopCenter
-            | crate::config::ToastClipboardPosition::TopRight
-    )
-}
-
 impl ClientShellState {
     pub(crate) fn compose(&mut self, cols: u16, rows: u16) -> Option<FrameData> {
         self.last_composed_size = Some((cols, rows));
@@ -295,33 +286,38 @@ impl ClientShellState {
                 );
             }
             if let Some(notification) = self.visible_notification.as_ref() {
-                let notification_area = if layout.mobile_header.is_empty() {
-                    Rect::new(0, 0, cols, rows)
+                self.hits.notification_toast = if layout.mobile_header.is_empty() {
+                    notifications::render_visible_notification(
+                        &mut composed,
+                        Rect::new(0, 0, cols, rows),
+                        notification,
+                        self.config.toast_position,
+                        u16::from(has_config_diagnostic),
+                        &self.config.palette,
+                    )
                 } else {
-                    layout.pane_surface
+                    notifications::render_mobile_notification_banner(
+                        &mut composed,
+                        Rect::new(0, 0, cols, rows),
+                        notification,
+                        has_config_diagnostic,
+                        &self.config.palette,
+                    )
                 };
-                self.hits.notification_toast = notifications::render_visible_notification(
-                    &mut composed,
-                    notification_area,
-                    notification,
-                    self.config.toast_position,
-                    u16::from(has_config_diagnostic),
-                    &self.config.palette,
-                );
             }
             frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
         }
         if let Some(feedback) = self.copy_feedback.as_ref() {
             let cursor = frame.cursor.clone();
             let mut composed = frame.to_ratatui_buffer()?;
-            let base_offset =
-                if clipboard_feedback_starts_at_top(self.config.clipboard_toast_position) {
-                    u16::from(has_config_diagnostic)
-                } else {
-                    0
-                };
+            let base_offset = u16::from(has_config_diagnostic);
+            let feedback_area = if layout.mobile_header.is_empty() {
+                layout.pane_surface
+            } else {
+                Rect::new(0, 0, cols, rows)
+            };
             let offset = crate::ui::copy_feedback_offset_for_toast(
-                layout.pane_surface,
+                feedback_area,
                 feedback,
                 base_offset,
                 self.config.clipboard_toast_position,
@@ -329,7 +325,7 @@ impl ClientShellState {
             );
             crate::ui::render_copy_feedback_buffer(
                 &mut composed,
-                layout.pane_surface,
+                feedback_area,
                 feedback,
                 offset,
                 self.config.clipboard_toast_position,
@@ -371,6 +367,26 @@ impl ClientShellState {
                     pixel_height: popup.pixel_height,
                 });
             }
+        }
+        if !layout.mobile_header.is_empty()
+            && self.mode == ClientShellMode::Navigate
+            && self.overlay.is_none()
+        {
+            let mut composed = frame.to_ratatui_buffer()?;
+            super::mobile::render_mobile_switcher(
+                &mut composed,
+                Rect::new(0, 0, cols, rows),
+                snapshot,
+                &self.config,
+                self.navigate_workspace_id.as_deref(),
+                &mut self.mobile_switcher_scroll,
+                &mut self.reveal_mobile_workspace,
+                &mut self.hits,
+            );
+            frame.replace_from_ratatui_buffer_preserving_effects(&composed, None);
+            self.hits.panes.clear();
+            self.hits.pane_splits.clear();
+            self.hits.popup = None;
         }
         restore_mode_bar(&mut frame, mode_bar, mode_bar_cells.as_deref());
         if let Some(overlay) = self.overlay.as_ref() {

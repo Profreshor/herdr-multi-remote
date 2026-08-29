@@ -4405,6 +4405,13 @@
                 "string",
                 "null"
               ]
+            },
+            "source_workspace_id": {
+              "description": "Workspace whose focused pane supplies the `follow` cwd policy.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "type": "object"

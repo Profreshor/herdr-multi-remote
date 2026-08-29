@@ -807,6 +807,9 @@ impl ClientShellState {
             self.focus_visible_notification(outcome);
             return;
         }
+        if self.handle_mobile_mouse(mouse, outcome) {
+            return;
+        }
         if mouse.kind == MouseEventKind::Drag(MouseButton::Left) {
             match self.chrome_drag.as_ref() {
                 Some(ClientChromeDrag::SidebarWidth) => {
