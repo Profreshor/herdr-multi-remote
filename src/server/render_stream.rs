@@ -289,6 +289,7 @@ mod tests {
         let pane = ratatui::buffer::Buffer::with_lines(["pane"]);
         let popup = ratatui::buffer::Buffer::with_lines([content]);
         PaneSurfaceFrame {
+            boot_id: "boot-1".into(),
             projection_revision: 1,
             frame: FrameData::from_ratatui_buffer_with_hyperlinks(&pane, None, &[]),
             panes: Vec::new(),

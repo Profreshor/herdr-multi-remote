@@ -86,11 +86,35 @@ fn spawn_client_process(
     spawn_client_process_with_args(config_home, runtime_dir, api_socket_path, &["client"])
 }
 
+fn spawn_client_shell_process(
+    config_home: &PathBuf,
+    runtime_dir: &PathBuf,
+    api_socket_path: &PathBuf,
+) -> SpawnedHerdr {
+    spawn_client_process_with_args_and_env(
+        config_home,
+        runtime_dir,
+        api_socket_path,
+        &["client"],
+        &[("HERDR_CLIENT_RENDERED_SHELL", "1")],
+    )
+}
+
 fn spawn_client_process_with_args(
     config_home: &PathBuf,
     runtime_dir: &PathBuf,
     api_socket_path: &PathBuf,
     args: &[&str],
+) -> SpawnedHerdr {
+    spawn_client_process_with_args_and_env(config_home, runtime_dir, api_socket_path, args, &[])
+}
+
+fn spawn_client_process_with_args_and_env(
+    config_home: &PathBuf,
+    runtime_dir: &PathBuf,
+    api_socket_path: &PathBuf,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
 ) -> SpawnedHerdr {
     register_runtime_dir(runtime_dir);
     let pair = native_pty_system()
@@ -111,6 +135,9 @@ fn spawn_client_process_with_args(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -881,6 +908,120 @@ fn attach_thin_client_with_config(
     (spawned_server, thin_client, output)
 }
 
+#[test]
+fn client_shell_detaches_restores_and_freshly_reattaches_to_current_state() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let mut server = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+
+    let created = send_json_request(
+        &api_socket,
+        &serde_json::json!({
+            "id": "client-shell-lifecycle-workspace",
+            "method": "workspace.create",
+            "params": {"cwd": base, "focus": true, "label": "shell-lifecycle"},
+        })
+        .to_string(),
+    );
+    assert_eq!(created["result"]["type"], "workspace_created", "{created}");
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .expect("root pane id")
+        .to_string();
+    send_pane_shell_command(&api_socket, &pane_id, "printf 'SHELL_LIFECYCLE_INITIAL\\n'");
+
+    let mut client_a = spawn_client_shell_process(&config_home, &runtime_dir, &api_socket);
+    let output_a = spawn_pty_drain(
+        client_a
+            ._master
+            .as_ref()
+            .expect("first client shell PTY")
+            .try_clone_reader()
+            .expect("clone first client shell reader"),
+    );
+    assert!(
+        wait_until(Duration::from_secs(8), Duration::from_millis(20), || {
+            let output = read_output(&output_a);
+            output.contains("shell-lifecycle") && output.contains("SHELL_LIFECYCLE_INITIAL")
+        }),
+        "client shell should compose one coherent snapshot and pane surface; output: {:?}",
+        read_output(&output_a)
+    );
+
+    let detach_watermark = output_len(&output_a);
+    client_a
+        ._master
+        .as_ref()
+        .expect("first client shell PTY")
+        .take_writer()
+        .expect("first client shell writer")
+        .write_all(b"\x02q")
+        .expect("detach first client shell");
+    let detach_output = drain_until_client_exits(&mut client_a, &output_a, detach_watermark);
+    assert!(
+        output_has_mouse_teardown(&detach_output),
+        "client shell should restore the host terminal after detach; output: {detach_output:?}"
+    );
+    assert!(
+        ping_socket(&api_socket).contains("pong"),
+        "server should remain alive after client shell detach"
+    );
+    drop(client_a);
+
+    send_pane_shell_command(
+        &api_socket,
+        &pane_id,
+        "printf 'SHELL_LIFECYCLE_DETACHED\\n'",
+    );
+    let mut client_b = spawn_client_shell_process(&config_home, &runtime_dir, &api_socket);
+    let output_b = spawn_pty_drain(
+        client_b
+            ._master
+            .as_ref()
+            .expect("reattached client shell PTY")
+            .try_clone_reader()
+            .expect("clone reattached client shell reader"),
+    );
+    assert!(
+        wait_until(Duration::from_secs(8), Duration::from_millis(20), || {
+            let output = read_output(&output_b);
+            output.contains("shell-lifecycle") && output.contains("SHELL_LIFECYCLE_DETACHED")
+        }),
+        "fresh client shell should receive current state and detached-period output; output: {:?}",
+        read_output(&output_b)
+    );
+
+    let disconnect_watermark = output_len(&output_b);
+    if let Some(pid) = server.child.process_id() {
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+    server.close_master();
+    let disconnect_output =
+        drain_until_client_exits(&mut client_b, &output_b, disconnect_watermark);
+    assert!(
+        output_has_mouse_teardown(&disconnect_output),
+        "client shell should restore the host terminal after endpoint loss; output: {disconnect_output:?}"
+    );
+    assert!(
+        disconnect_output
+            .to_lowercase()
+            .contains("lost connection to server"),
+        "client shell should explain endpoint loss; output: {disconnect_output:?}"
+    );
+
+    drop(server);
+    cleanup_spawned_herdr(client_b, base);
+}
+
 fn captured_window_titles(output: &SharedOutput) -> Vec<String> {
     read_output(output)
         .split("\x1b]0;")
@@ -1424,7 +1565,25 @@ fn pane_spawn_cwd_fallback_in_server() {
         "fallback cwd should exist: {cwd}"
     );
 
-    cleanup_spawned_herdr(spawned, base);
+    let client_shell = spawn_client_shell_process(&config_home, &runtime_dir, &api_socket);
+    let output = spawn_pty_drain(
+        client_shell
+            ._master
+            .as_ref()
+            .expect("restored client shell PTY")
+            .try_clone_reader()
+            .expect("clone restored client shell reader"),
+    );
+    assert!(
+        wait_until(Duration::from_secs(8), Duration::from_millis(20), || {
+            read_output(&output).contains("missing-cwd")
+        }),
+        "client shell should render the restored session; output: {:?}",
+        read_output(&output)
+    );
+
+    drop(spawned);
+    cleanup_spawned_herdr(client_shell, base);
 }
 
 #[test]

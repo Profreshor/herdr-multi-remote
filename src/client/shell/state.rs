@@ -1018,24 +1018,31 @@ impl ClientShellState {
     }
 
     pub(crate) fn set_snapshot(&mut self, snapshot: Box<ClientShellSnapshot>) {
+        if self.snapshot.as_ref().is_some_and(|current| {
+            current.boot_id == snapshot.boot_id && snapshot.revision < current.revision
+        }) {
+            return;
+        }
         self.graphics.set_scope(&snapshot.boot_id);
         self.config_diagnostic = super::config::merged_config_diagnostic(
             self.local_config_diagnostic.as_deref(),
             snapshot.config_diagnostic.as_deref(),
         );
-        if self
-            .pane_surface
-            .as_ref()
-            .is_none_or(|surface| surface.projection_revision != snapshot.revision)
-        {
-            self.hits = ShellHitMap::default();
-        }
         let boot_changed = self
             .snapshot
             .as_ref()
             .is_some_and(|current| current.boot_id != snapshot.boot_id);
+        if boot_changed
+            || self
+                .pane_surface
+                .as_ref()
+                .is_none_or(|surface| surface.projection_revision != snapshot.revision)
+        {
+            self.hits = ShellHitMap::default();
+        }
         if boot_changed {
             self.pane_surface = None;
+            self.input_leases = ClientInputLeases::default();
             self.popup_terminal_id = None;
             self.chrome_drag = None;
             self.workspace_press = None;
@@ -1251,6 +1258,18 @@ impl ClientShellState {
     }
 
     pub(crate) fn set_pane_surface(&mut self, mut surface: PaneSurfaceFrame) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        if surface.boot_id != snapshot.boot_id
+            || surface.projection_revision < snapshot.revision
+            || self.pane_surface.as_ref().is_some_and(|current| {
+                current.boot_id == surface.boot_id
+                    && surface.projection_revision < current.projection_revision
+            })
+        {
+            return;
+        }
         if self
             .snapshot
             .as_ref()

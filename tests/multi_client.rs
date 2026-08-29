@@ -15,8 +15,10 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use serde::Deserialize;
 use serde_json::Value;
 use support::{
-    cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid,
-    unregister_spawned_herdr_pid, CURRENT_PROTOCOL,
+    cleanup_test_base, client_shell_handshake as support_client_shell_handshake,
+    drain_messages as drain_shell_messages, register_runtime_dir, register_spawned_herdr_pid,
+    unregister_spawned_herdr_pid, wait_for_client_shell_bootstrap, wait_for_message_variant,
+    CURRENT_PROTOCOL, SERVER_MESSAGE_PANE_SURFACE,
 };
 
 fn unique_test_dir() -> PathBuf {
@@ -767,6 +769,92 @@ fn agent_panel_starts_with(frame: &FrameWire, agent_label: &str) -> bool {
         .skip(1)
         .find(|line| line.contains("agent-"))
         .is_some_and(|line| line.contains(agent_label))
+}
+
+#[test]
+fn legacy_app_and_client_shell_receive_their_own_render_contracts() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+    let (_workspace_id, pane_id) =
+        create_workspace_and_root_pane(&api_socket, "mixed-render-contracts");
+
+    let mut legacy = connect_raw_client(&client_socket, 100, 30);
+    drain_server_messages(&mut legacy, Duration::from_millis(200));
+
+    let mut shell = UnixStream::connect(&client_socket).expect("connect client shell");
+    let (version, error) =
+        support_client_shell_handshake(&mut shell, CURRENT_PROTOCOL, 100, 30, 74, 29)
+            .expect("client shell handshake");
+    assert_eq!(version, CURRENT_PROTOCOL);
+    assert!(error.is_none(), "client shell handshake failed: {error:?}");
+    wait_for_client_shell_bootstrap(&mut shell, Duration::from_secs(5))
+        .expect("client shell should receive its snapshot before pane-only surface");
+
+    drain_server_messages(&mut legacy, Duration::from_millis(200));
+    drain_shell_messages(&mut shell);
+    pane_send_input(&api_socket, &pane_id, "printf 'MIXED_CLIENT_OUTPUT\\n'");
+    let (legacy_updated, frames) =
+        wait_for_frame_matching_with_snapshots(&mut legacy, Duration::from_secs(5), |frame| {
+            frame_contains_text(frame, "MIXED_CLIENT_OUTPUT")
+        })
+        .expect("read legacy App frames");
+    assert!(
+        legacy_updated,
+        "legacy App client should render pane output; recent frames: {frames:?}"
+    );
+    assert!(
+        wait_for_message_variant(
+            &mut shell,
+            Duration::from_secs(5),
+            SERVER_MESSAGE_PANE_SURFACE,
+        )
+        .unwrap(),
+        "client shell should keep receiving pane surfaces"
+    );
+
+    let server_log = server_log_path(&config_home);
+    let detaches_before = count_log_occurrences(&server_log, "client detached");
+    send_client_detach(&mut shell);
+    assert!(
+        wait_for_log_occurrence_count(
+            &server_log,
+            "client detached",
+            detaches_before + 1,
+            Duration::from_secs(5),
+        ),
+        "server did not process client shell detach; log tail:\n{}",
+        log_tail(&server_log, 40)
+    );
+    drop(shell);
+    assert!(
+        ping_socket(&api_socket).contains("pong"),
+        "detaching the client shell must not affect the server or legacy client"
+    );
+    drain_server_messages(&mut legacy, Duration::from_millis(200));
+    pane_send_input(
+        &api_socket,
+        &pane_id,
+        "printf 'LEGACY_AFTER_SHELL_DETACH\\n'",
+    );
+    let (legacy_remained_live, frames) =
+        wait_for_frame_matching_with_snapshots(&mut legacy, Duration::from_secs(5), |frame| {
+            frame_contains_text(frame, "LEGACY_AFTER_SHELL_DETACH")
+        })
+        .expect("read legacy App frames after shell detach");
+    assert!(
+        legacy_remained_live,
+        "legacy client should remain live after client shell detaches; recent frames: {frames:?}"
+    );
+
+    cleanup_spawned_herdr(spawned, base);
 }
 
 #[test]

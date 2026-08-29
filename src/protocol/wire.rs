@@ -1072,6 +1072,8 @@ pub struct SurfaceGraphicsScene {
 /// One server-rendered active-tab surface without sidebar, tab bar, or overlays.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSurfaceFrame {
+    /// Endpoint process identity that produced this surface.
+    pub boot_id: String,
     /// Projection revision whose focused IDs and topology produced this surface.
     pub projection_revision: u64,
     pub frame: FrameData,

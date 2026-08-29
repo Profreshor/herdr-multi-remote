@@ -16,6 +16,9 @@ static CLEANUP_GUARD: OnceLock<CleanupGuard> = OnceLock::new();
 const WATCHDOG_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_OWNER_MARKER: &str = ".herdr-test-owner-pid";
 pub const CURRENT_PROTOCOL: u32 = 21;
+pub const SERVER_MESSAGE_CLIENT_SHELL_SNAPSHOT: u32 = 15;
+pub const SERVER_MESSAGE_PANE_SURFACE: u32 = 16;
+const CLIENT_MESSAGE_CLIENT_SHELL_HELLO: u32 = 13;
 
 pub fn register_spawned_herdr_pid(pid: Option<u32>) {
     let Some(pid) = pid else {
@@ -220,16 +223,35 @@ fn decode_welcome(payload: &[u8]) -> Result<(u32, Option<String>), String> {
     Ok((version, error))
 }
 
+fn finish_handshake(
+    stream: &mut UnixStream,
+    hello_payload: &[u8],
+) -> Result<(u32, Option<String>), String> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
+    stream
+        .write_all(&frame_message(hello_payload))
+        .map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())?;
+
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).map_err(|e| e.to_string())?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > 2 * 1024 * 1024 {
+        return Err(format!("oversized response: {len}"));
+    }
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
+    decode_welcome(&payload)
+}
+
 pub fn client_handshake(
     stream: &mut UnixStream,
     version: u32,
     cols: u16,
     rows: u16,
 ) -> Result<(u32, Option<String>), String> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| e.to_string())?;
-
     let hello_payload = encode_varint_enum(
         0,
         &[
@@ -243,20 +265,33 @@ pub fn client_handshake(
             &encode_varint_u32(0),  // ClientLaunchMode::App
         ],
     );
-    let framed = frame_message(&hello_payload);
-    stream.write_all(&framed).map_err(|e| e.to_string())?;
-    stream.flush().map_err(|e| e.to_string())?;
+    finish_handshake(stream, &hello_payload)
+}
 
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).map_err(|e| e.to_string())?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > 2 * 1024 * 1024 {
-        return Err(format!("oversized response: {len}"));
-    }
-
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
-    decode_welcome(&payload)
+pub fn client_shell_handshake(
+    stream: &mut UnixStream,
+    version: u32,
+    cols: u16,
+    rows: u16,
+    surface_cols: u16,
+    surface_rows: u16,
+) -> Result<(u32, Option<String>), String> {
+    let hello_payload = encode_varint_enum(
+        CLIENT_MESSAGE_CLIENT_SHELL_HELLO,
+        &[
+            &encode_varint_u32(version),
+            &encode_varint_u16(cols),
+            &encode_varint_u16(rows),
+            &encode_varint_u32(8),
+            &encode_varint_u32(16),
+            &encode_varint_u32(0),
+            &encode_varint_u16(surface_cols),
+            &encode_varint_u16(surface_rows),
+            &[0],
+            &[0],
+        ],
+    );
+    finish_handshake(stream, &hello_payload)
 }
 
 pub fn read_server_message(stream: &mut UnixStream) -> Result<(u32, Vec<u8>), String> {
@@ -342,6 +377,35 @@ pub fn wait_for_message_variant(
         }
     }
     Ok(false)
+}
+
+pub fn wait_for_client_shell_bootstrap(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + timeout;
+    let mut saw_snapshot = false;
+    while Instant::now() < deadline {
+        match read_server_message(stream) {
+            Ok((SERVER_MESSAGE_CLIENT_SHELL_SNAPSHOT, _)) => saw_snapshot = true,
+            Ok((SERVER_MESSAGE_PANE_SURFACE, _)) if saw_snapshot => return Ok(()),
+            Ok((SERVER_MESSAGE_PANE_SURFACE, _)) => {
+                return Err("client shell pane surface arrived before its snapshot".into());
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    Err(format!(
+        "timed out waiting for client shell {}",
+        if saw_snapshot {
+            "pane surface"
+        } else {
+            "snapshot"
+        }
+    ))
 }
 
 pub fn wait_for_disconnect(stream: &mut UnixStream, timeout: Duration) -> Result<bool, String> {

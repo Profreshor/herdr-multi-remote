@@ -357,6 +357,7 @@ mod tests {
     fn surface() -> PaneSurfaceFrame {
         let surface_buffer = Buffer::with_lines(["LIVE", "PANE"]);
         PaneSurfaceFrame {
+            boot_id: "boot-1".into(),
             projection_revision: 1,
             frame: FrameData::from_ratatui_buffer_with_hyperlinks(
                 &surface_buffer,
@@ -1490,8 +1491,7 @@ mod tests {
 
     #[test]
     fn shell_refuses_mismatched_projection_and_clears_stale_hits_in_either_order() {
-        let config = ClientShellConfig::from_config(&Config::default());
-        let mut state = ClientShellState::new(config);
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
         state.set_snapshot(Box::new(snapshot()));
         state.set_pane_surface(surface());
         state.compose(106, 20).expect("initial frame");
@@ -1503,14 +1503,83 @@ mod tests {
         assert!(state.hits.panes.is_empty());
         assert!(state.compose(106, 20).is_none());
 
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
         state.set_snapshot(Box::new(snapshot()));
         state.set_pane_surface(surface());
-        state.compose(106, 20).expect("restored frame");
+        state.compose(106, 20).expect("initial frame");
         let mut replacement_surface = surface();
         replacement_surface.projection_revision = 2;
         state.set_pane_surface(replacement_surface);
         assert!(state.hits.panes.is_empty());
         assert!(state.compose(106, 20).is_none());
+    }
+
+    #[test]
+    fn shell_ignores_older_same_boot_snapshot_and_surface() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        let mut current_snapshot = snapshot();
+        current_snapshot.revision = 2;
+        current_snapshot.workspaces[0].label = "current".into();
+        state.set_snapshot(Box::new(current_snapshot));
+        let mut current_surface = surface();
+        current_surface.projection_revision = 2;
+        current_surface.frame.cells[0].symbol = "N".into();
+        state.set_pane_surface(current_surface);
+        state.compose(106, 20).expect("current shell");
+        assert!(!state.hits.panes.is_empty());
+        let held_key = crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty());
+        assert!(matches!(
+            &state
+                .handle_raw_events(vec![RawInputEvent::Key(held_key.clone())])
+                .requests[..],
+            [ClientMessage::ClientShellPaneInput { .. }]
+        ));
+
+        let mut stale_snapshot = snapshot();
+        stale_snapshot.workspaces[0].label = "stale".into();
+        state.set_snapshot(Box::new(stale_snapshot));
+        let mut stale_surface = surface();
+        stale_surface.frame.cells[0].symbol = "O".into();
+        state.set_pane_surface(stale_surface);
+
+        let installed_snapshot = state.snapshot.as_deref().expect("current snapshot");
+        assert_eq!(installed_snapshot.revision, 2);
+        assert_eq!(installed_snapshot.workspaces[0].label, "current");
+        let installed_surface = state.pane_surface.as_ref().expect("current pane surface");
+        assert_eq!(installed_surface.projection_revision, 2);
+        assert_eq!(installed_surface.frame.cells[0].symbol, "N");
+
+        let mut ahead_surface = surface();
+        ahead_surface.projection_revision = 4;
+        ahead_surface.frame.cells[0].symbol = "A".into();
+        state.set_pane_surface(ahead_surface);
+        let mut delayed_surface = surface();
+        delayed_surface.projection_revision = 3;
+        delayed_surface.frame.cells[0].symbol = "D".into();
+        state.set_pane_surface(delayed_surface);
+        let installed_surface = state.pane_surface.as_ref().expect("newest pane surface");
+        assert_eq!(installed_surface.projection_revision, 4);
+        assert_eq!(installed_surface.frame.cells[0].symbol, "A");
+
+        let mut replacement_boot = snapshot();
+        replacement_boot.boot_id = "boot-2".into();
+        state.set_snapshot(Box::new(replacement_boot));
+        assert!(state.pane_surface.is_none());
+        assert!(state.hits.panes.is_empty());
+        let release = state.handle_raw_events(vec![RawInputEvent::Key(
+            held_key.with_kind(crossterm::event::KeyEventKind::Release),
+        )]);
+        assert!(
+            release.requests.is_empty(),
+            "boot replacement must discard held input leases"
+        );
+        let mut prior_boot_surface = surface();
+        prior_boot_surface.projection_revision = u64::MAX;
+        state.set_pane_surface(prior_boot_surface);
+        assert!(
+            state.pane_surface.is_none(),
+            "an old endpoint surface must not cross the boot boundary"
+        );
     }
 
     #[test]
@@ -4244,6 +4313,7 @@ detach = "prefix+x"
             .preview = false;
         state.set_snapshot(Box::new(endpoint_snapshot));
         let mut installed_surface = surface();
+        installed_surface.boot_id = "boot-2".into();
         installed_surface.projection_revision = 2;
         state.set_pane_surface(installed_surface);
         state.compose(106, 30).expect("installed shell");

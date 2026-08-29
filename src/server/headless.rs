@@ -5118,6 +5118,7 @@ impl HeadlessServer {
                 client
                     .render_state
                     .prepare_pane_surface(protocol::PaneSurfaceFrame {
+                        boot_id: self.client_shell_boot_id.clone(),
                         projection_revision: shell_projection_revision,
                         frame,
                         panes,
