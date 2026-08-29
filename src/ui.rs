@@ -56,11 +56,11 @@ pub(crate) use self::sidebar::agent_panel_entries_from;
 #[cfg(test)]
 pub(crate) use self::sidebar::workspace_drop_indicator_row;
 use self::sidebar::{render_sidebar, render_sidebar_collapsed};
-pub(crate) use self::status::render_copy_feedback_buffer;
 use self::status::{
     copy_feedback_rect, render_config_diagnostic, render_copy_feedback, render_toast_notification,
     toast_notification_rect,
 };
+pub(crate) use self::status::{render_config_diagnostic_buffer, render_copy_feedback_buffer};
 pub(crate) use self::tab_surface::{
     compute_tab_surface, render_tab_surface, resize_tab_surface, TabSurfaceLayout,
 };
@@ -550,7 +550,7 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
     }
 }
 
-fn copy_feedback_offset_for_toast(
+pub(crate) fn copy_feedback_offset_for_toast(
     area: Rect,
     feedback: &crate::app::state::CopyFeedback,
     base_offset: u16,

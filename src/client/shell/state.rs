@@ -37,6 +37,7 @@ pub(crate) struct ClientShellConfig {
     pub(super) worktree_directory: std::path::PathBuf,
     pub(super) preferences_path: Option<std::path::PathBuf>,
     pub(super) preferences: preferences::ClientChromePreferences,
+    pub(super) startup_config_diagnostic: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -766,6 +767,8 @@ pub(crate) struct ClientShellState {
     pub(super) pending_notifications: Vec<ClientPendingNotification>,
     pub(super) visible_notification: Option<ClientVisibleNotification>,
     pub(super) outer_focused: Option<bool>,
+    pub(super) local_config_diagnostic: Option<String>,
+    pub(super) config_diagnostic: Option<String>,
     pub(super) endpoint_error: Option<String>,
 }
 
@@ -779,6 +782,7 @@ pub(super) struct WorkspaceEntry {
 impl ClientShellState {
     pub(crate) fn new(mut config: ClientShellConfig) -> Self {
         let preferences = config.preferences;
+        let local_config_diagnostic = config.startup_config_diagnostic.take();
         let sidebar_collapsed = preferences
             .sidebar_collapsed
             .unwrap_or(config.sidebar_start_collapsed);
@@ -855,6 +859,8 @@ impl ClientShellState {
             pending_notifications: Vec::new(),
             visible_notification: None,
             outer_focused: None,
+            config_diagnostic: local_config_diagnostic.clone(),
+            local_config_diagnostic,
             endpoint_error: None,
         }
     }
@@ -891,6 +897,10 @@ impl ClientShellState {
     }
 
     pub(crate) fn set_snapshot(&mut self, snapshot: Box<ClientShellSnapshot>) {
+        self.config_diagnostic = super::config::merged_config_diagnostic(
+            self.local_config_diagnostic.as_deref(),
+            snapshot.config_diagnostic.as_deref(),
+        );
         if self
             .pane_surface
             .as_ref()

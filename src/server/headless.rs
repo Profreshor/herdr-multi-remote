@@ -3293,6 +3293,7 @@ impl HeadlessServer {
                     &self.app,
                     &self.client_shell_boot_id,
                     connection.shell_projection_revision,
+                    self.server_config_diagnostic_without_keybindings.as_deref(),
                 );
                 connection.shell_snapshot = Some(snapshot.clone());
                 self.clients.insert(client_id, connection);
@@ -4862,7 +4863,14 @@ impl HeadlessServer {
         let shell_snapshot_template = render_targets
             .iter()
             .any(|(_, _, _, _, mode)| matches!(mode, ClientConnectionMode::ClientShell))
-            .then(|| client_shell_snapshot(&self.app, &self.client_shell_boot_id, 0));
+            .then(|| {
+                client_shell_snapshot(
+                    &self.app,
+                    &self.client_shell_boot_id,
+                    0,
+                    self.server_config_diagnostic_without_keybindings.as_deref(),
+                )
+            });
         let mut broken_clients: Vec<u64> = Vec::new();
         let mut deferred_frame = false;
         for (client_id, (cols, rows), cell_size, is_foreground, mode) in render_targets {
@@ -5529,6 +5537,10 @@ fn server_config_diagnostic_summaries(diagnostics: &[String]) -> (Option<String>
 }
 
 fn is_keybinding_config_diagnostic(diagnostic: &str) -> bool {
+    if diagnostic.starts_with("config parse error:") || diagnostic.starts_with("config read error:")
+    {
+        return false;
+    }
     diagnostic.contains("keybinding") || diagnostic.contains("keys.")
 }
 
@@ -6510,6 +6522,8 @@ mod tests {
         server.app.state.active = Some(0);
         server.app.state.selected = 0;
         server.app.state.mode = crate::app::Mode::Terminal;
+        server.server_config_diagnostic_without_keybindings =
+            Some("endpoint config warning".into());
 
         let (writer, control_rx, render_rx) = test_client_writer();
         assert!(
@@ -6527,6 +6541,10 @@ mod tests {
             ServerMessage::ClientShellSnapshot(snapshot) => {
                 assert_eq!(snapshot.workspaces.len(), 1);
                 assert_eq!(snapshot.workspaces[0].label, "shell-only-label");
+                assert_eq!(
+                    snapshot.config_diagnostic.as_deref(),
+                    Some("endpoint config warning")
+                );
             }
             other => panic!("expected client shell snapshot, got {other:?}"),
         }
@@ -7083,6 +7101,19 @@ new_tab = "prefix+t"
             .bindings
             .iter()
             .any(|binding| binding.label == "prefix+c"));
+    }
+
+    #[test]
+    fn server_keybinding_filter_keeps_whole_config_failures() {
+        assert!(!is_keybinding_config_diagnostic(
+            "config parse error: invalid value at `keys.new_tab = @`; using defaults"
+        ));
+        assert!(!is_keybinding_config_diagnostic(
+            "config read error: permission denied at keys.toml; using defaults"
+        ));
+        assert!(is_keybinding_config_diagnostic(
+            "unsafe direct keybinding: keys.close_pane would intercept typing"
+        ));
     }
 
     #[test]

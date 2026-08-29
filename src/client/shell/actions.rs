@@ -548,13 +548,6 @@ impl ClientShellState {
             }
             PendingEndpointKind::ReloadConfig => {
                 let repaint = match result {
-                    Ok(crate::api::schema::ResponseResult::ConfigReload {
-                        diagnostics, ..
-                    }) if !diagnostics.is_empty() => {
-                        self.endpoint_error =
-                            crate::config::config_diagnostic_summary(&diagnostics);
-                        true
-                    }
                     Ok(crate::api::schema::ResponseResult::ConfigReload { .. }) => false,
                     Ok(_) => {
                         self.endpoint_error =

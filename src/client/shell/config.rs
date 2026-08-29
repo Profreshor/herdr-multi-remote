@@ -1,6 +1,31 @@
 use super::*;
 
+pub(super) fn merged_config_diagnostic(
+    local: Option<&str>,
+    endpoint: Option<&str>,
+) -> Option<String> {
+    match (local, endpoint) {
+        (Some(local), Some(endpoint)) if local == endpoint => {
+            Some(format!("client + endpoint: {local}"))
+        }
+        (Some(local), Some(endpoint)) => Some(format!("client: {local}\nendpoint: {endpoint}")),
+        (Some(local), None) => Some(local.to_owned()),
+        (None, Some(endpoint)) => Some(endpoint.to_owned()),
+        (None, None) => None,
+    }
+}
+
 impl ClientShellState {
+    fn set_local_config_diagnostic(&mut self, diagnostic: Option<String>) {
+        self.local_config_diagnostic = diagnostic;
+        self.config_diagnostic = merged_config_diagnostic(
+            self.local_config_diagnostic.as_deref(),
+            self.snapshot
+                .as_deref()
+                .and_then(|snapshot| snapshot.config_diagnostic.as_deref()),
+        );
+    }
+
     pub(super) fn persist_chrome_preferences(&mut self, outcome: &mut ClientShellInput) {
         let Some(path) = self.config.preferences_path.as_deref() else {
             return;
@@ -38,10 +63,14 @@ impl ClientShellState {
                 if self.agent_panel_sort_manual {
                     self.config.agent_panel_sort = agent_panel_sort;
                 }
-                self.endpoint_error = crate::config::config_diagnostic_summary(&diagnostics);
+                self.set_local_config_diagnostic(crate::config::config_diagnostic_summary(
+                    &diagnostics,
+                ));
             }
             Err(diagnostics) => {
-                self.endpoint_error = crate::config::config_diagnostic_summary(&diagnostics);
+                self.set_local_config_diagnostic(crate::config::config_diagnostic_summary(
+                    &diagnostics,
+                ));
             }
         }
     }
@@ -91,7 +120,13 @@ impl ClientShellConfig {
             ),
             preferences_path: None,
             preferences: preferences::ClientChromePreferences::default(),
+            startup_config_diagnostic: None,
         }
+    }
+
+    pub(crate) fn with_startup_config_diagnostic(mut self, diagnostic: Option<String>) -> Self {
+        self.startup_config_diagnostic = diagnostic;
+        self
     }
 
     pub(crate) fn with_local_endpoint(self, socket_path: &std::path::Path) -> Self {
@@ -133,6 +168,7 @@ impl ClientShellConfig {
                 diagnostics.push(format!("{diagnostic}; keeping previous [ui] settings"));
             } else {
                 let ui = &config.ui;
+                diagnostics.extend(ui.sound.diagnostics());
                 self.sidebar_width = ui.sidebar_width;
                 self.sidebar_min_width = ui.sidebar_min_width;
                 self.sidebar_max_width = ui.sidebar_max_width;

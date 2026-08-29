@@ -796,6 +796,8 @@ pub struct ClientShellSnapshot {
     pub boot_id: String,
     /// Monotonic replacement revision within one endpoint boot.
     pub revision: u64,
+    /// Endpoint startup/reload config warning, filtered for client-owned keybindings.
+    pub config_diagnostic: Option<String>,
     pub focused_workspace_id: Option<String>,
     pub focused_tab_id: Option<String>,
     pub focused_pane_id: Option<String>,
@@ -1916,6 +1918,7 @@ mod tests {
         let msg = ServerMessage::ClientShellSnapshot(Box::new(ClientShellSnapshot {
             boot_id: "boot-1".into(),
             revision: 1,
+            config_diagnostic: Some("endpoint config warning".into()),
             focused_workspace_id: Some("w1".into()),
             focused_tab_id: Some("w1:t1".into()),
             focused_pane_id: Some("w1:p1".into()),

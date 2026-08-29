@@ -1,5 +1,23 @@
 use super::*;
 
+fn diagnostic_overlap_rows(diagnostic_area: Rect, target: Rect, rendered_rows: u16) -> u16 {
+    let diagnostic_bottom = diagnostic_area
+        .y
+        .saturating_add(rendered_rows.min(diagnostic_area.height));
+    diagnostic_bottom
+        .min(target.bottom())
+        .saturating_sub(diagnostic_area.y.max(target.y))
+}
+
+fn clipboard_feedback_starts_at_top(position: crate::config::ToastClipboardPosition) -> bool {
+    matches!(
+        position,
+        crate::config::ToastClipboardPosition::TopLeft
+            | crate::config::ToastClipboardPosition::TopCenter
+            | crate::config::ToastClipboardPosition::TopRight
+    )
+}
+
 impl ClientShellState {
     pub(crate) fn compose(&mut self, cols: u16, rows: u16) -> Option<FrameData> {
         let snapshot = self.snapshot.as_deref()?;
@@ -246,26 +264,58 @@ impl ClientShellState {
             }
         }
         self.hits.notification_toast = Rect::default();
-        if let Some(notification) = self.visible_notification.as_ref() {
+        let mut diagnostic_pane_overlap = 0;
+        if self.config_diagnostic.is_some() || self.visible_notification.is_some() {
             let cursor = frame.cursor.clone();
             let mut composed = frame.to_ratatui_buffer()?;
-            self.hits.notification_toast = notifications::render_visible_notification(
-                &mut composed,
-                layout.pane_surface,
-                notification,
-                self.config.toast_position,
-                &self.config.palette,
-            );
+            if let Some(diagnostic) = self.config_diagnostic.as_deref() {
+                let diagnostic_area = if layout.mobile_header.is_empty() {
+                    Rect::new(0, 0, cols, rows)
+                } else {
+                    layout.pane_surface
+                };
+                let rendered_rows = crate::ui::render_config_diagnostic_buffer(
+                    &mut composed,
+                    diagnostic_area,
+                    diagnostic,
+                    &self.config.palette,
+                );
+                diagnostic_pane_overlap =
+                    diagnostic_overlap_rows(diagnostic_area, layout.pane_surface, rendered_rows);
+            }
+            if let Some(notification) = self.visible_notification.as_ref() {
+                self.hits.notification_toast = notifications::render_visible_notification(
+                    &mut composed,
+                    layout.pane_surface,
+                    notification,
+                    self.config.toast_position,
+                    diagnostic_pane_overlap,
+                    &self.config.palette,
+                );
+            }
             frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
         }
         if let Some(feedback) = self.copy_feedback.as_ref() {
             let cursor = frame.cursor.clone();
             let mut composed = frame.to_ratatui_buffer()?;
+            let base_offset =
+                if clipboard_feedback_starts_at_top(self.config.clipboard_toast_position) {
+                    diagnostic_pane_overlap
+                } else {
+                    0
+                };
+            let offset = crate::ui::copy_feedback_offset_for_toast(
+                layout.pane_surface,
+                feedback,
+                base_offset,
+                self.config.clipboard_toast_position,
+                self.hits.notification_toast,
+            );
             crate::ui::render_copy_feedback_buffer(
                 &mut composed,
                 layout.pane_surface,
                 feedback,
-                0,
+                offset,
                 self.config.clipboard_toast_position,
                 &self.config.palette,
             );

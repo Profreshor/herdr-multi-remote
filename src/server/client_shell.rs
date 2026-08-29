@@ -7,6 +7,7 @@ pub(super) fn snapshot(
     app: &app::App,
     boot_id: &str,
     revision: u64,
+    config_diagnostic: Option<&str>,
 ) -> protocol::ClientShellSnapshot {
     let snapshot = app.session_snapshot();
     let workspaces = snapshot
@@ -148,6 +149,7 @@ pub(super) fn snapshot(
     protocol::ClientShellSnapshot {
         boot_id: boot_id.to_owned(),
         revision,
+        config_diagnostic: config_diagnostic.map(str::to_owned),
         focused_workspace_id: snapshot.focused_workspace_id,
         focused_tab_id: snapshot.focused_tab_id,
         focused_pane_id: snapshot.focused_pane_id,

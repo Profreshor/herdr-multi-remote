@@ -9,6 +9,7 @@ pub(super) fn render_visible_notification(
     area: Rect,
     notification: &ClientVisibleNotification,
     default_position: crate::config::ToastHerdrPosition,
+    top_offset: u16,
     palette: &Palette,
 ) -> Rect {
     if area.is_empty() {
@@ -32,7 +33,9 @@ pub(super) fn render_visible_notification(
     };
     let y = match position {
         crate::config::ToastHerdrPosition::TopLeft
-        | crate::config::ToastHerdrPosition::TopRight => area.y,
+        | crate::config::ToastHerdrPosition::TopRight => area
+            .y
+            .saturating_add(top_offset.min(area.height.saturating_sub(height))),
         crate::config::ToastHerdrPosition::BottomLeft
         | crate::config::ToastHerdrPosition::BottomRight => area.bottom().saturating_sub(height),
     };

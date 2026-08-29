@@ -277,6 +277,7 @@ mod tests {
         ClientShellSnapshot {
             boot_id: "boot-1".into(),
             revision: 1,
+            config_diagnostic: None,
             focused_workspace_id: Some("ws_1".into()),
             focused_tab_id: Some("tab_1".into()),
             focused_pane_id: Some("pane_1".into()),
@@ -487,6 +488,124 @@ mod tests {
             frame.cursor.as_ref().map(|cursor| (cursor.x, cursor.y)),
             Some((27, 2))
         );
+    }
+
+    #[test]
+    fn startup_config_diagnostics_are_client_rendered_and_persist_until_replaced() {
+        let config = ClientShellConfig::from_config(&Config::default())
+            .with_startup_config_diagnostic(Some("local config warning".into()));
+        let mut state = ClientShellState::new(config);
+        let mut shared_snapshot = snapshot();
+        shared_snapshot.config_diagnostic = Some("local config warning".into());
+        state.set_snapshot(Box::new(shared_snapshot));
+        assert_eq!(
+            state.config_diagnostic.as_deref(),
+            Some("client + endpoint: local config warning")
+        );
+
+        let mut endpoint_snapshot = snapshot();
+        endpoint_snapshot.config_diagnostic = Some("endpoint config warning".into());
+        state.set_snapshot(Box::new(endpoint_snapshot));
+        state.set_pane_surface(surface());
+
+        let frame = state.compose(106, 20).expect("diagnostic frame");
+        let text = frame
+            .cells
+            .chunks(frame.width as usize)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("client: local config warning"));
+        assert!(text.contains("endpoint: endpoint config warning"));
+
+        state.handle_input_bytes(b"x");
+        assert!(state.config_diagnostic.is_some());
+
+        state.set_snapshot(Box::new(snapshot()));
+        assert_eq!(
+            state.config_diagnostic.as_deref(),
+            Some("local config warning")
+        );
+    }
+
+    #[test]
+    fn config_diagnostic_offsets_only_the_pane_rows_it_overlaps() {
+        let mut config = ClientShellConfig::from_config(&Config::default());
+        config.toast_delay_seconds = 0;
+        let mut state = ClientShellState::new(config);
+        let mut endpoint_snapshot = snapshot();
+        endpoint_snapshot.config_diagnostic = Some("one-line warning".into());
+        state.set_snapshot(Box::new(endpoint_snapshot));
+        state.set_pane_surface(surface());
+        state.visible_notification = Some(ClientVisibleNotification {
+            event: SemanticNotification {
+                kind: SemanticNotificationKind::Custom,
+                title: "notification".into(),
+                body: None,
+                sound: None,
+                agent: None,
+                workspace_id: None,
+                tab_id: None,
+                pane_id: None,
+                position: Some(crate::config::ToastHerdrPosition::TopRight),
+            },
+            deadline: std::time::Instant::now(),
+        });
+
+        state.compose(106, 20).expect("one-line frame");
+        let pane_area = state.layout(106, 20).pane_surface;
+        assert_eq!(state.hits.notification_toast.y, pane_area.y);
+
+        let mut endpoint_snapshot = snapshot();
+        endpoint_snapshot.config_diagnostic = Some("first warning\nsecond warning".into());
+        state.set_snapshot(Box::new(endpoint_snapshot));
+        state.compose(106, 20).expect("two-line frame");
+        assert_eq!(state.hits.notification_toast.y, pane_area.y + 1);
+    }
+
+    #[test]
+    fn endpoint_reload_result_does_not_override_snapshot_diagnostic_authority() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        let mut endpoint_snapshot = snapshot();
+        endpoint_snapshot.config_diagnostic = Some("endpoint warning".into());
+        state.set_snapshot(Box::new(endpoint_snapshot));
+        state.pending_requests.insert(
+            "reload-1".into(),
+            PendingEndpointRequest {
+                boot_id: "boot-1".into(),
+                confirmation_workspace_id: None,
+                kind: PendingEndpointKind::ReloadConfig,
+            },
+        );
+
+        state.handle_endpoint_result(
+            "boot-1",
+            "reload-1",
+            Ok(crate::api::schema::ResponseResult::ConfigReload {
+                status: crate::config::ConfigReloadStatus::Partial,
+                diagnostics: vec!["keybinding warning".into()],
+            }),
+        );
+        assert_eq!(state.config_diagnostic.as_deref(), Some("endpoint warning"));
+
+        state.set_snapshot(Box::new(snapshot()));
+        assert!(state.config_diagnostic.is_none());
+    }
+
+    #[test]
+    fn live_client_config_keeps_sound_diagnostics() {
+        let mut shell_config = ClientShellConfig::from_config(&Config::default());
+        let mut config = Config::default();
+        config.ui.sound.path = Some(std::path::PathBuf::from("invalid.wav"));
+
+        let diagnostics = shell_config.apply_live_config(&config, &[], &[]);
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("expected an mp3 file")));
     }
 
     #[test]

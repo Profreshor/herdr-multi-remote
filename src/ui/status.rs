@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Widget},
     Frame,
 };
 
@@ -180,10 +180,20 @@ pub(crate) fn render_copy_feedback_buffer(
 }
 
 pub(super) fn render_config_diagnostic(frame: &mut Frame, area: Rect, message: &str, p: &Palette) {
+    render_config_diagnostic_buffer(frame.buffer_mut(), area, message, p);
+}
+
+pub(crate) fn render_config_diagnostic_buffer(
+    buffer: &mut Buffer,
+    area: Rect,
+    message: &str,
+    p: &Palette,
+) -> u16 {
     let style = Style::default()
         .fg(panel_contrast_fg(p))
         .bg(p.yellow)
         .add_modifier(Modifier::BOLD);
+    let mut rendered_rows = 0u16;
 
     for (row, line) in message
         .lines()
@@ -193,16 +203,19 @@ pub(super) fn render_config_diagnostic(frame: &mut Frame, area: Rect, message: &
     {
         let text = format!(" {line} ");
         let width = (text.len() as u16).min(area.width);
-        let notif_area = Rect::new(
+        let diagnostic_area = Rect::new(
             area.x + area.width.saturating_sub(width),
             area.y + row as u16,
             width,
             1,
         );
 
-        frame.render_widget(Clear, notif_area);
-        frame.render_widget(Paragraph::new(Span::styled(text, style)), notif_area);
+        Clear.render(diagnostic_area, buffer);
+        Paragraph::new(Span::styled(text, style)).render(diagnostic_area, buffer);
+        rendered_rows = rendered_rows.saturating_add(1);
     }
+
+    rendered_rows
 }
 
 pub(super) fn state_icon_symbol(

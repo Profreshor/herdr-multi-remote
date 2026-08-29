@@ -1287,6 +1287,9 @@ fn run_client_with_mode(
     let socket_path = client_socket_path();
     let shell_config = client_rendered_shell.then(|| {
         shell::ClientShellConfig::from_config(&loaded_config.config)
+            .with_startup_config_diagnostic(crate::config::config_diagnostic_summary(
+                &loaded_config.diagnostics,
+            ))
             .with_local_endpoint(&socket_path)
     });
     let mouse_capture = loaded_config.config.ui.mouse_capture;
