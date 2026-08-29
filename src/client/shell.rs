@@ -4837,6 +4837,44 @@ detach = "prefix+x"
     }
 
     #[test]
+    fn generic_endpoint_failures_and_control_errors_are_visible() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        let mut outcome = ClientShellInput::default();
+        state.push_endpoint_method(
+            crate::api::schema::Method::WorkspaceFocus(crate::api::schema::WorkspaceTarget {
+                workspace_id: "missing".into(),
+            }),
+            &mut outcome,
+        );
+        let request_id = match &outcome.actions[..] {
+            [ClientShellAction::Endpoint { request, .. }] => request.id.clone(),
+            other => panic!("expected generic endpoint request, got {other:?}"),
+        };
+        let (repaint, actions) = state.handle_endpoint_result(
+            "boot-1",
+            &request_id,
+            Err(ClientShellEndpointError {
+                code: Some("not_found".into()),
+                message: "workspace no longer exists".into(),
+            }),
+        );
+        assert!(repaint);
+        assert!(actions.is_empty());
+        assert_eq!(
+            state.endpoint_error.as_deref(),
+            Some("workspace no longer exists")
+        );
+
+        assert!(state.receive_endpoint_error("Paste rejected: too large".into()));
+        assert_eq!(
+            state.endpoint_error.as_deref(),
+            Some("Paste rejected: too large")
+        );
+        assert!(!state.receive_endpoint_error("Paste rejected: too large".into()));
+    }
+
+    #[test]
     fn custom_binding_missing_from_endpoint_manifest_is_not_forwarded() {
         let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
         state.set_snapshot(Box::new(snapshot()));

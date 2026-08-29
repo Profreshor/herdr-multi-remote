@@ -3469,16 +3469,22 @@ impl HeadlessServer {
                 size,
                 max,
             } => {
-                self.send_to_client(
-                    client_id,
+                let detail = format!("Input message is {size} bytes; Herdr's limit is {max} bytes");
+                let message = if matches!(
+                    self.clients.get(&client_id).map(|client| &client.mode),
+                    Some(ClientConnectionMode::ClientShell)
+                ) {
+                    ServerMessage::ClientShellError {
+                        message: format!("Paste rejected: {detail}"),
+                    }
+                } else {
                     ServerMessage::Notify {
                         kind: protocol::NotifyKind::Toast,
                         message: "Paste rejected".to_owned(),
-                        body: Some(format!(
-                            "Input message is {size} bytes; Herdr's limit is {max} bytes"
-                        )),
-                    },
-                );
+                        body: Some(detail),
+                    }
+                };
+                self.send_to_client(client_id, message);
                 false
             }
             ServerEvent::ClientClipboardImage {
@@ -3708,6 +3714,113 @@ impl HeadlessServer {
                 }
                 true
             }
+            ServerEvent::ClientShellEndpointRequest {
+                client_id,
+                boot_id,
+                request,
+            } => {
+                let Some(client) = self.clients.get(&client_id) else {
+                    return false;
+                };
+                if !matches!(client.mode, ClientConnectionMode::ClientShell) {
+                    self.remove_client_and_resize_if_needed(client_id);
+                    return true;
+                }
+                let request_id = request.id.clone();
+                if !crate::server::client_commands::supports_client_shell_method(&request.method) {
+                    let message = crate::server::client_commands::error_message(
+                        boot_id,
+                        request_id,
+                        "unsupported_endpoint_command",
+                        "this method is not available through the client shell command lane",
+                    );
+                    self.send_to_client(client_id, message);
+                    return false;
+                }
+                if boot_id != self.client_shell_boot_id {
+                    let message = crate::server::client_commands::error_message(
+                        boot_id,
+                        request_id,
+                        "stale_boot",
+                        "endpoint command targeted an earlier server boot",
+                    );
+                    self.send_to_client(client_id, message);
+                    return false;
+                }
+                if client.shell_endpoint_command_in_flight {
+                    self.send_to_client(
+                        client_id,
+                        ServerMessage::ServerShutdown {
+                            reason: Some("client sent concurrent endpoint commands".into()),
+                        },
+                    );
+                    self.remove_client_and_resize_if_needed(client_id);
+                    return true;
+                }
+
+                let (respond_to, response_rx) = std::sync::mpsc::channel();
+                if let Err(err) = crate::server::client_commands::spawn_response_waiter(
+                    client_id,
+                    boot_id.clone(),
+                    request_id.clone(),
+                    response_rx,
+                    self.server_event_tx.clone(),
+                ) {
+                    let message = crate::server::client_commands::error_message(
+                        boot_id,
+                        request_id,
+                        "server_unavailable",
+                        format!("failed to start endpoint response bridge: {err}"),
+                    );
+                    self.send_to_client(client_id, message);
+                    return false;
+                }
+                if let Some(client) = self.clients.get_mut(&client_id) {
+                    client.shell_endpoint_command_in_flight = true;
+                }
+                let foreground_changed = self.promote_client_to_foreground(client_id);
+                if foreground_changed {
+                    self.resize_shared_runtime_to_effective_size_before_input();
+                }
+                foreground_changed
+                    | self.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                        request: *request,
+                        respond_to,
+                        response_write_complete: None,
+                        stream_active: None,
+                    })
+            }
+            ServerEvent::ClientShellEndpointResponseChunkReady {
+                client_id,
+                boot_id,
+                request_id,
+                final_chunk,
+                data,
+            } => {
+                let valid = self.clients.get(&client_id).is_some_and(|client| {
+                    matches!(client.mode, ClientConnectionMode::ClientShell)
+                        && client.shell_endpoint_command_in_flight
+                        && boot_id == self.client_shell_boot_id
+                });
+                if !valid {
+                    return false;
+                }
+                if final_chunk {
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.shell_endpoint_command_in_flight = false;
+                    }
+                }
+                self.send_to_client(
+                    client_id,
+                    ServerMessage::ClientShellEndpointResponseChunk {
+                        boot_id,
+                        request_id,
+                        final_chunk,
+                        data,
+                    },
+                );
+                false
+            }
             ServerEvent::ClientDetach { client_id } => {
                 info!(client_id, "client detached");
                 self.send_terminal_stream_detach_shutdown(client_id);
@@ -3746,6 +3859,7 @@ impl HeadlessServer {
             ev,
             ServerEvent::ClientConnected { .. }
                 | ServerEvent::ClientShellConnected { .. }
+                | ServerEvent::ClientShellEndpointResponseChunkReady { .. }
                 | ServerEvent::ClientDisconnected { .. }
                 | ServerEvent::ClientWriterDrained { .. }
                 | ServerEvent::QuitSignal
@@ -6581,6 +6695,71 @@ mod tests {
         assert_eq!(server.app.state.mode, crate::app::Mode::Onboarding);
         assert_eq!(server.app.state.workspaces.len(), 1);
         assert_eq!(server.app.state.active, Some(0));
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn client_shell_endpoint_request_uses_the_selected_connection() {
+        let mut server = test_headless_server();
+        let (writer, control_rx, _render_rx) = test_client_writer();
+        let client_id = 41;
+        assert!(
+            server.handle_server_event(ServerEvent::ClientShellConnected {
+                client_id,
+                surface_cols: 80,
+                surface_rows: 23,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                pixel_mouse: false,
+                direct_graphics: false,
+                writer,
+            })
+        );
+        let _initial_snapshot = control_rx.recv().expect("initial shell snapshot");
+        let boot_id = server.client_shell_boot_id.clone();
+
+        assert!(
+            !server.handle_server_event(ServerEvent::ClientShellEndpointRequest {
+                client_id,
+                boot_id: boot_id.clone(),
+                request: Box::new(api::schema::Request {
+                    id: "client-shell:1".into(),
+                    method: api::schema::Method::IntegrationList(
+                        api::schema::EmptyParams::default(),
+                    ),
+                }),
+            })
+        );
+        assert!(server.clients[&client_id].shell_endpoint_command_in_flight);
+
+        let response_ready = server
+            .server_event_rx
+            .recv()
+            .await
+            .expect("endpoint response ready");
+        assert!(!server.handle_server_event(response_ready));
+        assert!(!server.clients[&client_id].shell_endpoint_command_in_flight);
+
+        match read_server_message(control_rx.recv().expect("endpoint response")) {
+            ServerMessage::ClientShellEndpointResponseChunk {
+                boot_id: response_boot_id,
+                request_id,
+                final_chunk,
+                data,
+            } => {
+                assert_eq!(response_boot_id, boot_id);
+                assert_eq!(request_id, "client-shell:1");
+                assert!(final_chunk);
+                let response = serde_json::from_slice::<api::schema::SuccessResponse>(&data)
+                    .expect("success response");
+                assert_eq!(response.id, "client-shell:1");
+                assert!(matches!(
+                    response.result,
+                    api::schema::ResponseResult::IntegrationList { .. }
+                ));
+            }
+            other => panic!("expected client shell endpoint response, got {other:?}"),
+        }
         shutdown_test_runtimes(&mut server);
     }
 
@@ -12399,6 +12578,40 @@ next_tab = ""
             }
             other => panic!("expected paste rejection notification, got {other:?}"),
         }
+        let (shell_writer, shell_control_rx, _shell_render_rx) = test_client_writer();
+        server.clients.insert(
+            3,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::ClientShell,
+                None,
+                (100, 30),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                3,
+                RenderEncoding::SemanticFrame,
+                false,
+                Some(shell_writer),
+            ),
+        );
+        assert!(
+            !server.handle_server_event(ServerEvent::ClientPasteRejected {
+                client_id: 3,
+                size: 7_000_000,
+                max: 1_048_576,
+            })
+        );
+        match read_server_message(
+            shell_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("client shell rejection error"),
+        ) {
+            ServerMessage::ClientShellError { message } => assert_eq!(
+                message,
+                "Paste rejected: Input message is 7000000 bytes; Herdr's limit is 1048576 bytes"
+            ),
+            other => panic!("expected client shell paste error, got {other:?}"),
+        }
         assert!(
             foreground_control_rx
                 .recv_timeout(Duration::from_millis(50))
@@ -12406,7 +12619,7 @@ next_tab = ""
             "foreground client must not receive another client's rejection"
         );
         assert_eq!(server.foreground_client_id, Some(2));
-        assert_eq!(server.clients.len(), 2);
+        assert_eq!(server.clients.len(), 3);
         assert!(server.app.state.toast.is_none());
     }
 

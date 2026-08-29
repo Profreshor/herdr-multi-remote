@@ -2,6 +2,7 @@ mod alt_screen_read;
 pub mod autodetect;
 #[cfg(unix)]
 pub(crate) mod client_accept;
+pub(crate) mod client_commands;
 pub(crate) mod client_shell;
 pub(crate) mod client_shell_graphics;
 pub(crate) mod client_transport;

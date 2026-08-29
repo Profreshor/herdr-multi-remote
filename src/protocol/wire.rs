@@ -583,6 +583,9 @@ pub enum ClientMessage {
         terminal_id: String,
         events: Vec<ClientPaneInputEvent>,
     },
+
+    /// Invoke one endpoint operation through this client shell's selected connection.
+    ClientShellEndpointRequest { boot_id: String, request: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1266,6 +1269,17 @@ pub enum ServerMessage {
     /// Ephemeral semantic notification delivered over the private control lane.
     /// It is sent only to currently connected client-rendered shells.
     SemanticNotification(SemanticNotification),
+
+    /// Immediate endpoint error that the client-rendered shell must show regardless of notification policy.
+    ClientShellError { message: String },
+
+    /// One ordered chunk of the final response to an endpoint operation.
+    ClientShellEndpointResponseChunk {
+        boot_id: String,
+        request_id: String,
+        final_chunk: bool,
+        data: Vec<u8>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1736,6 +1750,33 @@ mod tests {
         };
         assert_eq!(key.shifted_codepoint, Some('L' as u32));
         assert_eq!(key.kind, crossterm::event::KeyEventKind::Release);
+    }
+
+    #[test]
+    fn client_shell_endpoint_messages_roundtrip() {
+        let request = ClientMessage::ClientShellEndpointRequest {
+            boot_id: "boot-a".into(),
+            request: r#"{"id":"request-a","method":"session.snapshot","params":{}}"#.into(),
+        };
+        let encoded = bincode::serde::encode_to_vec(&request, bincode::config::standard())
+            .expect("encode endpoint request");
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+                .expect("decode endpoint request");
+        assert_eq!(decoded, request);
+
+        let response = ServerMessage::ClientShellEndpointResponseChunk {
+            boot_id: "boot-a".into(),
+            request_id: "request-a".into(),
+            final_chunk: true,
+            data: br#"{"id":"request-a","result":{"type":"ok"}}"#.to_vec(),
+        };
+        let encoded = bincode::serde::encode_to_vec(&response, bincode::config::standard())
+            .expect("encode endpoint response");
+        let (decoded, _): (ServerMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+                .expect("decode endpoint response");
+        assert_eq!(decoded, response);
     }
 
     #[test]

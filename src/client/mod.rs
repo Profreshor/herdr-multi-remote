@@ -14,6 +14,7 @@
 
 #[cfg(unix)]
 mod direct_graphics;
+mod endpoint_commands;
 mod input;
 mod shell;
 
@@ -986,15 +987,9 @@ enum ClientLoopEvent {
     /// Terminal resize detected.
     Resize(u16, u16, u32, u32),
     /// Server message received.
-    ServerMessage(ServerMessage),
+    ServerMessage(Box<ServerMessage>),
     /// Server reader thread exited (connection lost).
     ServerDisconnected,
-    /// A client-shell endpoint API request completed.
-    ClientShellEndpointResult {
-        boot_id: String,
-        request_id: String,
-        result: Box<Result<crate::api::schema::ResponseResult, shell::ClientShellEndpointError>>,
-    },
     /// Timer tick.
     Timer,
 }
@@ -1481,14 +1476,13 @@ fn run_client_with_mode(
 
 fn dispatch_client_shell_actions(
     actions: Vec<shell::ClientShellAction>,
-    endpoint_tx: Option<&std::sync::mpsc::Sender<(String, crate::api::schema::Request)>>,
-) {
+    endpoint_commands: &mut endpoint_commands::EndpointCommands,
+    write_stream: &mut LocalStream,
+) -> Result<(), ClientError> {
     for action in actions {
         match action {
             shell::ClientShellAction::Endpoint { boot_id, request } => {
-                if endpoint_tx.is_none_or(|tx| tx.send((boot_id, *request)).is_err()) {
-                    warn!("client shell endpoint worker unavailable");
-                }
+                endpoint_commands.enqueue(boot_id, request);
             }
             shell::ClientShellAction::ClipboardWrite(bytes) => {
                 crate::selection::write_osc52_bytes(&bytes);
@@ -1501,6 +1495,9 @@ fn dispatch_client_shell_actions(
             }
         }
     }
+    endpoint_commands
+        .send_next(write_stream)
+        .map_err(ClientError::ConnectionLost)
 }
 
 fn client_shell_resize_message(
@@ -1524,7 +1521,7 @@ fn finish_client_shell_input(
     outcome: shell::ClientShellInput,
     frame: Option<FrameData>,
     write_stream: &mut LocalStream,
-    endpoint_tx: Option<&std::sync::mpsc::Sender<(String, crate::api::schema::Request)>>,
+    endpoint_commands: &mut endpoint_commands::EndpointCommands,
 ) -> Result<bool, ClientError> {
     if outcome.detach {
         let _ = write_to_server(write_stream, &ClientMessage::Detach);
@@ -1545,7 +1542,7 @@ fn finish_client_shell_input(
     if outcome.query_host_appearance {
         query_host_terminal_appearance();
     }
-    dispatch_client_shell_actions(outcome.actions, endpoint_tx);
+    dispatch_client_shell_actions(outcome.actions, endpoint_commands, write_stream)?;
     for request in outcome.requests {
         write_to_server(write_stream, &request).map_err(ClientError::ConnectionLost)?;
     }
@@ -1614,61 +1611,7 @@ async fn run_client_loop(
     // Channel for events from the stdin, resize, and server reader threads.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
 
-    let shell_endpoint_tx = state.shell.as_ref().map(|_| {
-        let (request_tx, request_rx) =
-            std::sync::mpsc::channel::<(String, crate::api::schema::Request)>();
-        let result_tx = event_tx.clone();
-        let _ = std::thread::Builder::new()
-            .name("herdr-client-shell-endpoint".into())
-            .spawn(move || {
-                let client = crate::api::client::ApiClient::local();
-                while let Ok((boot_id, request)) = request_rx.recv() {
-                    let request_id = request.id.clone();
-                    let result = match client.request(request) {
-                        Ok(response) if response.id == request_id => Ok(response.result),
-                        Ok(response) => Err(shell::ClientShellEndpointError {
-                            code: None,
-                            message: format!(
-                                "endpoint response id {:?} did not match {request_id:?}",
-                                response.id
-                            ),
-                        }),
-                        Err(crate::api::client::ApiClientError::ErrorResponse(response))
-                            if response.id == request_id =>
-                        {
-                            Err(shell::ClientShellEndpointError {
-                                code: Some(response.error.code),
-                                message: response.error.message,
-                            })
-                        }
-                        Err(crate::api::client::ApiClientError::ErrorResponse(response)) => {
-                            Err(shell::ClientShellEndpointError {
-                                code: None,
-                                message: format!(
-                                    "endpoint error id {:?} did not match {request_id:?}",
-                                    response.id
-                                ),
-                            })
-                        }
-                        Err(error) => Err(shell::ClientShellEndpointError {
-                            code: None,
-                            message: error.to_string(),
-                        }),
-                    };
-                    if result_tx
-                        .blocking_send(ClientLoopEvent::ClientShellEndpointResult {
-                            boot_id,
-                            request_id,
-                            result: Box::new(result),
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-        request_tx
-    });
+    let mut endpoint_commands = endpoint_commands::EndpointCommands::default();
 
     // Spawn the stdin reader thread.
     let will_query_host_terminal_theme = state.attach_escape.is_none()
@@ -1796,7 +1739,7 @@ async fn run_client_loop(
                         outcome,
                         frame,
                         &mut write_stream,
-                        shell_endpoint_tx.as_ref(),
+                        &mut endpoint_commands,
                     )? {
                         return Ok(());
                     }
@@ -1926,7 +1869,7 @@ async fn run_client_loop(
                         outcome,
                         frame,
                         &mut write_stream,
-                        shell_endpoint_tx.as_ref(),
+                        &mut endpoint_commands,
                     )? {
                         return Ok(());
                     }
@@ -1960,7 +1903,7 @@ async fn run_client_loop(
                         outcome,
                         frame,
                         &mut write_stream,
-                        shell_endpoint_tx.as_ref(),
+                        &mut endpoint_commands,
                     )? {
                         return Ok(());
                     }
@@ -2001,24 +1944,6 @@ async fn run_client_loop(
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
-            ClientLoopEvent::ClientShellEndpointResult {
-                boot_id,
-                request_id,
-                result,
-            } => {
-                let (repaint, actions) = state.shell.as_mut().map_or_else(
-                    || (false, Vec::new()),
-                    |shell| shell.handle_endpoint_result(&boot_id, &request_id, *result),
-                );
-                dispatch_client_shell_actions(actions, shell_endpoint_tx.as_ref());
-                if repaint {
-                    if let Some(frame) = state.shell.as_mut().and_then(|shell| {
-                        shell.compose(state.reported_size.0, state.reported_size.1)
-                    }) {
-                        state.present_frame(frame);
-                    }
-                }
-            }
             ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
                 state.reported_size = (new_cols, new_rows);
                 state.reported_cell_size = (cell_width_px, cell_height_px);
@@ -2048,7 +1973,7 @@ async fn run_client_loop(
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
-            ClientLoopEvent::ServerMessage(msg) => match msg {
+            ClientLoopEvent::ServerMessage(msg) => match *msg {
                 ServerMessage::Frame(frame_data) => state.present_frame(frame_data),
                 ServerMessage::ClientShellSnapshot(snapshot) => {
                     let (composed, resize, graphics_cleanup) = if let Some(shell) = &mut state.shell
@@ -2275,6 +2200,51 @@ async fn run_client_loop(
                         }
                     }
                 }
+                ServerMessage::ClientShellError { message } => {
+                    if let Some(shell) = state.shell.as_mut() {
+                        if shell.receive_endpoint_error(message) {
+                            let frame = shell.compose(state.reported_size.0, state.reported_size.1);
+                            if let Some(frame) = frame {
+                                state.present_frame(frame);
+                            }
+                        }
+                    }
+                }
+                ServerMessage::ClientShellEndpointResponseChunk {
+                    boot_id,
+                    request_id,
+                    final_chunk,
+                    data,
+                } => {
+                    let completed = endpoint_commands
+                        .receive_chunk(&boot_id, &request_id, final_chunk, data)
+                        .map_err(ClientError::ConnectionLost)?;
+                    let Some(completed) = completed else {
+                        continue;
+                    };
+                    let (repaint, actions) = state.shell.as_mut().map_or_else(
+                        || (false, Vec::new()),
+                        |shell| {
+                            shell.handle_endpoint_result(
+                                &completed.boot_id,
+                                &completed.request_id,
+                                completed.result,
+                            )
+                        },
+                    );
+                    dispatch_client_shell_actions(
+                        actions,
+                        &mut endpoint_commands,
+                        &mut write_stream,
+                    )?;
+                    if repaint {
+                        if let Some(frame) = state.shell.as_mut().and_then(|shell| {
+                            shell.compose(state.reported_size.0, state.reported_size.1)
+                        }) {
+                            state.present_frame(frame);
+                        }
+                    }
+                }
                 ServerMessage::Clipboard { data } => {
                     forward_clipboard(&data);
                     let _ = io::stdout().flush();
@@ -2366,7 +2336,7 @@ async fn run_client_loop(
                         outcome,
                         frame,
                         &mut write_stream,
-                        shell_endpoint_tx.as_ref(),
+                        &mut endpoint_commands,
                     )? {
                         return Ok(());
                     }
@@ -2412,7 +2382,7 @@ fn server_reader_thread(
         match protocol::read_message(&mut stream, max_frame_size) {
             Ok(msg) => {
                 if event_tx
-                    .blocking_send(ClientLoopEvent::ServerMessage(msg))
+                    .blocking_send(ClientLoopEvent::ServerMessage(Box::new(msg)))
                     .is_err()
                 {
                     break; // Main loop gone.

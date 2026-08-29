@@ -326,6 +326,14 @@ impl ClientShellState {
         });
     }
 
+    pub(crate) fn receive_endpoint_error(&mut self, message: String) -> bool {
+        if self.endpoint_error.as_deref() == Some(message.as_str()) {
+            return false;
+        }
+        self.endpoint_error = Some(message);
+        true
+    }
+
     pub(crate) fn handle_endpoint_result(
         &mut self,
         boot_id: &str,

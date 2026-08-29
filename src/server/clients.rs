@@ -78,6 +78,8 @@ pub(crate) struct ClientConnection {
     pub(crate) shell_snapshot: Option<crate::protocol::ClientShellSnapshot>,
     /// Monotonic shell replacement revision for this connection.
     pub(crate) shell_projection_revision: u64,
+    /// Whether this shell is waiting for one ordered endpoint command response.
+    pub(crate) shell_endpoint_command_in_flight: bool,
     /// Channels for sending framed ServerMessage data to the client writer thread.
     pub(crate) writer: Option<ClientWriter>,
 }
@@ -146,6 +148,7 @@ impl ClientConnection {
             staged_clipboard_files: Vec::new(),
             shell_snapshot: None,
             shell_projection_revision: 0,
+            shell_endpoint_command_in_flight: false,
             writer,
         }
     }

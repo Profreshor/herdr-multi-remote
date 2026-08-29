@@ -418,6 +418,20 @@ pub(crate) enum ServerEvent {
         terminal_id: String,
         events: Vec<ClientPaneInputEvent>,
     },
+    /// A client-owned shell invoked one endpoint operation through this connection.
+    ClientShellEndpointRequest {
+        client_id: u64,
+        boot_id: String,
+        request: Box<crate::api::schema::Request>,
+    },
+    /// One chunk of a deferred endpoint operation's final response is ready.
+    ClientShellEndpointResponseChunkReady {
+        client_id: u64,
+        boot_id: String,
+        request_id: String,
+        final_chunk: bool,
+        data: Vec<u8>,
+    },
     /// A client detached gracefully.
     ClientDetach { client_id: u64 },
     /// A client connection was lost.
@@ -1192,6 +1206,43 @@ fn client_read_loop(
                     break;
                 }
             },
+            ClientMessage::ClientShellEndpointRequest { boot_id, request } => {
+                if boot_id.len() > crate::server::client_commands::MAX_ENDPOINT_BOOT_ID_BYTES
+                    || request.len() > crate::server::client_commands::MAX_ENDPOINT_COMMAND_BYTES
+                {
+                    warn!(
+                        client_id,
+                        boot_id_size = boot_id.len(),
+                        request_size = request.len(),
+                        "oversized client shell endpoint command, closing"
+                    );
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    break;
+                }
+                let Ok(request) = serde_json::from_str::<crate::api::schema::Request>(&request)
+                else {
+                    warn!(client_id, "invalid client shell endpoint command, closing");
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    break;
+                };
+                if request.id.len() > crate::server::client_commands::MAX_ENDPOINT_REQUEST_ID_BYTES
+                {
+                    warn!(
+                        client_id,
+                        "oversized client shell endpoint request id, closing"
+                    );
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    break;
+                }
+                ServerEvent::ClientShellEndpointRequest {
+                    client_id,
+                    boot_id,
+                    request: Box::new(request),
+                }
+            }
             ClientMessage::Detach => ServerEvent::ClientDetach { client_id },
             ClientMessage::AttachTerminal {
                 terminal_id,
