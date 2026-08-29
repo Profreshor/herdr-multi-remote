@@ -1,6 +1,63 @@
 use super::*;
 
 impl ClientShellState {
+    pub(super) fn dismiss_product_announcement(&mut self, outcome: &mut ClientShellInput) {
+        let announcement = match self.overlay.take() {
+            Some(ClientShellOverlay::ProductAnnouncement(announcement)) => announcement,
+            other => {
+                self.overlay = other;
+                return;
+            }
+        };
+        if self.snapshot.is_none() {
+            self.overlay = Some(ClientShellOverlay::ProductAnnouncement(announcement));
+            return;
+        }
+        self.dismissed_product_announcement =
+            Some((announcement.version.clone(), announcement.id.clone()));
+        self.chrome_drag = None;
+        self.push_endpoint_method_with_kind(
+            crate::api::schema::Method::ProductAnnouncementDismiss(
+                crate::api::schema::ProductAnnouncementDismissParams {
+                    version: announcement.version.clone(),
+                    id: announcement.id.clone(),
+                },
+            ),
+            PendingEndpointKind::ProductAnnouncementDismiss {
+                version: announcement.version,
+                id: announcement.id,
+            },
+            outcome,
+        );
+        outcome.repaint = true;
+    }
+
+    pub(super) fn scroll_product_announcement(&mut self, delta: isize) {
+        let max_scroll = self.hits.product_announcement_max_scroll;
+        if let Some(ClientShellOverlay::ProductAnnouncement(announcement)) = self.overlay.as_mut() {
+            let current = usize::from(announcement.scroll);
+            let next = if delta.is_negative() {
+                current.saturating_sub(delta.unsigned_abs())
+            } else {
+                current.saturating_add(delta as usize)
+            }
+            .min(max_scroll);
+            announcement.scroll = u16::try_from(next).unwrap_or(u16::MAX);
+        }
+    }
+
+    pub(super) fn set_product_announcement_offset_from_bottom(
+        &mut self,
+        offset_from_bottom: usize,
+    ) {
+        let max_scroll = self.hits.product_announcement_max_scroll;
+        if let Some(ClientShellOverlay::ProductAnnouncement(announcement)) = self.overlay.as_mut() {
+            announcement.scroll =
+                u16::try_from(max_scroll.saturating_sub(offset_from_bottom.min(max_scroll)))
+                    .unwrap_or(u16::MAX);
+        }
+    }
+
     pub(super) fn complete_onboarding(&mut self, outcome: &mut ClientShellInput) {
         if self.snapshot.is_none() {
             return;
@@ -272,6 +329,51 @@ impl ClientShellState {
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l')
             ) {
                 self.complete_onboarding(outcome);
+            }
+            return;
+        }
+
+        if matches!(
+            self.overlay,
+            Some(ClientShellOverlay::ProductAnnouncement(_))
+        ) {
+            match key.code {
+                KeyCode::Enter | KeyCode::Esc => self.dismiss_product_announcement(outcome),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.scroll_product_announcement(-1);
+                    outcome.repaint = true;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.scroll_product_announcement(1);
+                    outcome.repaint = true;
+                }
+                KeyCode::PageUp => {
+                    self.scroll_product_announcement(-8);
+                    outcome.repaint = true;
+                }
+                KeyCode::PageDown => {
+                    self.scroll_product_announcement(8);
+                    outcome.repaint = true;
+                }
+                KeyCode::Home => {
+                    if let Some(ClientShellOverlay::ProductAnnouncement(announcement)) =
+                        self.overlay.as_mut()
+                    {
+                        announcement.scroll = 0;
+                    }
+                    outcome.repaint = true;
+                }
+                KeyCode::End => {
+                    if let Some(ClientShellOverlay::ProductAnnouncement(announcement)) =
+                        self.overlay.as_mut()
+                    {
+                        announcement.scroll =
+                            u16::try_from(self.hits.product_announcement_max_scroll)
+                                .unwrap_or(u16::MAX);
+                    }
+                    outcome.repaint = true;
+                }
+                _ => {}
             }
             return;
         }

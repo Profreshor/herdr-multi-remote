@@ -1396,6 +1396,7 @@ pub struct ReleaseNotesState {
     pub preview: bool,
 }
 
+#[derive(Debug)]
 pub struct ProductAnnouncementState {
     pub version: String,
     pub id: String,

@@ -92,6 +92,9 @@ pub(super) struct ShellHitMap {
     pub(super) settings_popup: Rect,
     pub(super) settings_tabs: Vec<(Rect, ClientSettingsSection)>,
     pub(super) settings_choices: Vec<(Rect, usize)>,
+    pub(super) product_announcement_scrollbar: Rect,
+    pub(super) product_announcement_scroll_metrics: Option<crate::pane::ScrollMetrics>,
+    pub(super) product_announcement_max_scroll: usize,
 }
 
 #[derive(Clone)]
@@ -147,6 +150,9 @@ pub(super) enum ClientChromeDrag {
         grab_row_offset: u16,
     },
     HelpScrollbar {
+        grab_row_offset: u16,
+    },
+    ProductAnnouncementScrollbar {
         grab_row_offset: u16,
     },
     Tab {
@@ -212,6 +218,7 @@ pub(super) enum ClientShellMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ClientShellOverlayKind {
     Onboarding,
+    ProductAnnouncement,
     Rename,
     ConfirmClose,
     Help,
@@ -494,6 +501,7 @@ pub(super) struct ClientConfirmCloseOverlay {
 #[derive(Debug)]
 pub(super) enum ClientShellOverlay {
     Onboarding,
+    ProductAnnouncement(crate::app::state::ProductAnnouncementState),
     Rename(ClientRenameOverlay),
     ConfirmClose(ClientConfirmCloseOverlay),
     Help(ClientHelpOverlay),
@@ -510,6 +518,7 @@ impl ClientShellOverlay {
     pub(super) fn kind(&self) -> ClientShellOverlayKind {
         match self {
             Self::Onboarding => ClientShellOverlayKind::Onboarding,
+            Self::ProductAnnouncement(_) => ClientShellOverlayKind::ProductAnnouncement,
             Self::Rename(_) => ClientShellOverlayKind::Rename,
             Self::ConfirmClose(_) => ClientShellOverlayKind::ConfirmClose,
             Self::Help(_) => ClientShellOverlayKind::Help,
@@ -527,6 +536,10 @@ impl ClientShellOverlay {
 #[derive(Debug)]
 pub(super) enum PendingEndpointKind {
     Generic,
+    ProductAnnouncementDismiss {
+        version: String,
+        id: String,
+    },
     PopupCommand,
     ReloadConfig,
     IntegrationList,
@@ -774,6 +787,20 @@ pub(crate) struct ClientShellState {
     pub(super) local_config_diagnostic: Option<String>,
     pub(super) config_diagnostic: Option<String>,
     pub(super) endpoint_error: Option<String>,
+    pub(super) dismissed_product_announcement: Option<(String, String)>,
+}
+
+pub(super) fn product_announcement_state(
+    announcement: &crate::protocol::ClientShellProductAnnouncement,
+) -> crate::app::state::ProductAnnouncementState {
+    crate::app::state::ProductAnnouncementState {
+        version: announcement.version.clone(),
+        id: announcement.id.clone(),
+        title: announcement.title.clone(),
+        body: announcement.body.clone(),
+        scroll: 0,
+        preview: announcement.preview,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -869,6 +896,7 @@ impl ClientShellState {
             config_diagnostic: local_config_diagnostic.clone(),
             local_config_diagnostic,
             endpoint_error: None,
+            dismissed_product_announcement: None,
         }
     }
 
@@ -915,11 +943,11 @@ impl ClientShellState {
         {
             self.hits = ShellHitMap::default();
         }
-        if self
+        let boot_changed = self
             .snapshot
             .as_ref()
-            .is_some_and(|current| current.boot_id != snapshot.boot_id)
-        {
+            .is_some_and(|current| current.boot_id != snapshot.boot_id);
+        if boot_changed {
             self.pane_surface = None;
             self.popup_terminal_id = None;
             self.chrome_drag = None;
@@ -959,6 +987,7 @@ impl ClientShellState {
             self.copy_feedback = None;
             self.copy_feedback_deadline = None;
             self.host_mouse_pixels = None;
+            self.dismissed_product_announcement = None;
         } else if let Some(previous) = self
             .snapshot
             .as_deref()
@@ -1069,6 +1098,44 @@ impl ClientShellState {
             .retain(|pane_id, _| pane_exists(pane_id));
         self.pane_scroll_targets
             .retain(|pane_id, _| pane_exists(pane_id));
+
+        if !self.config.startup_onboarding {
+            match snapshot.product_announcement.as_ref() {
+                Some(announcement) => {
+                    let key = (announcement.version.clone(), announcement.id.clone());
+                    let already_open = matches!(
+                        self.overlay.as_ref(),
+                        Some(ClientShellOverlay::ProductAnnouncement(current))
+                            if current.version == announcement.version && current.id == announcement.id
+                    );
+                    let may_open = self.overlay.is_none()
+                        || matches!(
+                            self.overlay.as_ref(),
+                            Some(ClientShellOverlay::ProductAnnouncement(_))
+                        );
+                    if self.dismissed_product_announcement.as_ref() != Some(&key)
+                        && may_open
+                        && !already_open
+                    {
+                        self.overlay = Some(ClientShellOverlay::ProductAnnouncement(
+                            product_announcement_state(announcement),
+                        ));
+                    }
+                }
+                None if matches!(
+                    self.overlay.as_ref(),
+                    Some(ClientShellOverlay::ProductAnnouncement(_))
+                ) =>
+                {
+                    self.overlay = None;
+                    self.chrome_drag = None;
+                    self.dismissed_product_announcement = None;
+                }
+                None => {
+                    self.dismissed_product_announcement = None;
+                }
+            }
+        }
         self.snapshot = Some(snapshot);
     }
 
@@ -1092,10 +1159,15 @@ impl ClientShellState {
             }
             self.mode = ClientShellMode::Terminal;
             self.navigate_workspace_id = None;
-            self.overlay = self
-                .config
-                .startup_onboarding
-                .then_some(ClientShellOverlay::Onboarding);
+            if !matches!(
+                self.overlay.as_ref(),
+                Some(ClientShellOverlay::Onboarding | ClientShellOverlay::ProductAnnouncement(_))
+            ) {
+                self.overlay = self
+                    .config
+                    .startup_onboarding
+                    .then_some(ClientShellOverlay::Onboarding);
+            }
             self.selection = None;
             self.last_pane_click = None;
             self.selection_autoscroll = None;

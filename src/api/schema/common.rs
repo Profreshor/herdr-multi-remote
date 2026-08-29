@@ -36,6 +36,12 @@ pub struct PaneTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ProductAnnouncementDismissParams {
+    pub version: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TabTarget {
     pub tab_id: String,
 }

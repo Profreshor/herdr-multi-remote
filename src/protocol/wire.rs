@@ -798,6 +798,8 @@ pub struct ClientShellSnapshot {
     pub revision: u64,
     /// Endpoint startup/reload config warning, filtered for client-owned keybindings.
     pub config_diagnostic: Option<String>,
+    /// Unseen announcement owned and persisted by this endpoint.
+    pub product_announcement: Option<ClientShellProductAnnouncement>,
     pub focused_workspace_id: Option<String>,
     pub focused_tab_id: Option<String>,
     pub focused_pane_id: Option<String>,
@@ -810,6 +812,15 @@ pub struct ClientShellSnapshot {
     pub panes: Vec<ClientShellPane>,
     pub agents: Vec<ClientShellAgent>,
     pub commands: Vec<ClientShellCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientShellProductAnnouncement {
+    pub version: String,
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    pub preview: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1919,6 +1930,13 @@ mod tests {
             boot_id: "boot-1".into(),
             revision: 1,
             config_diagnostic: Some("endpoint config warning".into()),
+            product_announcement: Some(ClientShellProductAnnouncement {
+                version: "0.8.2".into(),
+                id: "client-shell".into(),
+                title: "Client shell".into(),
+                body: "### New\n- Client-owned chrome".into(),
+                preview: false,
+            }),
             focused_workspace_id: Some("w1".into()),
             focused_tab_id: Some("w1:t1".into()),
             focused_pane_id: Some("w1:p1".into()),

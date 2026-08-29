@@ -77,7 +77,13 @@ impl ClientShellState {
                 RawInputEvent::Key(key) => self.handle_key(key, &mut outcome),
                 RawInputEvent::Text(text) => {
                     let text = text.into_string();
-                    if matches!(self.overlay, Some(ClientShellOverlay::Onboarding)) {
+                    if matches!(
+                        self.overlay,
+                        Some(
+                            ClientShellOverlay::Onboarding
+                                | ClientShellOverlay::ProductAnnouncement(_)
+                        )
+                    ) {
                         continue;
                     }
                     if self.prepare_committed_text(&text, &mut outcome) {
@@ -101,7 +107,13 @@ impl ClientShellState {
                     }
                 }
                 RawInputEvent::Paste(text) => {
-                    if matches!(self.overlay, Some(ClientShellOverlay::Onboarding)) {
+                    if matches!(
+                        self.overlay,
+                        Some(
+                            ClientShellOverlay::Onboarding
+                                | ClientShellOverlay::ProductAnnouncement(_)
+                        )
+                    ) {
                         continue;
                     }
                     if self.prepare_committed_text(&text, &mut outcome) {
@@ -242,8 +254,13 @@ impl ClientShellState {
         key: &crate::input::TerminalKey,
         outcome: &mut ClientShellInput,
     ) -> Option<ClientInputTarget> {
-        if matches!(self.overlay, Some(ClientShellOverlay::Onboarding)) {
-            self.route_overlay_key(key, outcome);
+        if matches!(
+            self.overlay,
+            Some(ClientShellOverlay::Onboarding | ClientShellOverlay::ProductAnnouncement(_))
+        ) {
+            if key.kind == KeyEventKind::Press {
+                self.route_overlay_key(key, outcome);
+            }
             return None;
         }
         if let Some(target) = self.popup_input_target() {

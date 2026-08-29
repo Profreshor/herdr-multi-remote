@@ -596,6 +596,73 @@ impl ClientShellState {
             }
             return;
         }
+        if matches!(
+            self.overlay,
+            Some(ClientShellOverlay::ProductAnnouncement(_))
+        ) {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left)
+                    if super::contains(self.hits.overlay_primary, point) =>
+                {
+                    self.dismiss_product_announcement(outcome);
+                }
+                MouseEventKind::Down(MouseButton::Left)
+                    if super::contains(self.hits.product_announcement_scrollbar, point) =>
+                {
+                    if let Some(metrics) = self.hits.product_announcement_scroll_metrics {
+                        if let Some(grab_row_offset) = crate::ui::scrollbar_thumb_grab_offset(
+                            metrics,
+                            self.hits.product_announcement_scrollbar,
+                            mouse.row,
+                        ) {
+                            self.chrome_drag =
+                                Some(ClientChromeDrag::ProductAnnouncementScrollbar {
+                                    grab_row_offset,
+                                });
+                        } else {
+                            let offset = crate::ui::scrollbar_offset_from_row(
+                                metrics,
+                                self.hits.product_announcement_scrollbar,
+                                mouse.row,
+                            );
+                            self.set_product_announcement_offset_from_bottom(offset);
+                            outcome.repaint = true;
+                        }
+                    }
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let (
+                        Some(ClientChromeDrag::ProductAnnouncementScrollbar { grab_row_offset }),
+                        Some(metrics),
+                    ) = (
+                        self.chrome_drag.as_ref(),
+                        self.hits.product_announcement_scroll_metrics,
+                    ) {
+                        let offset = crate::ui::scrollbar_offset_from_drag_row(
+                            metrics,
+                            self.hits.product_announcement_scrollbar,
+                            mouse.row,
+                            *grab_row_offset,
+                        );
+                        self.set_product_announcement_offset_from_bottom(offset);
+                        outcome.repaint = true;
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.chrome_drag = None;
+                }
+                MouseEventKind::ScrollUp => {
+                    self.scroll_product_announcement(-3);
+                    outcome.repaint = true;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.scroll_product_announcement(3);
+                    outcome.repaint = true;
+                }
+                _ => {}
+            }
+            return;
+        }
         if let Some(gesture) = self.pane_mouse_gesture.as_ref() {
             let gesture_event = matches!(
                 mouse.kind,
@@ -730,6 +797,10 @@ impl ClientShellState {
                             outcome.repaint = true;
                         }
                     }
+                    return;
+                }
+                Some(ClientChromeDrag::ProductAnnouncementScrollbar { .. }) => {
+                    self.chrome_drag = None;
                     return;
                 }
                 Some(ClientChromeDrag::PaneScrollbar {
@@ -1005,7 +1076,8 @@ impl ClientShellState {
                     }
                     ClientChromeDrag::WorkspaceScrollbar { .. }
                     | ClientChromeDrag::AgentScrollbar { .. }
-                    | ClientChromeDrag::HelpScrollbar { .. } => {}
+                    | ClientChromeDrag::HelpScrollbar { .. }
+                    | ClientChromeDrag::ProductAnnouncementScrollbar { .. } => {}
                 }
                 return;
             }

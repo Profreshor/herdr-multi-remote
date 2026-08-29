@@ -278,6 +278,7 @@ mod tests {
             boot_id: "boot-1".into(),
             revision: 1,
             config_diagnostic: None,
+            product_announcement: None,
             focused_workspace_id: Some("ws_1".into()),
             focused_tab_id: Some("tab_1".into()),
             focused_pane_id: Some("pane_1".into()),
@@ -488,6 +489,240 @@ mod tests {
             frame.cursor.as_ref().map(|cursor| (cursor.x, cursor.y)),
             Some((27, 2))
         );
+    }
+
+    #[test]
+    fn endpoint_product_announcement_is_client_rendered_modal_and_dismissed_by_identity() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        let mut endpoint_snapshot = snapshot();
+        endpoint_snapshot.product_announcement =
+            Some(crate::protocol::ClientShellProductAnnouncement {
+                version: "0.8.2".into(),
+                id: "client-shell".into(),
+                title: "A client-owned announcement".into(),
+                body: (0..40)
+                    .map(|index| format!("- announcement line {index}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                preview: false,
+            });
+        state.set_snapshot(Box::new(endpoint_snapshot.clone()));
+        state.set_pane_surface(surface_with_popup());
+
+        let frame = state.compose(106, 30).expect("announcement frame");
+        let text = frame
+            .cells
+            .chunks(frame.width as usize)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("A client-owned announcement"));
+        assert!(text.contains("product announcement · v0.8.2"));
+        assert!(!state.hits.product_announcement_scrollbar.is_empty());
+
+        let popup_key = state.handle_input_bytes(b"x");
+        assert!(popup_key.requests.is_empty());
+        let popup_paste = state.handle_raw_events(vec![RawInputEvent::Paste("secret".into())]);
+        assert!(popup_paste.requests.is_empty());
+
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        })]);
+        state.handle_input_bytes(b"\x1b[6~");
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::ProductAnnouncement(
+                crate::app::state::ProductAnnouncementState { scroll: 11, .. }
+            ))
+        ));
+        let repeated = state.handle_raw_events(vec![RawInputEvent::Key(
+            crate::input::TerminalKey::new(KeyCode::PageDown, KeyModifiers::empty())
+                .with_kind(crossterm::event::KeyEventKind::Repeat),
+        )]);
+        assert!(repeated.actions.is_empty());
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::ProductAnnouncement(
+                crate::app::state::ProductAnnouncementState { scroll: 11, .. }
+            ))
+        ));
+
+        let dismissed = state.handle_input_bytes(b"\r");
+        assert!(state.overlay.is_none());
+        assert!(matches!(
+            &dismissed.actions[..],
+            [ClientShellAction::Endpoint { request, .. }]
+                if matches!(
+                    &request.method,
+                    crate::api::schema::Method::ProductAnnouncementDismiss(params)
+                        if params.version == "0.8.2" && params.id == "client-shell"
+                )
+        ));
+
+        state.set_snapshot(Box::new(endpoint_snapshot.clone()));
+        assert!(state.overlay.is_none(), "same announcement stays dismissed");
+        endpoint_snapshot
+            .product_announcement
+            .as_mut()
+            .expect("announcement")
+            .id = "new-announcement".into();
+        state.set_snapshot(Box::new(endpoint_snapshot.clone()));
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::ProductAnnouncement(_))
+        ));
+        state.chrome_drag =
+            Some(ClientChromeDrag::ProductAnnouncementScrollbar { grab_row_offset: 0 });
+        endpoint_snapshot.product_announcement = None;
+        state.set_snapshot(Box::new(endpoint_snapshot));
+        assert!(state.overlay.is_none());
+        assert!(state.chrome_drag.is_none());
+        assert!(state.dismissed_product_announcement.is_none());
+    }
+
+    #[test]
+    fn failed_product_announcement_dismiss_reopens_authoritative_snapshot() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        let mut endpoint_snapshot = snapshot();
+        endpoint_snapshot.product_announcement =
+            Some(crate::protocol::ClientShellProductAnnouncement {
+                version: "0.8.2".into(),
+                id: "client-shell".into(),
+                title: "Client shell".into(),
+                body: "announcement".into(),
+                preview: false,
+            });
+        state.set_snapshot(Box::new(endpoint_snapshot));
+        let dismissed = state.handle_input_bytes(b"\r");
+        let request_id = match &dismissed.actions[..] {
+            [ClientShellAction::Endpoint { request, .. }] => request.id.clone(),
+            actions => panic!("unexpected actions: {actions:?}"),
+        };
+
+        let (repaint, actions) = state.handle_endpoint_result(
+            "boot-1",
+            &request_id,
+            Err(ClientShellEndpointError {
+                code: Some("stale_announcement".into()),
+                message: "dismiss failed".into(),
+            }),
+        );
+        assert!(repaint);
+        assert!(actions.is_empty());
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::ProductAnnouncement(_))
+        ));
+        assert!(state.dismissed_product_announcement.is_none());
+    }
+
+    #[test]
+    fn product_announcement_mouse_is_modal_and_closes_only_from_its_button() {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        let mut endpoint_snapshot = snapshot();
+        endpoint_snapshot.product_announcement =
+            Some(crate::protocol::ClientShellProductAnnouncement {
+                version: "0.8.2".into(),
+                id: "client-shell".into(),
+                title: "Client shell".into(),
+                body: (0..40)
+                    .map(|index| format!("- line {index}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                preview: false,
+            });
+        state.set_snapshot(Box::new(endpoint_snapshot));
+        state.set_pane_surface(surface_with_popup());
+        state.compose(106, 30).expect("announcement frame");
+
+        let outside =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })]);
+        assert!(outside.requests.is_empty());
+        assert!(outside.actions.is_empty());
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::ProductAnnouncement(_))
+        ));
+
+        let metrics = state
+            .hits
+            .product_announcement_scroll_metrics
+            .expect("scroll metrics");
+        let track = state.hits.product_announcement_scrollbar;
+        let thumb = crate::ui::scrollbar_thumb(metrics, track).expect("thumb");
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: track.x,
+            row: thumb.top,
+            modifiers: KeyModifiers::NONE,
+        })]);
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: track.x,
+            row: track.bottom().saturating_sub(1),
+            modifiers: KeyModifiers::NONE,
+        })]);
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: track.x,
+            row: track.bottom().saturating_sub(1),
+            modifiers: KeyModifiers::NONE,
+        })]);
+        assert!(state.chrome_drag.is_none());
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::ProductAnnouncement(
+                crate::app::state::ProductAnnouncementState { scroll, .. }
+            )) if usize::from(scroll) == state.hits.product_announcement_max_scroll
+        ));
+
+        let close = state.hits.overlay_primary;
+        let closed =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: close.x,
+                row: close.y,
+                modifiers: KeyModifiers::NONE,
+            })]);
+        assert!(state.overlay.is_none());
+        assert!(matches!(
+            &closed.actions[..],
+            [ClientShellAction::Endpoint { request, .. }]
+                if matches!(request.method, crate::api::schema::Method::ProductAnnouncementDismiss(_))
+        ));
+    }
+
+    #[test]
+    fn onboarding_has_priority_over_endpoint_product_announcement() {
+        let config =
+            ClientShellConfig::from_config(&Config::default()).with_startup_onboarding(true);
+        let mut state = ClientShellState::new(config);
+        let mut endpoint_snapshot = snapshot();
+        endpoint_snapshot.product_announcement =
+            Some(crate::protocol::ClientShellProductAnnouncement {
+                version: "0.8.2".into(),
+                id: "client-shell".into(),
+                title: "Hidden until a later launch".into(),
+                body: "announcement body".into(),
+                preview: false,
+            });
+        state.set_snapshot(Box::new(endpoint_snapshot));
+        assert!(matches!(
+            state.overlay,
+            Some(ClientShellOverlay::Onboarding)
+        ));
     }
 
     #[test]

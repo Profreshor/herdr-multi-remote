@@ -511,30 +511,11 @@ impl AppState {
     }
 
     fn product_announcement_scroll_metrics(&self) -> Option<crate::pane::ScrollMetrics> {
-        let announcement = self.product_announcement.as_ref()?;
-        let body = self.product_announcement_body_rect()?;
-        let viewport_rows = body.height.max(1) as usize;
-        let lines = crate::ui::product_announcement_display_lines(announcement, &self.palette);
-
-        let rows_for_width = |wrap_width: u16| {
-            crate::ui::release_notes_wrapped_line_count(&lines, wrap_width.max(1))
-        };
-
-        let full_width = body.width.max(1);
-        let mut total_rows = rows_for_width(full_width);
-        let wrap_width = if total_rows > viewport_rows && full_width > 1 {
-            body.width.saturating_sub(1).max(1)
-        } else {
-            full_width
-        };
-        total_rows = rows_for_width(wrap_width);
-
-        let max_offset_from_bottom = total_rows.saturating_sub(viewport_rows);
-        Some(crate::pane::ScrollMetrics {
-            offset_from_bottom: max_offset_from_bottom.saturating_sub(announcement.scroll as usize),
-            max_offset_from_bottom,
-            viewport_rows,
-        })
+        Some(crate::ui::product_announcement_scroll_metrics(
+            self.product_announcement.as_ref()?,
+            self.product_announcement_body_rect()?,
+            &self.palette,
+        ))
     }
 
     pub(crate) fn product_announcement_max_scroll(&self) -> u16 {

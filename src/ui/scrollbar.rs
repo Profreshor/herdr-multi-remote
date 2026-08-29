@@ -1,4 +1,5 @@
 use ratatui::{
+    buffer::Buffer,
     layout::Rect,
     style::{Color, Style},
     Frame,
@@ -132,8 +133,8 @@ pub(crate) fn scrollbar_offset_from_drag_row(
     scrollbar_offset_from_thumb_top(metrics, track, desired_top)
 }
 
-pub(super) fn render_scrollbar(
-    frame: &mut Frame,
+pub(crate) fn render_scrollbar_buffer(
+    buffer: &mut Buffer,
     metrics: crate::pane::ScrollMetrics,
     track: Rect,
     track_color: Color,
@@ -148,17 +149,34 @@ pub(super) fn render_scrollbar(
         return;
     };
 
-    let buf = frame.buffer_mut();
     for y in track.y..track.y + track.height {
-        let cell = &mut buf[(track.x, y)];
+        let cell = &mut buffer[(track.x, y)];
         cell.set_symbol("▕");
         cell.set_style(Style::default().fg(track_color));
     }
     for y in thumb.top..thumb.top + thumb.len {
-        let cell = &mut buf[(track.x, y)];
+        let cell = &mut buffer[(track.x, y)];
         cell.set_symbol(thumb_symbol);
         cell.set_style(Style::default().fg(thumb_color));
     }
+}
+
+pub(super) fn render_scrollbar(
+    frame: &mut Frame,
+    metrics: crate::pane::ScrollMetrics,
+    track: Rect,
+    track_color: Color,
+    thumb_color: Color,
+    thumb_symbol: &str,
+) {
+    render_scrollbar_buffer(
+        frame.buffer_mut(),
+        metrics,
+        track,
+        track_color,
+        thumb_color,
+        thumb_symbol,
+    );
 }
 
 pub(super) fn render_pane_scrollbar(

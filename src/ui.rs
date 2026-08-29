@@ -46,14 +46,15 @@ pub(crate) use self::onboarding::{
 pub(crate) use self::panes::{popup_pane_rects, render_selection_highlight};
 use self::panes::{render_empty, render_popup_pane, resize_popup_pane};
 pub(crate) use self::release_notes::{
-    product_announcement_display_lines, release_notes_close_button_rect,
-    release_notes_display_lines, release_notes_wrapped_line_count, PRODUCT_ANNOUNCEMENT_MODAL_SIZE,
-    RELEASE_NOTES_MODAL_SIZE,
+    product_announcement_display_lines, product_announcement_scroll_metrics,
+    release_notes_close_button_rect, release_notes_display_lines, release_notes_wrapped_line_count,
+    PRODUCT_ANNOUNCEMENT_MODAL_SIZE, RELEASE_NOTES_MODAL_SIZE,
 };
 use self::release_notes::{render_product_announcement_overlay, render_release_notes_overlay};
 pub(crate) use self::scrollbar::{
-    pane_scrollbar_rect, release_notes_scrollbar_rect, scrollbar_offset_from_drag_row,
-    scrollbar_offset_from_row, scrollbar_thumb, scrollbar_thumb_grab_offset, should_show_scrollbar,
+    pane_scrollbar_rect, release_notes_scrollbar_rect, render_scrollbar_buffer,
+    scrollbar_offset_from_drag_row, scrollbar_offset_from_row, scrollbar_thumb,
+    scrollbar_thumb_grab_offset, should_show_scrollbar,
 };
 use self::settings::render_settings_overlay;
 pub(crate) use self::sidebar::agent_panel_entries_from;

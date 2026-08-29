@@ -428,6 +428,30 @@ pub(crate) fn product_announcement_display_lines<'a>(
     release_notes_lines(announcement.body.as_str(), p)
 }
 
+pub(crate) fn product_announcement_scroll_metrics(
+    announcement: &ProductAnnouncementState,
+    body: Rect,
+    p: &Palette,
+) -> crate::pane::ScrollMetrics {
+    let viewport_rows = body.height.max(1) as usize;
+    let lines = product_announcement_display_lines(announcement, p);
+    let rows_for_width = |width: u16| release_notes_wrapped_line_count(&lines, width.max(1));
+    let full_width = body.width.max(1);
+    let mut total_rows = rows_for_width(full_width);
+    let wrap_width = if total_rows > viewport_rows && full_width > 1 {
+        full_width.saturating_sub(1)
+    } else {
+        full_width
+    };
+    total_rows = rows_for_width(wrap_width);
+    let max_offset_from_bottom = total_rows.saturating_sub(viewport_rows);
+    crate::pane::ScrollMetrics {
+        offset_from_bottom: max_offset_from_bottom.saturating_sub(usize::from(announcement.scroll)),
+        max_offset_from_bottom,
+        viewport_rows,
+    }
+}
+
 pub(crate) fn release_notes_wrapped_line_count(lines: &[(usize, Line<'_>)], width: u16) -> usize {
     Paragraph::new(
         lines

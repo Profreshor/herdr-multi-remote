@@ -146,10 +146,21 @@ pub(super) fn snapshot(
         })
         .collect();
 
+    let product_announcement = app.state.product_announcement.as_ref().map(|announcement| {
+        protocol::ClientShellProductAnnouncement {
+            version: announcement.version.clone(),
+            id: announcement.id.clone(),
+            title: announcement.title.clone(),
+            body: announcement.body.clone(),
+            preview: announcement.preview,
+        }
+    });
+
     protocol::ClientShellSnapshot {
         boot_id: boot_id.to_owned(),
         revision,
         config_diagnostic: config_diagnostic.map(str::to_owned),
+        product_announcement,
         focused_workspace_id: snapshot.focused_workspace_id,
         focused_tab_id: snapshot.focused_tab_id,
         focused_pane_id: snapshot.focused_pane_id,

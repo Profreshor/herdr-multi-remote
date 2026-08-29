@@ -4158,6 +4158,15 @@ mod tests {
                 },
             ),
         };
+        let announcement_dismiss = crate::api::schema::Request {
+            id: "req_11".into(),
+            method: crate::api::schema::Method::ProductAnnouncementDismiss(
+                crate::api::schema::ProductAnnouncementDismissParams {
+                    version: "0.8.2".into(),
+                    id: "client-shell".into(),
+                },
+            ),
+        };
 
         assert!(!crate::api::request_changes_ui(&read_only));
         assert!(!crate::api::request_changes_ui(&worktree_list));
@@ -4169,6 +4178,7 @@ mod tests {
         assert!(crate::api::request_changes_ui(&pane_resize));
         assert!(crate::api::request_changes_ui(&agent_view));
         assert!(crate::api::request_changes_ui(&command_invoke));
+        assert!(crate::api::request_changes_ui(&announcement_dismiss));
     }
 
     #[test]

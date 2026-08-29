@@ -6555,6 +6555,14 @@ mod tests {
         server.app.state.active = Some(0);
         server.app.state.selected = 0;
         server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.product_announcement = Some(crate::app::state::ProductAnnouncementState {
+            version: "0.8.2".into(),
+            id: "client-shell".into(),
+            title: "Client shell".into(),
+            body: "announcement".into(),
+            scroll: 0,
+            preview: true,
+        });
         server.server_config_diagnostic_without_keybindings =
             Some("endpoint config warning".into());
 
@@ -6577,6 +6585,14 @@ mod tests {
                 assert_eq!(
                     snapshot.config_diagnostic.as_deref(),
                     Some("endpoint config warning")
+                );
+                assert_eq!(
+                    snapshot.product_announcement.as_ref().map(|announcement| (
+                        announcement.version.as_str(),
+                        announcement.id.as_str(),
+                        announcement.preview,
+                    )),
+                    Some(("0.8.2", "client-shell", true))
                 );
             }
             other => panic!("expected client shell snapshot, got {other:?}"),

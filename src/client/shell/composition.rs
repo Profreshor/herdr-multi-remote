@@ -393,12 +393,22 @@ impl ClientShellState {
                 self.hits.settings_popup = rendered.settings_popup;
                 self.hits.settings_tabs = rendered.settings_tabs;
                 self.hits.settings_choices = rendered.settings_choices;
+                self.hits.product_announcement_scrollbar = rendered.product_announcement_scrollbar;
+                self.hits.product_announcement_scroll_metrics =
+                    rendered.product_announcement_scroll_metrics;
+                self.hits.product_announcement_max_scroll =
+                    rendered.product_announcement_max_scroll;
                 rendered.cursor
             };
             frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
         }
         if let Some(ClientShellOverlay::Help(help)) = self.overlay.as_mut() {
             help.scroll = help.scroll.min(self.hits.help_max_scroll);
+        }
+        if let Some(ClientShellOverlay::ProductAnnouncement(announcement)) = self.overlay.as_mut() {
+            announcement.scroll = announcement
+                .scroll
+                .min(u16::try_from(self.hits.product_announcement_max_scroll).unwrap_or(u16::MAX));
         }
         Some(frame)
     }

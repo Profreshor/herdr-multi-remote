@@ -1000,6 +1000,24 @@ impl App {
             Method::NotificationShow(params) => {
                 return self.handle_notification_show(request.id, params);
             }
+            Method::ProductAnnouncementDismiss(params) => {
+                let matches_current =
+                    self.state
+                        .product_announcement
+                        .as_ref()
+                        .is_some_and(|announcement| {
+                            announcement.version == params.version && announcement.id == params.id
+                        });
+                if !matches_current {
+                    return responses::encode_error(
+                        request.id,
+                        "stale_announcement",
+                        "the product announcement is no longer current",
+                    );
+                }
+                self.dismiss_product_announcement();
+                return responses::encode_success(request.id, ResponseResult::Ok {});
+            }
             Method::CommandInvoke(params) => {
                 return self.handle_command_invoke(request.id, params);
             }
@@ -1478,6 +1496,52 @@ mod tests {
         )
         .await
         .expect("matching agent detection runtime should be reset");
+    }
+
+    #[test]
+    fn product_announcement_dismiss_requires_current_identity() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.product_announcement = Some(crate::app::state::ProductAnnouncementState {
+            version: "0.8.2".into(),
+            id: "client-shell".into(),
+            title: "Client shell".into(),
+            body: "announcement".into(),
+            scroll: 0,
+            preview: true,
+        });
+
+        let stale = app.handle_api_request(crate::api::schema::Request {
+            id: "stale".into(),
+            method: crate::api::schema::Method::ProductAnnouncementDismiss(
+                crate::api::schema::ProductAnnouncementDismissParams {
+                    version: "0.8.2".into(),
+                    id: "old".into(),
+                },
+            ),
+        });
+        let stale: serde_json::Value = serde_json::from_str(&stale).unwrap();
+        assert_eq!(stale["error"]["code"], "stale_announcement");
+        assert!(app.state.product_announcement.is_some());
+
+        let dismissed = app.handle_api_request(crate::api::schema::Request {
+            id: "dismiss".into(),
+            method: crate::api::schema::Method::ProductAnnouncementDismiss(
+                crate::api::schema::ProductAnnouncementDismissParams {
+                    version: "0.8.2".into(),
+                    id: "client-shell".into(),
+                },
+            ),
+        });
+        let dismissed: serde_json::Value = serde_json::from_str(&dismissed).unwrap();
+        assert_eq!(dismissed["result"]["type"], "ok");
+        assert!(app.state.product_announcement.is_none());
     }
 
     #[tokio::test]

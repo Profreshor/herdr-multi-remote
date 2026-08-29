@@ -342,6 +342,33 @@ impl ClientShellState {
         }
         match pending.kind {
             PendingEndpointKind::Generic => {}
+            PendingEndpointKind::ProductAnnouncementDismiss { version, id } => {
+                return match result {
+                    Ok(_) => (false, Vec::new()),
+                    Err(error) => {
+                        let key = (version.clone(), id.clone());
+                        if self.dismissed_product_announcement.as_ref() == Some(&key) {
+                            self.dismissed_product_announcement = None;
+                        }
+                        if self.overlay.is_none() {
+                            if let Some(announcement) = self
+                                .snapshot
+                                .as_deref()
+                                .and_then(|snapshot| snapshot.product_announcement.as_ref())
+                                .filter(|announcement| {
+                                    announcement.version == version && announcement.id == id
+                                })
+                            {
+                                self.overlay = Some(ClientShellOverlay::ProductAnnouncement(
+                                    product_announcement_state(announcement),
+                                ));
+                            }
+                        }
+                        self.endpoint_error = Some(error.message);
+                        (true, Vec::new())
+                    }
+                };
+            }
             PendingEndpointKind::PopupCommand => {
                 return match result {
                     Ok(_) => {
