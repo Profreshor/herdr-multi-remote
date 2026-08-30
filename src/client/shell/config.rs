@@ -48,7 +48,7 @@ impl ClientShellState {
         }
     }
 
-    pub(super) fn reload_client_config(&mut self) {
+    pub(crate) fn reload_client_config(&mut self) {
         match crate::config::load_live_config() {
             Ok(loaded) => {
                 let agent_panel_sort = self.config.agent_panel_sort;
@@ -63,14 +63,20 @@ impl ClientShellState {
                 if self.agent_panel_sort_manual {
                     self.config.agent_panel_sort = agent_panel_sort;
                 }
-                self.set_local_config_diagnostic(crate::config::config_diagnostic_summary(
-                    &diagnostics,
-                ));
+                self.set_local_config_diagnostic(self.config.local_config_diagnostic(&diagnostics));
+                if let Some(snapshot) = self.snapshot.as_deref() {
+                    let profile = snapshot.server_keybindings_toml.clone();
+                    let commands = snapshot.commands.clone();
+                    if let Err(err) = self
+                        .config
+                        .apply_snapshot_keybindings(profile.as_deref(), &commands)
+                    {
+                        self.endpoint_error = Some(err);
+                    }
+                }
             }
             Err(diagnostics) => {
-                self.set_local_config_diagnostic(crate::config::config_diagnostic_summary(
-                    &diagnostics,
-                ));
+                self.set_local_config_diagnostic(self.config.local_config_diagnostic(&diagnostics));
             }
         }
     }
@@ -109,6 +115,8 @@ impl ClientShellConfig {
                     prefix: config.prefix_key(),
                     keybinds: config.keybinds(),
                 }),
+            local_keys: config.keys.clone(),
+            keybinding_source: ClientShellKeybindingSource::Local,
             prompt_new_tab_name: config.ui.prompt_new_tab_name,
             prompt_new_workspace_name: config.ui.prompt_new_workspace_name,
             confirm_close: config.ui.confirm_close,
@@ -135,6 +143,24 @@ impl ClientShellConfig {
         self
     }
 
+    pub(crate) fn with_keybinding_source(mut self, source: ClientShellKeybindingSource) -> Self {
+        self.keybinding_source = source;
+        self.keybinds.keybinds.custom_commands.clear();
+        self
+    }
+
+    pub(crate) fn uses_endpoint_keybindings(&self) -> bool {
+        self.keybinding_source == ClientShellKeybindingSource::Endpoint
+    }
+
+    pub(super) fn local_config_diagnostic(&self, diagnostics: &[String]) -> Option<String> {
+        if self.uses_endpoint_keybindings() {
+            crate::config::config_diagnostic_summary_without_keybindings(diagnostics)
+        } else {
+            crate::config::config_diagnostic_summary(diagnostics)
+        }
+    }
+
     pub(crate) fn with_local_endpoint(self, socket_path: &std::path::Path) -> Self {
         self.with_preferences_path(preferences::path_for_local_endpoint(socket_path))
     }
@@ -143,6 +169,79 @@ impl ClientShellConfig {
         self.preferences = preferences::load(&path).unwrap_or_default();
         self.preferences_path = Some(path);
         self
+    }
+
+    pub(super) fn apply_snapshot_keybindings(
+        &mut self,
+        profile: Option<&str>,
+        commands: &[crate::protocol::ClientShellCommand],
+    ) -> Result<(), String> {
+        let mut keybinds = match self.keybinding_source {
+            ClientShellKeybindingSource::Endpoint => crate::config::keybindings_from_profile_toml(
+                profile.ok_or("endpoint did not publish its keybindings")?,
+            )?,
+            ClientShellKeybindingSource::RemoteLocal => return Ok(()),
+            ClientShellKeybindingSource::Local => {
+                let mut config = crate::config::Config {
+                    keys: self.local_keys.clone(),
+                    ..Default::default()
+                };
+                config.keys.command = commands
+                    .iter()
+                    .map(|command| crate::config::CommandKeybindConfig {
+                        key: if command.binding_labels.len() == 1 {
+                            crate::config::BindingConfig::One(command.binding_labels[0].clone())
+                        } else {
+                            crate::config::BindingConfig::Many(command.binding_labels.clone())
+                        },
+                        // The client never executes this field; preserve the opaque endpoint ID
+                        // through the shared config collision resolver.
+                        command: command.command_id.clone(),
+                        action_type: match command.action {
+                            crate::protocol::ClientShellCommandAction::Shell => {
+                                crate::config::CommandKeybindType::Shell
+                            }
+                            crate::protocol::ClientShellCommandAction::Pane => {
+                                crate::config::CommandKeybindType::Pane
+                            }
+                            crate::protocol::ClientShellCommandAction::Popup => {
+                                crate::config::CommandKeybindType::Popup
+                            }
+                            crate::protocol::ClientShellCommandAction::PluginAction => {
+                                crate::config::CommandKeybindType::PluginAction
+                            }
+                        },
+                        description: command.description.clone(),
+                        width: None,
+                        height: None,
+                    })
+                    .collect();
+                config
+                    .live_keybinds_with_diagnostics()
+                    .map(|(keybinds, _diagnostics)| keybinds)
+                    .map_err(|diagnostics| diagnostics.join("; "))?
+            }
+        };
+        if self.keybinding_source == ClientShellKeybindingSource::Endpoint {
+            for command in commands {
+                keybinds
+                    .keybinds
+                    .custom_commands
+                    .push(crate::config::CustomCommandKeybind {
+                        bindings: crate::config::ActionKeybinds::from_labels(
+                            &command.binding_labels,
+                        )?,
+                        label: command.binding_label.clone(),
+                        command: command.command_id.clone(),
+                        action: command.action.into(),
+                        description: command.description.clone(),
+                        width: None,
+                        height: None,
+                    });
+            }
+        }
+        self.keybinds = keybinds;
+        Ok(())
     }
 
     pub(super) fn apply_live_config(
@@ -155,9 +254,15 @@ impl ClientShellConfig {
         let invalid_section =
             |section: &str| invalid_sections.iter().any(|invalid| invalid == section);
 
-        if !invalid_section("keys") {
+        if !invalid_section("keys")
+            && self.keybinding_source != ClientShellKeybindingSource::Endpoint
+        {
             match config.live_keybinds_with_diagnostics() {
-                Ok((keybinds, keybind_diagnostics)) => {
+                Ok((mut keybinds, keybind_diagnostics)) => {
+                    self.local_keys = config.keys.clone();
+                    if self.keybinding_source == ClientShellKeybindingSource::RemoteLocal {
+                        keybinds.keybinds.custom_commands.clear();
+                    }
                     self.keybinds = keybinds;
                     diagnostics.extend(keybind_diagnostics);
                 }

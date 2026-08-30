@@ -165,6 +165,7 @@ pub struct App {
     /// even when an App-internal drain consumes the event before the forwarding drain.
     pub(crate) local_input_source_switch: bool,
     pub(crate) config_reloaded_from_disk: bool,
+    client_shell_keybindings_profile: Option<String>,
     endpoint_commands: custom_commands::EndpointCommandRegistry,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
@@ -780,6 +781,7 @@ impl App {
                 .get(idx)
                 .and_then(|ws| ws.focused_pane_id().map(|pane_id| (idx, pane_id)))
         });
+        let client_shell_keybindings_profile = config.local_keybindings_profile_toml().ok();
         let endpoint_commands =
             custom_commands::EndpointCommandRegistry::new(&state.keybinds.custom_commands);
 
@@ -846,6 +848,7 @@ impl App {
             local_terminal_notifications: true,
             local_input_source_switch: true,
             config_reloaded_from_disk: false,
+            client_shell_keybindings_profile,
             endpoint_commands,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         };
@@ -1489,6 +1492,12 @@ impl App {
                     self.state.prefix_code = live.prefix.0;
                     self.state.prefix_mods = live.prefix.1;
                     self.state.keybinds = live.keybinds;
+                    match config.local_keybindings_profile_toml() {
+                        Ok(profile) => self.client_shell_keybindings_profile = Some(profile),
+                        Err(err) => diagnostics.push(format!(
+                            "failed to publish server keybindings: {err}; kept previous keybindings"
+                        )),
+                    }
                     diagnostics.extend(keybind_diagnostics);
                 }
                 Err(keybind_diagnostics) => {
@@ -1533,13 +1542,7 @@ impl App {
                     .clamp(self.state.sidebar_min_width, self.state.sidebar_max_width);
                 self.state.mouse_capture = config.ui.mouse_capture;
                 self.state.copy_on_select = config.ui.copy_on_select;
-                if self.state.redraw_on_focus_gained != config.ui.redraw_on_focus_gained {
-                    self.state.request_client_config_reload = true;
-                }
                 self.state.redraw_on_focus_gained = config.ui.redraw_on_focus_gained;
-                if self.loaded_host_cursor != config.ui.host_cursor {
-                    self.state.request_client_config_reload = true;
-                }
                 self.loaded_host_cursor = config.ui.host_cursor;
                 self.state.mouse_scroll_lines = config.ui.mouse_scroll_lines();
                 self.state.right_click_passthrough_modifiers =
@@ -1567,9 +1570,6 @@ impl App {
                 self.state.sidebar_spaces = config.ui.sidebar.spaces.clone();
                 self.state.agent_panel_scroll = 0;
                 self.state.accent = crate::config::parse_color(&config.ui.accent);
-                if !self.state.local_sound_playback && self.state.sound != config.ui.sound {
-                    self.state.request_client_config_reload = true;
-                }
                 self.state.sound = config.ui.sound.clone();
                 self.state.toast_config = config.ui.toast.clone();
             }
@@ -1691,6 +1691,7 @@ impl App {
             }
         }
 
+        self.state.request_client_config_reload = true;
         crate::config::ConfigReloadReport {
             status,
             diagnostics,
@@ -3272,6 +3273,26 @@ mod tests {
         assert_eq!(toast.kind, crate::app::state::ToastKind::UpdateInstalled);
         assert_eq!(toast.title, "reloaded config");
         assert_eq!(toast.context, "using config.toml");
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_requests_client_reload_for_key_only_change() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-key-only");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[keys]\nprefix = \"ctrl+a\"\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        app.state.request_client_config_reload = false;
+        let report = app.reload_config();
+
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(app.state.prefix_code, KeyCode::Char('a'));
+        assert!(app.state.request_client_config_reload);
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

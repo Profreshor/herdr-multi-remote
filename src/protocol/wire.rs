@@ -561,6 +561,8 @@ pub enum ClientMessage {
         surface_size: ClientSurfaceSize,
         pixel_mouse: bool,
         direct_graphics: bool,
+        /// Whether the endpoint's keymap, rather than the client's, owns shell bindings.
+        endpoint_keybindings: bool,
     },
 
     /// Resize the outer terminal and pane viewport of a client-owned shell.
@@ -808,6 +810,8 @@ pub struct ClientShellSnapshot {
     pub update_available: Option<String>,
     /// Endpoint-specific command shown in update instructions.
     pub update_install_command: String,
+    /// Endpoint's normalized built-in keybindings, used only when a remote client selects server bindings.
+    pub server_keybindings_toml: Option<String>,
     /// Whether the endpoint has a What's New entry, even if its body is unavailable.
     pub latest_release_notes_available: bool,
     /// Whether endpoint-owned integration assets need an update.
@@ -863,11 +867,24 @@ impl From<crate::config::CustomCommandAction> for ClientShellCommandAction {
     }
 }
 
+impl From<ClientShellCommandAction> for crate::config::CustomCommandAction {
+    fn from(action: ClientShellCommandAction) -> Self {
+        match action {
+            ClientShellCommandAction::Shell => Self::Shell,
+            ClientShellCommandAction::Pane => Self::Pane,
+            ClientShellCommandAction::Popup => Self::Popup,
+            ClientShellCommandAction::PluginAction => Self::PluginAction,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientShellCommand {
     pub command_id: String,
     pub binding_label: String,
+    pub binding_labels: Vec<String>,
     pub action: ClientShellCommandAction,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2077,6 +2094,7 @@ mod tests {
             }),
             update_available: Some("0.8.3".into()),
             update_install_command: "herdr update".into(),
+            server_keybindings_toml: Some("[keys]\nprefix = \"ctrl+a\"\n".into()),
             latest_release_notes_available: true,
             integration_updates_available: true,
             release_notes: Some(ClientShellReleaseNotes {
@@ -2132,7 +2150,9 @@ mod tests {
             commands: vec![ClientShellCommand {
                 command_id: "cmd_0123456789abcdef0123456789abcdef".into(),
                 binding_label: "prefix+z".into(),
+                binding_labels: vec!["prefix+z".into()],
                 action: ClientShellCommandAction::Shell,
+                description: Some("deploy".into()),
             }],
         }));
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();

@@ -51,7 +51,28 @@ pub(crate) use self::{
     window_title::{sanitize_window_title_text, window_title_diagnostics},
 };
 
+pub(crate) use self::{keybinds::CommandKeybindType, model::KeysConfig};
+
 pub const CONFIG_PATH_ENV_VAR: &str = "HERDR_CONFIG_PATH";
+
+pub(crate) fn is_keybinding_config_diagnostic(diagnostic: &str) -> bool {
+    if diagnostic.starts_with("config parse error:") || diagnostic.starts_with("config read error:")
+    {
+        return false;
+    }
+    diagnostic.contains("keybinding") || diagnostic.contains("keys.")
+}
+
+pub(crate) fn config_diagnostic_summary_without_keybindings(
+    diagnostics: &[String],
+) -> Option<String> {
+    let diagnostics = diagnostics
+        .iter()
+        .filter(|diagnostic| !is_keybinding_config_diagnostic(diagnostic))
+        .cloned()
+        .collect::<Vec<_>>();
+    config_diagnostic_summary(&diagnostics)
+}
 pub const DEFAULT_SCROLLBACK_LIMIT_BYTES: usize = 10_000_000;
 pub const DEFAULT_MOUSE_SCROLL_LINES: usize = 3;
 pub const DEFAULT_MOBILE_WIDTH_THRESHOLD: u16 = 64;
@@ -159,10 +180,19 @@ impl Config {
             keys: model::KeysConfigOverlay,
         }
 
-        toml::to_string_pretty(&KeysProfile {
-            keys: self.keys.local_profile(&self.keybinds()),
-        })
+        let mut keys = self.keys.local_profile(&self.keybinds());
+        keys.set_prefix(format_key_combo(self.prefix_key()));
+        toml::to_string_pretty(&KeysProfile { keys })
     }
+}
+
+pub(crate) fn keybindings_from_profile_toml(profile: &str) -> Result<LiveKeybindConfig, String> {
+    let config = toml::from_str::<Config>(profile)
+        .map_err(|err| format!("invalid keybinding profile: {err}"))?;
+    config
+        .live_keybinds_with_diagnostics()
+        .map(|(keybinds, _diagnostics)| keybinds)
+        .map_err(|diagnostics| diagnostics.join("; "))
 }
 
 #[cfg(test)]
@@ -192,6 +222,23 @@ command = "lazygit"
         assert!(!profile.contains("lazygit"));
         assert!(!profile.contains("command ="));
         assert!(!profile.contains("[[keys.command]]"));
+    }
+
+    #[test]
+    fn local_keybindings_profile_publishes_the_effective_prefix_fallback() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+prefix = "ctrl+"
+"#,
+        )
+        .unwrap();
+
+        let profile = config.local_keybindings_profile_toml().unwrap();
+        let keybinds = keybindings_from_profile_toml(&profile).unwrap();
+
+        assert!(profile.contains("prefix = \"ctrl+b\""));
+        assert_eq!(keybinds.prefix, config.prefix_key());
     }
 
     #[test]

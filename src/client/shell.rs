@@ -283,6 +283,7 @@ mod tests {
             product_announcement: None,
             update_available: None,
             update_install_command: "herdr update".into(),
+            server_keybindings_toml: None,
             latest_release_notes_available: false,
             integration_updates_available: false,
             release_notes: None,
@@ -1149,6 +1150,19 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_keybindings_hide_only_local_keybinding_diagnostics() {
+        let config = ClientShellConfig::from_config(&Config::default())
+            .with_keybinding_source(ClientShellKeybindingSource::Endpoint);
+        let diagnostics = vec![
+            "unsafe direct keybinding: keys.close_pane would intercept typing".into(),
+            "theme warning".into(),
+        ];
+
+        assert!(config.local_config_diagnostic(&diagnostics[..1]).is_none());
+        assert!(config.local_config_diagnostic(&diagnostics).is_some());
+    }
+
+    #[test]
     fn live_client_config_keeps_sound_diagnostics() {
         let mut shell_config = ClientShellConfig::from_config(&Config::default());
         let mut config = Config::default();
@@ -1423,7 +1437,9 @@ mod tests {
             .push(crate::protocol::ClientShellCommand {
                 command_id: "cmd_popup".into(),
                 binding_label: binding.label.clone(),
+                binding_labels: binding.bindings.labels(),
                 action: crate::protocol::ClientShellCommandAction::Popup,
+                description: None,
             });
         state.set_snapshot(Box::new(projection));
         state.set_pane_surface(surface());
@@ -4797,6 +4813,138 @@ detach = "prefix+x"
     }
 
     #[test]
+    fn remote_keybinding_sources_keep_local_commands_off_endpoints_and_apply_server_profiles() {
+        let local: Config = toml::from_str(
+            r#"
+[keys]
+prefix = "ctrl+a"
+new_tab = "prefix+c"
+
+[[keys.command]]
+key = "prefix+c"
+command = "local-only"
+"#,
+        )
+        .unwrap();
+        let remote_local = ClientShellConfig::from_config(&local)
+            .with_keybinding_source(ClientShellKeybindingSource::RemoteLocal);
+        assert_eq!(remote_local.keybinds.prefix.0, KeyCode::Char('a'));
+        assert!(remote_local.keybinds.keybinds.custom_commands.is_empty());
+        assert_eq!(
+            remote_local.keybinds.keybinds.new_tab.label().as_deref(),
+            Some("prefix+c")
+        );
+
+        let mut local_state = ClientShellState::new(
+            ClientShellConfig::from_config(&local)
+                .with_keybinding_source(ClientShellKeybindingSource::Local),
+        );
+        let mut local_projection = snapshot();
+        local_projection
+            .commands
+            .push(crate::protocol::ClientShellCommand {
+                command_id: "cmd_loaded_endpoint".into(),
+                binding_label: "prefix+c / prefix+y".into(),
+                binding_labels: vec!["prefix+c".into(), "prefix+y".into()],
+                action: crate::protocol::ClientShellCommandAction::Shell,
+                description: Some("loaded endpoint command".into()),
+            });
+        local_state.set_snapshot(Box::new(local_projection));
+        assert_eq!(
+            local_state.config.keybinds.keybinds.custom_commands[0].label,
+            "prefix+y"
+        );
+        assert_eq!(
+            local_state
+                .config
+                .keybinds
+                .keybinds
+                .new_tab
+                .label()
+                .as_deref(),
+            Some("prefix+c")
+        );
+        let mut command_outcome = ClientShellInput::default();
+        local_state.record_binding(
+            crate::input::KeybindMatch::Command(
+                local_state.config.keybinds.keybinds.custom_commands[0].clone(),
+            ),
+            &mut command_outcome,
+        );
+        let [ClientShellAction::Endpoint { request, .. }] = &command_outcome.actions[..] else {
+            panic!("expected surviving endpoint command binding");
+        };
+        let crate::api::schema::Method::CommandInvoke(params) = &request.method else {
+            panic!("expected command invocation");
+        };
+        assert_eq!(params.command_id, "cmd_loaded_endpoint");
+
+        let mut id_only_projection = snapshot();
+        id_only_projection.revision = 2;
+        id_only_projection
+            .commands
+            .push(crate::protocol::ClientShellCommand {
+                command_id: "cmd_reloaded_endpoint".into(),
+                binding_label: "prefix+c / prefix+y".into(),
+                binding_labels: vec!["prefix+c".into(), "prefix+y".into()],
+                action: crate::protocol::ClientShellCommandAction::Shell,
+                description: Some("loaded endpoint command".into()),
+            });
+        local_state.mode = ClientShellMode::Prefix;
+        local_state.set_snapshot(Box::new(id_only_projection));
+        assert_eq!(local_state.mode, ClientShellMode::Prefix);
+        assert_eq!(
+            local_state.config.keybinds.keybinds.custom_commands[0].command,
+            "cmd_reloaded_endpoint"
+        );
+
+        let endpoint: Config = toml::from_str(
+            r#"
+[keys]
+prefix = "ctrl+x"
+new_tab = "prefix+n"
+"#,
+        )
+        .unwrap();
+        let mut state = ClientShellState::new(
+            ClientShellConfig::from_config(&local)
+                .with_keybinding_source(ClientShellKeybindingSource::Endpoint),
+        );
+        let mut projection = snapshot();
+        projection.server_keybindings_toml = endpoint.local_keybindings_profile_toml().ok();
+        projection
+            .commands
+            .push(crate::protocol::ClientShellCommand {
+                command_id: "cmd_remote".into(),
+                binding_label: "prefix+z".into(),
+                binding_labels: vec!["prefix+z".into()],
+                action: crate::protocol::ClientShellCommandAction::Shell,
+                description: Some("remote command".into()),
+            });
+        state.set_snapshot(Box::new(projection));
+
+        assert_eq!(state.config.keybinds.prefix.0, KeyCode::Char('x'));
+        assert_eq!(
+            state.config.keybinds.keybinds.new_tab.label().as_deref(),
+            Some("prefix+n")
+        );
+        assert_eq!(
+            state.config.keybinds.keybinds.custom_commands[0].label,
+            "prefix+z"
+        );
+        assert_eq!(
+            state.config.keybinds.keybinds.custom_commands[0]
+                .description
+                .as_deref(),
+            Some("remote command")
+        );
+        assert_eq!(
+            state.config.keybinds.keybinds.custom_commands[0].command,
+            "cmd_remote"
+        );
+    }
+
+    #[test]
     fn custom_binding_invokes_only_the_endpoint_manifest_id() {
         let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
         let binding = crate::config::CustomCommandKeybind {
@@ -4814,7 +4962,9 @@ detach = "prefix+x"
             .push(crate::protocol::ClientShellCommand {
                 command_id: "cmd_0123456789abcdef0123456789abcdef".into(),
                 binding_label: binding.label.clone(),
+                binding_labels: binding.bindings.labels(),
                 action: crate::protocol::ClientShellCommandAction::Shell,
+                description: None,
             });
         state.set_snapshot(Box::new(projection));
 
@@ -4902,21 +5052,17 @@ detach = "prefix+x"
     #[test]
     fn help_overlay_restores_released_search_scroll_and_custom_binding_behavior() {
         let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
-        state
-            .config
-            .keybinds
-            .keybinds
-            .custom_commands
-            .push(crate::config::CustomCommandKeybind {
-                bindings: crate::config::ActionKeybinds::prefix("z"),
-                label: "prefix+z".into(),
-                command: "plugin.action".into(),
-                action: crate::config::CustomCommandAction::PluginAction,
+        let mut projection = snapshot();
+        projection
+            .commands
+            .push(crate::protocol::ClientShellCommand {
+                command_id: "plugin-action".into(),
+                binding_label: "prefix+z".into(),
+                binding_labels: vec!["prefix+z".into()],
+                action: crate::protocol::ClientShellCommandAction::PluginAction,
                 description: Some("run plugin action".into()),
-                width: None,
-                height: None,
             });
-        state.set_snapshot(Box::new(snapshot()));
+        state.set_snapshot(Box::new(projection));
         state.set_pane_surface(surface());
         let mut open = ClientShellInput::default();
         state.record_binding(

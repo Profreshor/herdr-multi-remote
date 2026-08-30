@@ -593,6 +593,12 @@ pub(crate) struct KeysConfigOverlay {
     command: Option<Vec<CommandKeybindConfig>>,
 }
 
+impl KeysConfigOverlay {
+    pub(crate) fn set_prefix(&mut self, prefix: String) {
+        self.prefix = Some(prefix);
+    }
+}
+
 impl<'de> Deserialize<'de> for KeysConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

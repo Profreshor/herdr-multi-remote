@@ -3259,6 +3259,7 @@ impl HeadlessServer {
                 cell_height_px,
                 pixel_mouse,
                 direct_graphics,
+                endpoint_keybindings,
                 writer,
             } => {
                 if self.handoff_in_progress {
@@ -3274,6 +3275,15 @@ impl HeadlessServer {
                     }
                     return false;
                 }
+                info!(
+                    client_id,
+                    cols = surface_cols,
+                    rows = surface_rows,
+                    cell_width_px,
+                    cell_height_px,
+                    render_encoding = ?protocol::RenderEncoding::SemanticFrame,
+                    "client connected"
+                );
                 if self.app.state.mode == app::Mode::Onboarding
                     && self.app.state.workspaces.is_empty()
                 {
@@ -3300,12 +3310,18 @@ impl HeadlessServer {
                 );
                 connection.pixel_mouse = pixel_mouse;
                 connection.direct_graphics = direct_graphics;
+                connection.shell_uses_endpoint_keybindings = endpoint_keybindings;
                 connection.shell_projection_revision = 1;
+                let config_diagnostic = if endpoint_keybindings {
+                    self.server_config_diagnostic.as_deref()
+                } else {
+                    self.server_config_diagnostic_without_keybindings.as_deref()
+                };
                 let snapshot = client_shell_snapshot(
                     &self.app,
                     &self.client_shell_boot_id,
                     connection.shell_projection_revision,
-                    self.server_config_diagnostic_without_keybindings.as_deref(),
+                    config_diagnostic,
                 );
                 connection.shell_snapshot = Some(snapshot.clone());
                 self.clients.insert(client_id, connection);
@@ -4989,14 +5005,7 @@ impl HeadlessServer {
         let shell_snapshot_template = render_targets
             .iter()
             .any(|(_, _, _, _, mode)| matches!(mode, ClientConnectionMode::ClientShell))
-            .then(|| {
-                client_shell_snapshot(
-                    &self.app,
-                    &self.client_shell_boot_id,
-                    0,
-                    self.server_config_diagnostic_without_keybindings.as_deref(),
-                )
-            });
+            .then(|| client_shell_snapshot(&self.app, &self.client_shell_boot_id, 0, None));
         let mut broken_clients: Vec<u64> = Vec::new();
         let mut deferred_frame = false;
         for (client_id, (cols, rows), cell_size, is_foreground, mode) in render_targets {
@@ -5009,6 +5018,11 @@ impl HeadlessServer {
                 };
                 let Some(mut candidate) = shell_snapshot_template.clone() else {
                     continue;
+                };
+                candidate.config_diagnostic = if client.shell_uses_endpoint_keybindings {
+                    self.server_config_diagnostic.clone()
+                } else {
+                    self.server_config_diagnostic_without_keybindings.clone()
                 };
                 candidate.revision = client.shell_projection_revision;
                 if client.shell_snapshot.as_ref() != Some(&candidate) {
@@ -5691,23 +5705,10 @@ fn sanitize_notification_text(value: &str, max_chars: usize) -> Option<String> {
 }
 
 fn server_config_diagnostic_summaries(diagnostics: &[String]) -> (Option<String>, Option<String>) {
-    let without_keybindings = diagnostics
-        .iter()
-        .filter(|diagnostic| !is_keybinding_config_diagnostic(diagnostic))
-        .cloned()
-        .collect::<Vec<_>>();
     (
         config::config_diagnostic_summary(diagnostics),
-        config::config_diagnostic_summary(&without_keybindings),
+        config::config_diagnostic_summary_without_keybindings(diagnostics),
     )
-}
-
-fn is_keybinding_config_diagnostic(diagnostic: &str) -> bool {
-    if diagnostic.starts_with("config parse error:") || diagnostic.starts_with("config read error:")
-    {
-        return false;
-    }
-    diagnostic.contains("keybinding") || diagnostic.contains("keys.")
 }
 
 // ---------------------------------------------------------------------------
@@ -6688,6 +6689,7 @@ mod tests {
                 cell_height_px: 0,
                 pixel_mouse: false,
                 direct_graphics: false,
+                endpoint_keybindings: false,
                 writer,
             })
         );
@@ -6712,6 +6714,7 @@ mod tests {
                 cell_height_px: 0,
                 pixel_mouse: false,
                 direct_graphics: false,
+                endpoint_keybindings: false,
                 writer,
             })
         );
@@ -6801,6 +6804,7 @@ mod tests {
                 cell_height_px: 20,
                 pixel_mouse: true,
                 direct_graphics: false,
+                endpoint_keybindings: false,
                 writer,
             })
         );
@@ -6850,6 +6854,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
+        let mut server = test_headless_server();
+        server.server_config_diagnostic = Some("server keybinding warning\ntheme warning".into());
+        server.server_config_diagnostic_without_keybindings = Some("theme warning".into());
+
+        let (local_writer, local_control, _local_render) = test_client_writer();
+        assert!(
+            server.handle_server_event(ServerEvent::ClientShellConnected {
+                client_id: 13,
+                surface_cols: 80,
+                surface_rows: 23,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                pixel_mouse: false,
+                direct_graphics: false,
+                endpoint_keybindings: false,
+                writer: local_writer,
+            })
+        );
+        let ServerMessage::ClientShellSnapshot(local_snapshot) =
+            read_server_message(local_control.recv().expect("local shell snapshot"))
+        else {
+            panic!("expected local shell snapshot");
+        };
+        assert_eq!(
+            local_snapshot.config_diagnostic.as_deref(),
+            Some("theme warning")
+        );
+
+        let (endpoint_writer, endpoint_control, _endpoint_render) = test_client_writer();
+        assert!(
+            server.handle_server_event(ServerEvent::ClientShellConnected {
+                client_id: 14,
+                surface_cols: 80,
+                surface_rows: 23,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                pixel_mouse: false,
+                direct_graphics: false,
+                endpoint_keybindings: true,
+                writer: endpoint_writer,
+            })
+        );
+        let ServerMessage::ClientShellSnapshot(endpoint_snapshot) =
+            read_server_message(endpoint_control.recv().expect("endpoint shell snapshot"))
+        else {
+            panic!("expected endpoint shell snapshot");
+        };
+        assert_eq!(
+            endpoint_snapshot.config_diagnostic.as_deref(),
+            Some("server keybinding warning\ntheme warning")
+        );
+
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
     async fn client_shell_replaces_projection_and_focuses_stable_ids() {
         let mut server = test_headless_server();
         let first = crate::workspace::Workspace::test_new("first");
@@ -6873,6 +6934,7 @@ mod tests {
                 cell_height_px: 0,
                 pixel_mouse: false,
                 direct_graphics: false,
+                endpoint_keybindings: false,
                 writer,
             })
         );
@@ -7030,6 +7092,7 @@ mod tests {
                 cell_height_px: 20,
                 pixel_mouse: false,
                 direct_graphics: false,
+                endpoint_keybindings: false,
                 writer,
             })
         );
@@ -7391,13 +7454,13 @@ new_tab = "prefix+t"
 
     #[test]
     fn server_keybinding_filter_keeps_whole_config_failures() {
-        assert!(!is_keybinding_config_diagnostic(
+        assert!(!config::is_keybinding_config_diagnostic(
             "config parse error: invalid value at `keys.new_tab = @`; using defaults"
         ));
-        assert!(!is_keybinding_config_diagnostic(
+        assert!(!config::is_keybinding_config_diagnostic(
             "config read error: permission denied at keys.toml; using defaults"
         ));
-        assert!(is_keybinding_config_diagnostic(
+        assert!(config::is_keybinding_config_diagnostic(
             "unsafe direct keybinding: keys.close_pane would intercept typing"
         ));
     }

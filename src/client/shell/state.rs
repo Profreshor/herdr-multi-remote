@@ -4,6 +4,13 @@ pub(super) const MIN_TAB_WIDTH: u16 = 8;
 pub(super) const NEW_TAB_WIDTH: u16 = 3;
 pub(super) const WORKSPACE_HEADER_ROWS: u16 = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientShellKeybindingSource {
+    Local,
+    RemoteLocal,
+    Endpoint,
+}
+
 pub(crate) struct ClientShellConfig {
     pub(super) sidebar_width: u16,
     pub(super) sidebar_min_width: u16,
@@ -28,6 +35,8 @@ pub(crate) struct ClientShellConfig {
     pub(super) theme_runtime: crate::app::state::ThemeRuntimeConfig,
     pub(super) palette: Palette,
     pub(super) keybinds: LiveKeybindConfig,
+    pub(super) local_keys: crate::config::KeysConfig,
+    pub(super) keybinding_source: ClientShellKeybindingSource,
     pub(super) prompt_new_tab_name: bool,
     pub(super) prompt_new_workspace_name: bool,
     pub(super) confirm_close: bool,
@@ -1024,6 +1033,40 @@ impl ClientShellState {
             return;
         }
         self.graphics.set_scope(&snapshot.boot_id);
+        let command_bindings_changed = self.snapshot.as_ref().is_none_or(|current| {
+            current.commands.len() != snapshot.commands.len()
+                || current
+                    .commands
+                    .iter()
+                    .zip(&snapshot.commands)
+                    .any(|(left, right)| {
+                        left.binding_labels != right.binding_labels || left.action != right.action
+                    })
+        });
+        let endpoint_profile_changed = self.snapshot.as_ref().is_none_or(|current| {
+            current.server_keybindings_toml != snapshot.server_keybindings_toml
+        });
+        let snapshot_keybindings_changed = match self.config.keybinding_source {
+            ClientShellKeybindingSource::Local => self
+                .snapshot
+                .as_ref()
+                .is_none_or(|current| current.commands != snapshot.commands),
+            ClientShellKeybindingSource::Endpoint => {
+                endpoint_profile_changed
+                    || self
+                        .snapshot
+                        .as_ref()
+                        .is_none_or(|current| current.commands != snapshot.commands)
+            }
+            ClientShellKeybindingSource::RemoteLocal => false,
+        };
+        let active_keymap_changed = match self.config.keybinding_source {
+            ClientShellKeybindingSource::Local => command_bindings_changed,
+            ClientShellKeybindingSource::Endpoint => {
+                endpoint_profile_changed || command_bindings_changed
+            }
+            ClientShellKeybindingSource::RemoteLocal => false,
+        };
         self.config_diagnostic = super::config::merged_config_diagnostic(
             self.local_config_diagnostic.as_deref(),
             snapshot.config_diagnostic.as_deref(),
@@ -1093,6 +1136,21 @@ impl ClientShellState {
             .filter(|previous| Some(previous.as_str()) != snapshot.focused_pane_id.as_deref())
         {
             self.previous_pane_id = Some(previous.clone());
+        }
+        if snapshot_keybindings_changed {
+            if let Err(err) = self.config.apply_snapshot_keybindings(
+                snapshot.server_keybindings_toml.as_deref(),
+                &snapshot.commands,
+            ) {
+                self.endpoint_error = Some(err);
+            } else if active_keymap_changed
+                && matches!(
+                    self.mode,
+                    ClientShellMode::Prefix | ClientShellMode::Navigate | ClientShellMode::Resize
+                )
+            {
+                self.mode = ClientShellMode::Terminal;
+            }
         }
         let tab_layout_changed = self.snapshot.as_deref().is_none_or(|current| {
             current.tabs.len() != snapshot.tabs.len()

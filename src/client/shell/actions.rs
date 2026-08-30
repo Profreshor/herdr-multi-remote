@@ -155,14 +155,25 @@ impl ClientShellState {
             }
             crate::input::KeybindMatch::Command(command) => {
                 let action = command.action.into();
+                let resolved_labels = command.bindings.labels();
                 let command_id = self.snapshot.as_deref().and_then(|snapshot| {
-                    snapshot
-                        .commands
-                        .iter()
-                        .find(|candidate| {
-                            candidate.binding_label == command.label && candidate.action == action
-                        })
-                        .map(|candidate| candidate.command_id.clone())
+                    if let Some(candidate) = snapshot.commands.iter().find(|candidate| {
+                        candidate.command_id == command.command && candidate.action == action
+                    }) {
+                        return Some(candidate.command_id.clone());
+                    }
+                    let mut candidates = snapshot.commands.iter().filter(|candidate| {
+                        candidate.action == action
+                            && !resolved_labels.is_empty()
+                            && resolved_labels
+                                .iter()
+                                .all(|label| candidate.binding_labels.contains(label))
+                    });
+                    let candidate = candidates.next()?;
+                    candidates
+                        .next()
+                        .is_none()
+                        .then(|| candidate.command_id.clone())
                 });
                 let Some(command_id) = command_id else {
                     self.endpoint_error = Some(

@@ -327,6 +327,7 @@ pub(crate) enum ServerEvent {
         cell_height_px: u32,
         pixel_mouse: bool,
         direct_graphics: bool,
+        endpoint_keybindings: bool,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -662,6 +663,7 @@ pub(crate) fn handle_client_handshake(
         direct_graphics,
         pixel_mouse,
         client_rendered_shell,
+        endpoint_keybindings,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -708,6 +710,7 @@ pub(crate) fn handle_client_handshake(
                 launch_mode == ClientLaunchMode::AppDirectGraphics,
                 launch_mode == ClientLaunchMode::AppDirectGraphics,
                 false,
+                false,
             )
         }
         ClientMessage::ClientShellHello {
@@ -720,6 +723,7 @@ pub(crate) fn handle_client_handshake(
             surface_size,
             pixel_mouse,
             direct_graphics,
+            endpoint_keybindings,
         } => {
             if let protocol::VersionCheck::Incompatible(reason) =
                 protocol::check_client_version(version)
@@ -758,6 +762,7 @@ pub(crate) fn handle_client_handshake(
                 direct_graphics,
                 pixel_mouse,
                 true,
+                endpoint_keybindings,
             )
         }
         _ => {
@@ -820,6 +825,7 @@ pub(crate) fn handle_client_handshake(
             cell_height_px,
             pixel_mouse,
             direct_graphics,
+            endpoint_keybindings,
             writer,
         }
     } else {
@@ -1705,6 +1711,7 @@ new_tab = "ctrl+notakey"
                 surface_size: crate::protocol::ClientSurfaceSize { cols: 80, rows: 29 },
                 pixel_mouse: true,
                 direct_graphics: true,
+                endpoint_keybindings: true,
             },
         )
         .expect("write shell hello");
@@ -1731,6 +1738,7 @@ new_tab = "ctrl+notakey"
                 cell_height_px,
                 pixel_mouse,
                 direct_graphics,
+                endpoint_keybindings,
                 writer,
             } => {
                 assert_eq!(client_id, 43);
@@ -1738,6 +1746,7 @@ new_tab = "ctrl+notakey"
                 assert_eq!((cell_width_px, cell_height_px), (8, 16));
                 assert!(pixel_mouse);
                 assert!(direct_graphics);
+                assert!(endpoint_keybindings);
                 drop(writer);
             }
             other => panic!("expected ClientShellConnected, got {other:?}"),

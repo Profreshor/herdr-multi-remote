@@ -91,13 +91,7 @@ fn spawn_client_shell_process(
     runtime_dir: &PathBuf,
     api_socket_path: &PathBuf,
 ) -> SpawnedHerdr {
-    spawn_client_process_with_args_and_env(
-        config_home,
-        runtime_dir,
-        api_socket_path,
-        &["client"],
-        &[("HERDR_CLIENT_RENDERED_SHELL", "1")],
-    )
+    spawn_client_process_with_args(config_home, runtime_dir, api_socket_path, &["client"])
 }
 
 fn spawn_client_process_with_args(

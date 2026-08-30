@@ -43,6 +43,10 @@ impl EndpointCommandRegistry {
 }
 
 impl App {
+    pub(crate) fn client_shell_keybindings_profile(&self) -> Option<&str> {
+        self.client_shell_keybindings_profile.as_deref()
+    }
+
     pub(crate) fn client_shell_command_manifest(&self) -> Vec<crate::protocol::ClientShellCommand> {
         self.endpoint_commands
             .entries
@@ -50,7 +54,9 @@ impl App {
             .map(|entry| crate::protocol::ClientShellCommand {
                 command_id: entry.id.clone(),
                 binding_label: entry.binding.label.clone(),
+                binding_labels: entry.binding.bindings.labels(),
                 action: entry.action,
+                description: entry.binding.description.clone(),
             })
             .collect()
     }
@@ -207,6 +213,8 @@ mod tests {
         let manifest = app.client_shell_command_manifest();
         assert_eq!(manifest.len(), 1);
         assert_eq!(manifest[0].binding_label, "prefix+z");
+        assert_eq!(manifest[0].binding_labels, ["prefix+z"]);
+        assert_eq!(manifest[0].description.as_deref(), Some("safe description"));
         assert!(!format!("{:?}", manifest).contains("secret-command"));
         assert_eq!(
             app.resolve_client_shell_command(&manifest[0].command_id)

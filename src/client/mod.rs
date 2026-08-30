@@ -752,19 +752,23 @@ impl Drop for TerminalGuard {
 // Handshake
 // ---------------------------------------------------------------------------
 
-fn requested_render_encoding() -> RenderEncoding {
-    match std::env::var("HERDR_RENDER_ENCODING").ok().as_deref() {
-        Some("terminal-ansi" | "terminal_ansi" | "ansi") => RenderEncoding::TerminalAnsi,
-        _ => RenderEncoding::SemanticFrame,
-    }
-}
-
 fn is_remote_client_process() -> bool {
     std::env::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR).is_ok()
 }
 
 fn is_ssh_session() -> bool {
     std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+}
+
+fn client_shell_keybinding_source() -> shell::ClientShellKeybindingSource {
+    match std::env::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR)
+        .ok()
+        .as_deref()
+    {
+        Some("server") => shell::ClientShellKeybindingSource::Endpoint,
+        Some(_) => shell::ClientShellKeybindingSource::RemoteLocal,
+        None => shell::ClientShellKeybindingSource::Local,
+    }
 }
 
 /// Time to wait for the server's Welcome reply during the handshake.
@@ -821,20 +825,6 @@ fn direct_graphics_profile_allowed(_direct_attach: bool) -> bool {
     false
 }
 
-fn requested_keybindings() -> ClientKeybindings {
-    match std::env::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR)
-        .ok()
-        .as_deref()
-    {
-        Some("local") => crate::config::Config::load()
-            .config
-            .local_keybindings_profile_toml()
-            .map(|keys_toml| ClientKeybindings::Local { keys_toml })
-            .unwrap_or(ClientKeybindings::Server),
-        _ => ClientKeybindings::Server,
-    }
-}
-
 #[cfg(windows)]
 fn set_handshake_recv_timeout(
     stream: &LocalStream,
@@ -862,25 +852,6 @@ fn set_handshake_recv_timeout(
         .map_err(ClientError::ConnectionFailed)
 }
 
-fn client_launch_mode(
-    direct_attach_requested: bool,
-    exact_cell_size: bool,
-    cell_width_px: u32,
-    cell_height_px: u32,
-) -> ClientLaunchMode {
-    if direct_attach_requested {
-        ClientLaunchMode::TerminalAttach
-    } else if exact_cell_size
-        && cell_width_px > 0
-        && cell_height_px > 0
-        && direct_graphics_profile_allowed(false)
-    {
-        ClientLaunchMode::AppDirectGraphics
-    } else {
-        ClientLaunchMode::App
-    }
-}
-
 /// Performs the client→server handshake.
 ///
 /// Sends Hello with the terminal size and protocol version, reads the Welcome
@@ -892,9 +863,8 @@ fn do_handshake(
     cell_width_px: u32,
     cell_height_px: u32,
     exact_cell_size: bool,
-    requested_encoding: RenderEncoding,
-    direct_attach_requested: bool,
     shell_surface_size: Option<crate::protocol::ClientSurfaceSize>,
+    endpoint_keybindings: bool,
 ) -> Result<RenderEncoding, ClientError> {
     stream
         .set_nonblocking(false)
@@ -908,13 +878,14 @@ fn do_handshake(
             rows,
             cell_width_px,
             cell_height_px,
-            requested_encoding,
+            requested_encoding: RenderEncoding::SemanticFrame,
             surface_size,
             pixel_mouse: exact_cell_size && cfg!(unix),
             direct_graphics: exact_cell_size
                 && cell_width_px > 0
                 && cell_height_px > 0
                 && direct_graphics_profile_allowed(false),
+            endpoint_keybindings,
         }
     } else {
         ClientMessage::Hello {
@@ -923,14 +894,9 @@ fn do_handshake(
             rows,
             cell_width_px,
             cell_height_px,
-            requested_encoding,
-            keybindings: requested_keybindings(),
-            launch_mode: client_launch_mode(
-                direct_attach_requested,
-                exact_cell_size,
-                cell_width_px,
-                cell_height_px,
-            ),
+            requested_encoding: RenderEncoding::TerminalAnsi,
+            keybindings: ClientKeybindings::Server,
+            launch_mode: ClientLaunchMode::TerminalAttach,
         }
     };
     protocol::write_message(stream, &hello)
@@ -999,19 +965,13 @@ enum ClientLoopEvent {
 ///
 /// This is the entry point called from `main.rs` when running in client mode.
 pub fn run_client() -> io::Result<()> {
-    run_client_with_mode(
-        requested_render_encoding(),
-        None,
-        None,
-        "connecting to server",
-    )
+    run_client_with_mode(None, None, "connecting to server")
 }
 
 /// Runs a direct terminal attach client.
 #[cfg(unix)]
 pub fn run_terminal_attach(terminal_id: String, takeover: bool) -> io::Result<()> {
     run_client_with_mode(
-        RenderEncoding::TerminalAnsi,
         Some((terminal_id, takeover)),
         Some(AttachEscapeState::default()),
         "attaching to terminal",
@@ -1103,17 +1063,7 @@ fn connect_terminal_session_stream(
         }
     };
 
-    match do_handshake(
-        &mut stream,
-        cols,
-        rows,
-        0,
-        0,
-        false,
-        RenderEncoding::TerminalAnsi,
-        true,
-        None,
-    ) {
+    match do_handshake(&mut stream, cols, rows, 0, 0, false, None, false) {
         Ok(RenderEncoding::TerminalAnsi) => {}
         Ok(encoding) => {
             eprintln!(
@@ -1288,7 +1238,6 @@ fn terminal_control_command_from_json(raw: &str) -> Result<ClientMessage, String
 }
 
 fn run_client_with_mode(
-    requested_encoding: RenderEncoding,
     attach_request: Option<(String, bool)>,
     attach_escape: Option<AttachEscapeState>,
     log_message: &'static str,
@@ -1297,25 +1246,29 @@ fn run_client_with_mode(
 
     let loaded_config = crate::config::Config::load();
     crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
-    let client_rendered_shell =
-        attach_request.is_none() && std::env::var_os("HERDR_CLIENT_RENDERED_SHELL").is_some();
+    let client_rendered_shell = attach_request.is_none();
     let socket_path = client_socket_path();
+    let keybinding_source = client_shell_keybinding_source();
+    let startup_config_diagnostic =
+        if keybinding_source == shell::ClientShellKeybindingSource::Endpoint {
+            crate::config::config_diagnostic_summary_without_keybindings(&loaded_config.diagnostics)
+        } else {
+            crate::config::config_diagnostic_summary(&loaded_config.diagnostics)
+        };
     let shell_config = client_rendered_shell.then(|| {
         shell::ClientShellConfig::from_config(&loaded_config.config)
-            .with_startup_config_diagnostic(crate::config::config_diagnostic_summary(
-                &loaded_config.diagnostics,
-            ))
+            .with_startup_config_diagnostic(startup_config_diagnostic)
             .with_startup_onboarding(loaded_config.config.should_show_onboarding())
+            .with_keybinding_source(keybinding_source)
             .with_local_endpoint(&socket_path)
     });
     let mouse_capture = loaded_config.config.ui.mouse_capture;
     let mouse_scroll_lines = loaded_config.config.ui.mouse_scroll_lines();
     let redraw_on_focus_gained = loaded_config.config.ui.redraw_on_focus_gained;
     let host_cursor = loaded_config.config.ui.host_cursor;
-    let direct_attach_requested = attach_request.is_some();
     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
     let kitty_graphics_enabled =
-        loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
+        loaded_config.config.experimental.kitty_graphics && client_rendered_shell;
     let loop_config = ClientLoopConfig {
         sound_config: loaded_config.config.ui.sound,
         mouse_scroll_lines,
@@ -1349,11 +1302,10 @@ fn run_client_with_mode(
         .shell_config
         .as_ref()
         .map(|shell| shell.initial_surface_size(cols, rows));
-    let requested_encoding = if shell_surface_size.is_some() {
-        RenderEncoding::SemanticFrame
-    } else {
-        requested_encoding
-    };
+    let endpoint_keybindings = loop_config
+        .shell_config
+        .as_ref()
+        .is_some_and(shell::ClientShellConfig::uses_endpoint_keybindings);
 
     // Perform handshake while the stream is still in blocking mode.
     let negotiated_encoding = match do_handshake(
@@ -1363,9 +1315,8 @@ fn run_client_with_mode(
         cell_width_px,
         cell_height_px,
         exact_cell_size,
-        requested_encoding,
-        direct_attach_requested,
         shell_surface_size,
+        endpoint_keybindings,
     ) {
         Ok(encoding) => encoding,
         Err(err) => {
@@ -2262,6 +2213,36 @@ async fn run_client_loop(
                         &mut state.draw_host_cursor,
                         &mut state.remote_image_paste_key,
                     );
+                    let (frame, resize) = if let Some(shell) = state.shell.as_mut() {
+                        let previous_size =
+                            shell.surface_size(state.reported_size.0, state.reported_size.1);
+                        shell.reload_client_config();
+                        let next_size =
+                            shell.surface_size(state.reported_size.0, state.reported_size.1);
+                        let resize = (previous_size != next_size).then(|| {
+                            shell.invalidate_pane_surface();
+                            client_shell_resize_message(
+                                shell,
+                                state.reported_size.0,
+                                state.reported_size.1,
+                                state.reported_cell_size.0,
+                                state.reported_cell_size.1,
+                            )
+                        });
+                        (
+                            shell.compose(state.reported_size.0, state.reported_size.1),
+                            resize,
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    if let Some(resize) = resize {
+                        write_to_server(&mut write_stream, &resize)
+                            .map_err(ClientError::ConnectionLost)?;
+                    }
+                    if let Some(frame) = frame {
+                        state.present_frame(frame);
+                    }
                 }
                 ServerMessage::MouseCapture {
                     enabled,
@@ -3123,18 +3104,6 @@ mod tests {
         assert!(!resize_report_required(false, size, size));
         assert!(resize_report_required(false, (120, 41, 8, 16), size));
         assert!(resize_report_required(false, (120, 40, 9, 18), size));
-    }
-
-    #[test]
-    fn approximate_cell_size_never_enables_direct_graphics() {
-        assert_eq!(
-            client_launch_mode(false, false, 8, 16),
-            ClientLaunchMode::App
-        );
-        assert_eq!(
-            client_launch_mode(true, false, 8, 16),
-            ClientLaunchMode::TerminalAttach
-        );
     }
 
     #[test]

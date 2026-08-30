@@ -289,6 +289,7 @@ pub fn client_shell_handshake(
             &encode_varint_u16(surface_rows),
             &[0],
             &[0],
+            &[0], // client-owned keybindings
         ],
     );
     finish_handshake(stream, &hello_payload)
