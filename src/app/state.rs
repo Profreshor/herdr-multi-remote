@@ -1450,8 +1450,6 @@ pub struct AppState {
     /// Stable workspace identity captured when the close confirmation opens.
     pub(crate) confirm_close_workspace_id: Option<String>,
     pub should_quit: bool,
-    /// In monolithic --no-session mode, detach exits the app because there is no server to detach from.
-    pub detach_exits: bool,
     /// Set when the current client should detach from the persistent session.
     /// The server's event loop checks this and handles client detach.
     pub detach_requested: bool,
@@ -1582,7 +1580,6 @@ pub struct AppState {
     #[allow(dead_code)] // kept for backward compat; palette.accent is the source of truth
     pub accent: Color,
     pub sound: SoundConfig,
-    pub local_sound_playback: bool,
     pub toast_config: ToastConfig,
     pub keybinds: Keybinds,
     /// UI color palette — all sidebar/UI colors centralized for theming.
@@ -1844,7 +1841,6 @@ impl AppState {
             mode: Mode::Navigate,
             confirm_close_workspace_id: None,
             should_quit: false,
-            detach_exits: false,
             detach_requested: false,
             request_new_workspace: false,
             request_new_tab: false,
@@ -1968,7 +1964,6 @@ impl AppState {
                 enabled: false,
                 ..SoundConfig::default()
             },
-            local_sound_playback: false,
             toast_config: ToastConfig::default(),
             keybinds: Keybinds::default(),
             palette: Palette::catppuccin(),

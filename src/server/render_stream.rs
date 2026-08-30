@@ -467,8 +467,8 @@ impl Backend for CursorTrackingBackend {
 
 /// Renders the AppState to an in-memory ratatui Buffer.
 ///
-/// This produces the same output as the monolithic binary's terminal draw,
-/// but writes to a `Buffer` instead of stdout. Cursor visibility is captured
+/// This produces the legacy full-app surface in a `Buffer` instead of writing
+/// to stdout. Cursor visibility is captured
 /// from explicit frame cursor intent rather than incidental backend state.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn render_virtual(

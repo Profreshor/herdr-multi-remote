@@ -2503,9 +2503,9 @@ mod tests {
 
         let outer_column = info.inner_rect.x + 2;
         let outer_row = info.inner_rect.y + 3;
-        for (button, expected_kind, ingress) in [
-            (66, MouseEventKind::ScrollLeft, "monolithic"),
-            (67, MouseEventKind::ScrollRight, "headless"),
+        for (button, expected_kind) in [
+            (66, MouseEventKind::ScrollLeft),
+            (67, MouseEventKind::ScrollRight),
         ] {
             let input = format!("\x1b[<{button};{};{}M", outer_column + 1, outer_row + 1);
             let mut events = crate::raw_input::parse_raw_input_bytes_sync(input.as_bytes());
@@ -2518,11 +2518,7 @@ mod tests {
             assert!(events.is_empty(), "expected one parsed mouse event");
             assert_eq!(mouse.kind, expected_kind);
 
-            if ingress == "monolithic" {
-                assert!(app.handle_raw_input_event(event).await);
-            } else {
-                app.route_client_events(vec![event], false);
-            }
+            app.route_client_events(vec![event], false);
 
             assert_eq!(
                 input_rx
@@ -2566,7 +2562,7 @@ mod tests {
             .pop()
             .expect("horizontal SGR wheel input should parse");
 
-        assert!(app.handle_raw_input_event(event).await);
+        app.route_client_events(vec![event], false);
 
         assert!(input_rx.try_recv().is_err());
     }

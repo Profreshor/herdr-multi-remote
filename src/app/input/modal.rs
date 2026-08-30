@@ -121,11 +121,7 @@ fn open_update_release_notes(state: &mut AppState) {
 }
 
 pub(super) fn request_detach(state: &mut AppState) {
-    if state.detach_exits {
-        state.should_quit = true;
-    } else {
-        state.detach_requested = true;
-    }
+    state.detach_requested = true;
 }
 
 pub(super) fn apply_global_menu_action(state: &mut AppState, action: GlobalMenuAction) {
@@ -1509,25 +1505,13 @@ mod tests {
     }
 
     #[test]
-    fn detach_requests_client_detach_in_persistence_mode() {
+    fn detach_requests_client_detach() {
         let mut state = state_with_workspaces(&["test"]);
-        state.detach_exits = false;
 
         request_detach(&mut state);
 
         assert!(state.detach_requested);
         assert!(!state.should_quit);
-    }
-
-    #[test]
-    fn detach_exits_in_no_session_mode() {
-        let mut state = state_with_workspaces(&["test"]);
-        state.detach_exits = true;
-
-        request_detach(&mut state);
-
-        assert!(state.should_quit);
-        assert!(!state.detach_requested);
     }
 
     #[test]

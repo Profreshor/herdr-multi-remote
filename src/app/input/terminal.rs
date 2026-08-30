@@ -321,18 +321,6 @@ impl App {
         bytes.is_empty() || runtime.try_send_bytes(Bytes::from(bytes)).is_ok()
     }
 
-    pub(crate) async fn forward_terminal_key_to_target(
-        &self,
-        target: &TerminalInputTarget,
-        key: TerminalKey,
-    ) -> bool {
-        let Some(runtime) = self.terminal_input_runtime(target) else {
-            return false;
-        };
-        let bytes = runtime.encode_terminal_key(key.clone());
-        bytes.is_empty() || runtime.send_bytes(Bytes::from(bytes)).await.is_ok()
-    }
-
     fn take_pressed_keys_for_source(
         &mut self,
         source_id: crate::app::InputSourceId,
@@ -360,42 +348,12 @@ impl App {
         }
     }
 
-    pub(crate) async fn release_input_source(&mut self, source_id: crate::app::InputSourceId) {
-        // Pending URL clicks survive this call; see clear_input_source.
-        self.state.clear_chrome_gesture(source_id);
-        for pressed in self.take_pressed_keys_for_source(source_id) {
-            let release = pressed
-                .key
-                .with_kind(crossterm::event::KeyEventKind::Release);
-            let _ = self
-                .forward_terminal_key_to_target(&pressed.target, release)
-                .await;
-        }
-    }
-
+    #[cfg(test)]
     pub(super) async fn handle_terminal_key(
         &mut self,
         key: TerminalKey,
     ) -> Option<TerminalInputTarget> {
-        match self.prepare_popup_key_forward(key.clone()) {
-            PreparedPopupInput::NotOpen => {}
-            PreparedPopupInput::Consumed => return None,
-            PreparedPopupInput::Bytes { target, bytes } => {
-                let Some(runtime) = self.popup_runtime() else {
-                    self.close_popup_pane();
-                    return None;
-                };
-                return runtime.send_bytes(bytes).await.is_ok().then_some(target);
-            }
-        }
-
-        let input = self.prepare_terminal_key_forward(crate::app::LOCAL_INPUT_SOURCE, key)?;
-        let sent = if let Some(runtime) = self.lookup_runtime_sender(input.ws_idx, input.pane_id) {
-            runtime.send_bytes(input.bytes).await.is_ok()
-        } else {
-            false
-        };
-        sent.then_some(input.target)
+        self.handle_terminal_key_headless_from(crate::app::LOCAL_INPUT_SOURCE, key)
     }
 }
 
@@ -1304,7 +1262,7 @@ mod tests {
         let deadline = app
             .selection_highlight_clear_deadline
             .expect("highlight clear deadline");
-        assert!(app.handle_scheduled_tasks(deadline + std::time::Duration::from_millis(1), false));
+        assert!(app.clear_due_selection_highlight(deadline + std::time::Duration::from_millis(1)));
         assert!(app.state.selection.is_none());
     }
 
@@ -1698,31 +1656,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_popup_input_waits_for_channel_capacity() {
-        let mut app = app_for_mouse_test();
-        let (runtime, mut rx) =
-            crate::terminal::TerminalRuntime::test_with_channel_capacity(40, 2, 1);
-        runtime
-            .try_send_bytes(Bytes::from_static(b"queued"))
-            .unwrap();
-        app.install_test_popup_runtime(runtime);
-        app.state.mode = Mode::Settings;
-
-        let mut send = Box::pin(
-            app.handle_terminal_key(TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty())),
-        );
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), &mut send)
-                .await
-                .is_err()
-        );
-
-        assert_eq!(rx.recv().await.unwrap().as_ref(), b"queued");
-        send.await;
-        assert_eq!(rx.recv().await.unwrap().as_ref(), b"x");
-    }
-
-    #[tokio::test]
     async fn alt_backspace_is_forwarded_to_focused_pane() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
@@ -1834,33 +1767,6 @@ mod tests {
             vec![crate::raw_input::RawInputEvent::Key(physical_page_up(3))],
             false,
         );
-
-        assert_eq!(
-            pane_scroll_offset(&app, pane_id),
-            pane_info.inner_rect.height as usize * 5
-        );
-    }
-
-    #[tokio::test]
-    async fn runtime_consumed_page_up_preserves_separate_and_grouped_repeats() {
-        let (mut app, pane_id, pane_info) = app_with_plain_scrollback(256);
-        let page_up = physical_page_up(1);
-        for key in [
-            page_up.clone(),
-            page_up.clone().with_kind(KeyEventKind::Repeat),
-            page_up.clone().with_kind(KeyEventKind::Release),
-        ] {
-            app.handle_raw_input_event(crate::raw_input::RawInputEvent::Key(key))
-                .await;
-        }
-
-        assert_eq!(
-            pane_scroll_offset(&app, pane_id),
-            pane_info.inner_rect.height as usize * 2
-        );
-
-        app.handle_raw_input_event(crate::raw_input::RawInputEvent::Key(physical_page_up(3)))
-            .await;
 
         assert_eq!(
             pane_scroll_offset(&app, pane_id),

@@ -665,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn monolithic_info_keeps_fast_transport_and_exact_pixels_disabled() {
+    fn non_persistent_info_keeps_fast_transport_and_exact_pixels_disabled() {
         let (mut app, pane_id) = app();
         app.state.host_cell_size = crate::kitty_graphics::HostCellSize {
             width_px: 10,

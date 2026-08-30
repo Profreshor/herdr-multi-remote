@@ -2924,9 +2924,8 @@ impl AppState {
                     .collect()
                 }
             }
-            // Intercepted before this dispatch — in App::handle_internal_event (monolithic)
-            // or via HeadlessServer forwarding to the foreground client (server); never touch
-            // AppState. Kept for AppEvent exhaustiveness.
+            // Host-local effects are intercepted by HeadlessServer and forwarded to the
+            // foreground client; they never touch AppState. Kept for AppEvent exhaustiveness.
             AppEvent::TerminalBell { .. } => Vec::new(),
             AppEvent::ClipboardWrite { .. } => Vec::new(),
             AppEvent::PrefixInputSource { .. } => Vec::new(),
@@ -3052,33 +3051,6 @@ impl AppState {
             .values()
             .filter_map(crate::terminal::TerminalState::next_managed_agent_deadline)
             .min()
-    }
-
-    pub(crate) fn reconcile_managed_agents_at(&mut self, now: Instant) -> Vec<(usize, PaneId)> {
-        let mut changed_terminals = std::collections::HashSet::new();
-        for (terminal_id, terminal) in &mut self.terminals {
-            if terminal.reconcile_managed_agent_at(now, false) {
-                changed_terminals.insert(terminal_id.clone());
-            }
-        }
-        if changed_terminals.is_empty() {
-            return Vec::new();
-        }
-        self.mark_session_dirty();
-        self.workspaces
-            .iter()
-            .enumerate()
-            .flat_map(|(ws_idx, workspace)| {
-                let changed_terminals = &changed_terminals;
-                workspace.tabs.iter().flat_map(move |tab| {
-                    tab.panes.iter().filter_map(move |(&pane_id, pane)| {
-                        changed_terminals
-                            .contains(&pane.attached_terminal_id)
-                            .then_some((ws_idx, pane_id))
-                    })
-                })
-            })
-            .collect()
     }
 
     pub(crate) fn publish_pane_process_exit_if_agent(
@@ -3277,12 +3249,6 @@ impl AppState {
     }
 
     fn apply_agent_notification_delivery(&mut self, delivery: &AgentNotificationDelivery) {
-        if self.local_sound_playback {
-            if let Some(sound) = delivery.sound {
-                crate::sound::play(sound, &self.sound);
-            }
-        }
-
         if matches!(
             self.toast_config.delivery,
             crate::config::ToastDelivery::Herdr

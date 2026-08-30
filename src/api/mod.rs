@@ -8,7 +8,7 @@ mod wait;
 
 pub use event_hub::EventHub;
 pub(crate) use server::start_server_with_stop_control;
-pub use server::{start_server_with_capabilities, ServerHandle};
+pub use server::ServerHandle;
 pub use status::{read_runtime_status_at, RuntimeStatus};
 
 use std::path::PathBuf;

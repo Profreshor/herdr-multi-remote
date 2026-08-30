@@ -113,37 +113,12 @@ impl App {
         &mut self,
         ev: AppEvent,
     ) -> Vec<crate::app::actions::PaneStateUpdate> {
-        if let AppEvent::TerminalBell { count, .. } = ev {
-            if let Err(err) =
-                crate::terminal_effects::write_terminal_bells(&mut std::io::stdout(), count)
-            {
-                tracing::warn!(err = %err, "failed to emit terminal bell");
-            }
-            return Vec::new();
-        }
-
-        if let AppEvent::ClipboardWrite { content } = ev {
-            #[cfg(not(test))]
-            crate::selection::write_osc52_bytes(&content);
-            #[cfg(test)]
-            let _ = content;
-            self.show_clipboard_feedback();
-            return Vec::new();
-        }
-
-        if let AppEvent::PrefixInputSource { active } = ev {
-            // Monolithic path applies the switch here. Server mode forwards it to the foreground
-            // client instead (see HeadlessServer::handle_internal_event_with_forwarding); should an
-            // App-internal drain consume the event before the forwarding drain, the flag keeps the
-            // switch out of the headless server process.
-            if !self.local_input_source_switch {
-                return Vec::new();
-            }
-            if active {
-                self.prefix_input_source.switch_to_ascii();
-            } else {
-                self.prefix_input_source.restore();
-            }
+        if matches!(
+            &ev,
+            AppEvent::TerminalBell { .. }
+                | AppEvent::ClipboardWrite { .. }
+                | AppEvent::PrefixInputSource { .. }
+        ) {
             return Vec::new();
         }
 
@@ -222,7 +197,6 @@ impl App {
                 self.sync_full_lifecycle_authority_detection_pauses();
                 self.refresh_new_herdr_toast_context_for_update(&update, &previous_toast);
                 self.emit_pane_state_update(&update);
-                self.emit_terminal_or_system_agent_notifications(std::slice::from_ref(&update));
             }
             if self.runtime_exit_action(*pane_id) == RuntimeExitAction::RespawnShell
                 && self.respawn_shell_for_launch_pane(*pane_id)
@@ -354,26 +328,6 @@ impl App {
         }
         if let Some((ws_idx, tab_idx)) = pane_exit_layout_target {
             self.emit_layout_updated_event(ws_idx, tab_idx);
-        }
-
-        if self.local_terminal_notifications
-            && matches!(
-                self.state.toast_config.delivery,
-                crate::config::ToastDelivery::Terminal | crate::config::ToastDelivery::System
-            )
-        {
-            let notify = match self.state.toast_config.delivery {
-                crate::config::ToastDelivery::Terminal => crate::terminal_notify::show_notification,
-                crate::config::ToastDelivery::System => crate::platform::show_desktop_notification,
-                _ => unreachable!("toast delivery was checked above"),
-            };
-
-            if let Some((version, install_command)) = update_ready {
-                let instruction = crate::update::update_install_instruction(&install_command);
-                let _ = notify(&format!("v{version} available"), Some(&instruction));
-            } else if self.state.toast_config.delay_seconds == 0 {
-                self.emit_terminal_or_system_agent_notifications(&pane_updates);
-            }
         }
 
         self.sync_toast_deadline(previous_toast);
@@ -663,78 +617,6 @@ impl App {
         }
     }
 
-    fn emit_terminal_or_system_agent_notifications(
-        &self,
-        pane_updates: &[crate::app::actions::PaneStateUpdate],
-    ) {
-        if !self.local_terminal_notifications
-            || self.state.toast_config.delay_seconds != 0
-            || !matches!(
-                self.state.toast_config.delivery,
-                crate::config::ToastDelivery::Terminal | crate::config::ToastDelivery::System
-            )
-        {
-            return;
-        }
-
-        let notify = match self.state.toast_config.delivery {
-            crate::config::ToastDelivery::Terminal => crate::terminal_notify::show_notification,
-            crate::config::ToastDelivery::System => crate::platform::show_desktop_notification,
-            _ => return,
-        };
-
-        for update in pane_updates {
-            let is_active_tab = self
-                .state
-                .pane_is_in_active_tab(update.ws_idx, update.pane_id);
-            let suppress_active_tab_notifications =
-                crate::app::actions::active_tab_suppresses_notifications(
-                    is_active_tab,
-                    self.state.outer_terminal_focus,
-                );
-            let Some(kind) = crate::app::actions::notification_toast_for_pane_state_update(
-                suppress_active_tab_notifications,
-                update,
-            ) else {
-                continue;
-            };
-            let Some(ws) = self.state.workspaces.get(update.ws_idx) else {
-                continue;
-            };
-            let Some(pane) = ws
-                .tabs
-                .iter()
-                .find_map(|tab| tab.panes.get(&update.pane_id))
-            else {
-                continue;
-            };
-            let Some(agent_label) = self
-                .state
-                .terminals
-                .get(&pane.attached_terminal_id)
-                .and_then(|terminal| terminal.effective_agent_label())
-            else {
-                continue;
-            };
-            let event_text = match kind {
-                ToastKind::NeedsAttention => "needs attention",
-                ToastKind::Finished => "finished",
-                ToastKind::UpdateInstalled => "updated",
-            };
-            let workspace_label =
-                ws.display_name_from(&self.state.terminals, &self.terminal_runtimes);
-            let _ = notify(
-                &format!("{} {}", agent_label, event_text),
-                Some(&crate::app::actions::notification_context(
-                    ws,
-                    &workspace_label,
-                    update.ws_idx,
-                    update.pane_id,
-                )),
-            );
-        }
-    }
-
     pub(crate) fn sync_toast_deadline(
         &mut self,
         previous_toast: Option<crate::app::state::ToastNotification>,
@@ -748,33 +630,6 @@ impl App {
                 };
                 Instant::now() + duration
             });
-        }
-    }
-
-    pub(crate) fn emit_delayed_client_local_agent_notifications(
-        &self,
-        deliveries: &[crate::app::state::AgentNotificationDelivery],
-    ) {
-        if !self.local_terminal_notifications
-            || !matches!(
-                self.state.toast_config.delivery,
-                crate::config::ToastDelivery::Terminal | crate::config::ToastDelivery::System
-            )
-        {
-            return;
-        }
-
-        let notify = match self.state.toast_config.delivery {
-            crate::config::ToastDelivery::Terminal => crate::terminal_notify::show_notification,
-            crate::config::ToastDelivery::System => crate::platform::show_desktop_notification,
-            _ => unreachable!("toast delivery was checked above"),
-        };
-
-        for delivery in deliveries {
-            let Some(toast) = &delivery.client_notification else {
-                continue;
-            };
-            let _ = notify(&toast.title, Some(&toast.context));
         }
     }
 
@@ -1279,7 +1134,6 @@ impl App {
     ) -> String {
         use crate::api::schema::{NotificationShowReason, ResponseResult};
 
-        let requested_sound = params.sound;
         let Some(title) = sanitized_notification_text(&params.title, 80) else {
             return responses::encode_error(id, "invalid_params", "notification title is empty");
         };
@@ -1306,32 +1160,11 @@ impl App {
                         target: None,
                     });
                     self.sync_toast_deadline(previous_toast);
-                    self.emit_api_notification_sound(requested_sound);
                     NotificationShowReason::Shown
                 }
             }
             crate::config::ToastDelivery::Terminal | crate::config::ToastDelivery::System => {
-                if self.api_notification_rate_limited(Instant::now()) {
-                    NotificationShowReason::RateLimited
-                } else {
-                    let notify = match self.state.toast_config.delivery {
-                        crate::config::ToastDelivery::Terminal => {
-                            crate::terminal_notify::show_notification
-                        }
-                        crate::config::ToastDelivery::System => {
-                            crate::platform::show_desktop_notification
-                        }
-                        _ => unreachable!("notification delivery was checked above"),
-                    };
-                    match notify(&title, body.as_deref()) {
-                        Ok(true) => {
-                            self.mark_api_notification_shown(Instant::now());
-                            self.emit_api_notification_sound(requested_sound);
-                            NotificationShowReason::Shown
-                        }
-                        Ok(false) | Err(_) => NotificationShowReason::NoForegroundClient,
-                    }
-                }
+                NotificationShowReason::NoForegroundClient
             }
         };
 
@@ -1342,15 +1175,6 @@ impl App {
                 reason,
             },
         )
-    }
-
-    fn emit_api_notification_sound(&self, sound: crate::api::schema::NotificationShowSound) {
-        if !self.state.local_sound_playback || !self.state.sound.allows(None) {
-            return;
-        }
-        if let Some(sound) = sound.to_sound() {
-            crate::sound::play(sound, &self.state.sound);
-        }
     }
 
     pub(crate) fn api_notification_rate_limited(&self, now: Instant) -> bool {
@@ -2025,9 +1849,15 @@ mod tests {
             .state
             .next_pending_agent_notification_deadline()
             .expect("pending notification deadline");
-        assert!(app.handle_scheduled_tasks(notification_deadline, false));
+        let mut deliveries = app
+            .state
+            .drain_due_agent_notifications(notification_deadline);
+        app.refresh_agent_notification_delivery_contexts(&mut deliveries);
         assert_eq!(
-            app.state.toast.as_ref().map(|toast| toast.context.as_str()),
+            deliveries
+                .first()
+                .and_then(|delivery| delivery.toast.as_ref())
+                .map(|toast| toast.context.as_str()),
             Some("__herdr_projects__ · 1")
         );
 
@@ -2394,8 +2224,6 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         );
-        app.local_terminal_notifications = false;
-
         let mut workspace = crate::workspace::Workspace::test_new("stale");
         workspace.custom_name = None;
         workspace.identity_cwd = "/__herdr_original__".into();

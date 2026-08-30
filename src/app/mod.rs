@@ -32,14 +32,13 @@ mod window_title;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};
-use std::future::pending;
-use std::io::{self, Write};
+#[cfg(unix)]
+use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
 pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
-const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 const GIT_REPO_DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -50,12 +49,7 @@ const PANE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_COPY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(500);
 const COPY_FEEDBACK_DURATION: Duration = Duration::from_secs(2);
 
-use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
-    execute, terminal,
-};
 use ratatui::layout::Rect;
-use ratatui::DefaultTerminal;
 use tokio::sync::{mpsc, Notify};
 use tracing::info;
 
@@ -111,8 +105,6 @@ pub struct App {
     pub(crate) event_hub: crate::api::EventHub,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
     pub(crate) no_session: bool,
-    pub(crate) input_rx: Option<mpsc::Receiver<crate::raw_input::RawInputEvent>>,
-    pub(crate) last_terminal_size: Option<(u16, u16)>,
     pub(crate) config_diagnostic_deadline: Option<Instant>,
     pub(crate) toast_deadline: Option<Instant>,
     pub(crate) copy_feedback_deadline: Option<Instant>,
@@ -130,7 +122,6 @@ pub struct App {
     pub(crate) last_sidebar_divider_click: Option<Instant>,
     pub(crate) last_pane_click: Option<PaneClickState>,
     pub(crate) pending_url_click_sources: HashSet<InputSourceId>,
-    pub(crate) next_resize_poll: Instant,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
     pub(crate) update_version_check_enabled: bool,
@@ -159,63 +150,13 @@ pub struct App {
     pub(crate) render_dirty: Arc<crate::render_signal::RenderSignal>,
     pub(crate) full_redraw_pending: bool,
     pub(crate) overlay_panes: HashMap<crate::layout::PaneId, OverlayPaneState>,
-    pub(crate) local_terminal_notifications: bool,
-    /// Whether this process applies `AppEvent::PrefixInputSource` to the host input source.
-    /// The headless server sets this to false: the switch belongs to the foreground client,
-    /// even when an App-internal drain consumes the event before the forwarding drain.
-    pub(crate) local_input_source_switch: bool,
     pub(crate) config_reloaded_from_disk: bool,
     client_shell_keybindings_profile: Option<String>,
     endpoint_commands: custom_commands::EndpointCommandRegistry,
-    prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
 pub(crate) const APP_EVENT_CHANNEL_CAPACITY: usize = 256;
 pub(crate) const APP_EVENT_DRAIN_LIMIT: usize = 64;
-
-pub(crate) enum LoopEvent {
-    Timer,
-    Internal(AppEvent),
-    Api(Box<crate::api::ApiRequestMessage>),
-    RawInput(crate::raw_input::RawInputEvent),
-    InputClosed,
-    RenderRequested,
-}
-
-struct SyncOutputGuard;
-
-impl SyncOutputGuard {
-    fn begin() -> io::Result<Self> {
-        let mut stdout = io::stdout().lock();
-        stdout.write_all(b"\x1b[?2026h")?;
-        stdout.flush()?;
-        Ok(Self)
-    }
-}
-
-impl Drop for SyncOutputGuard {
-    fn drop(&mut self) {
-        let mut stdout = io::stdout().lock();
-        let _ = stdout.write_all(b"\x1b[?2026l");
-        let _ = stdout.flush();
-    }
-}
-
-async fn recv_raw_input_or_pending(
-    input_rx: Option<&mut mpsc::Receiver<crate::raw_input::RawInputEvent>>,
-) -> Option<crate::raw_input::RawInputEvent> {
-    match input_rx {
-        Some(rx) => rx.recv().await,
-        None => pending().await,
-    }
-}
-
-async fn sleep_until_or_pending(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
-        None => pending().await,
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TerminalInputTarget {
@@ -586,7 +527,6 @@ impl App {
             selected,
             mode,
             should_quit: false,
-            detach_exits: no_session,
             detach_requested: false,
             request_new_workspace: false,
             request_new_tab: false,
@@ -715,7 +655,6 @@ impl App {
             pane_scrollback_limit_bytes: config.advanced.scrollback_limit_bytes,
             accent: crate::config::parse_color(&config.ui.accent),
             sound: config.ui.sound.clone(),
-            local_sound_playback: true,
             toast_config: config.ui.toast.clone(),
             keybinds: config.keybinds(),
             palette: theme_palette,
@@ -757,7 +696,7 @@ impl App {
                 cwd.as_deref().and_then(crate::workspace::git_branch);
         }
 
-        // Background auto-update is disabled in monolithic no-session mode
+        // Background auto-update is disabled for non-persistent test apps
         // and in debug/test builds so local development never mutates the
         // running binary out from under spawned test processes.
         let version_check_enabled =
@@ -811,7 +750,6 @@ impl App {
             last_sidebar_divider_click: None,
             last_pane_click: None,
             pending_url_click_sources: HashSet::new(),
-            next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
             next_auto_update_check: version_check_enabled
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             next_agent_manifest_update_check: manifest_check_enabled
@@ -839,18 +777,13 @@ impl App {
             event_hub,
             last_focus,
             no_session,
-            input_rx: None,
-            last_terminal_size: terminal::size().ok(),
             render_notify,
             render_dirty,
             full_redraw_pending: false,
             overlay_panes: HashMap::new(),
-            local_terminal_notifications: true,
-            local_input_source_switch: true,
             config_reloaded_from_disk: false,
             client_shell_keybindings_profile,
             endpoint_commands,
-            prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         };
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
         app.configure_window_title(&config.ui.window_title);
@@ -895,7 +828,6 @@ impl App {
         if background_update_check_enabled(app.no_session, app.update_manifest_check_enabled) {
             app.next_agent_manifest_update_check = Some(now + AUTO_UPDATE_CHECK_INTERVAL);
         }
-        app.state.detach_exits = false;
         app.state.pane_id_aliases = pane_id_aliases;
         app.state.workspaces = workspaces;
         app.state.terminals = terminals;
@@ -938,13 +870,9 @@ impl App {
         self.terminal_runtimes.assume_handoff_ownership();
     }
 
-    fn request_repaint(&mut self) {
-        self.full_redraw_pending = true;
-    }
-
     pub(crate) fn sync_prefix_input_source(&mut self, previous_mode: Mode) {
         // Emit the input-source intent on entering/leaving the ASCII realm, like `ClipboardWrite`;
-        // the foreground (client, or this app in monolithic mode) applies the switch. Keyed on the
+        // the foreground client applies the switch. Keyed on the
         // realm so multi-level prefix commands stay ASCII. The switch is flag-gated but the restore
         // always fires on exit, so a mid-interaction flag toggle can't strand the host on ASCII.
         let active = match (
@@ -971,312 +899,6 @@ impl App {
         let changed = self.handle_internal_event_with_render_impact(event);
         self.sync_prefix_input_source(previous_mode);
         changed
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_prefix_input_source(
-        &mut self,
-        source: Box<dyn crate::platform::PrefixInputSource>,
-    ) {
-        self.prefix_input_source = source;
-    }
-
-    pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
-        if self.input_rx.is_none() {
-            self.input_rx = Some(crate::raw_input::spawn_input_reader());
-        }
-        self.query_host_terminal_theme();
-
-        let mut needs_render = true;
-        let mut sent_window_title: Option<Option<String>> = None;
-        let mut host_mouse_capture_active = self.state.mouse_capture;
-        let mut host_keyboard_report_all_active = false;
-
-        while !self.state.should_quit {
-            self.reap_finished_detached_processes();
-            if self.render_dirty.is_pending() {
-                needs_render = true;
-            }
-            // Drain a bounded internal-event batch for responsiveness. API handlers
-            // perform an exhaustive drain before reading pane/runtime state.
-            if self.drain_internal_events() {
-                needs_render = true;
-            }
-            if self.expire_due_metadata(Instant::now()) {
-                needs_render = true;
-            }
-            if self.drain_api_requests() {
-                needs_render = true;
-            }
-
-            self.sync_focus_events();
-            self.sync_session_save_schedule();
-
-            let now = Instant::now();
-            if self.handle_scheduled_tasks(now, needs_render) {
-                needs_render = true;
-            }
-
-            if self.state.request_complete_onboarding {
-                self.state.request_complete_onboarding = false;
-                self.open_settings_from_onboarding();
-                needs_render = true;
-            }
-
-            if self.state.request_new_workspace {
-                self.state.request_new_workspace = false;
-                self.runtime_workspace_create(
-                    "tui.workspace.create",
-                    crate::api::schema::WorkspaceCreateParams {
-                        source_workspace_id: None,
-                        cwd: None,
-                        focus: true,
-                        label: None,
-                        env: Default::default(),
-                    },
-                );
-                needs_render = true;
-            }
-
-            if self.state.request_new_tab {
-                self.state.request_new_tab = false;
-                let label = self.state.requested_new_tab_name.take();
-                self.runtime_tab_create(
-                    "tui.tab.create",
-                    crate::api::schema::TabCreateParams {
-                        workspace_id: None,
-                        cwd: None,
-                        focus: true,
-                        label,
-                        env: Default::default(),
-                    },
-                );
-                needs_render = true;
-            }
-
-            if let Some(ws_idx) = self.state.request_new_linked_worktree.take() {
-                self.open_new_linked_worktree_dialog(ws_idx);
-                needs_render = true;
-            }
-
-            if let Some(ws_idx) = self.state.request_open_existing_worktree.take() {
-                self.open_existing_worktree_dialog(ws_idx);
-                needs_render = true;
-            }
-
-            if let Some(cwd) = self.state.request_new_workspace_cwd.take() {
-                self.runtime_workspace_create(
-                    "tui.workspace.create_cwd",
-                    crate::api::schema::WorkspaceCreateParams {
-                        source_workspace_id: None,
-                        cwd: Some(cwd.display().to_string()),
-                        focus: true,
-                        label: None,
-                        env: Default::default(),
-                    },
-                );
-                needs_render = true;
-            }
-
-            if let Some(ws_idx) = self.state.request_remove_linked_worktree.take() {
-                self.open_remove_linked_worktree_confirmation(ws_idx);
-                needs_render = true;
-            }
-
-            if self.state.request_submit_worktree_create {
-                self.state.request_submit_worktree_create = false;
-                self.submit_worktree_create_via_api();
-                needs_render = true;
-            }
-
-            if self.state.request_submit_worktree_open {
-                self.state.request_submit_worktree_open = false;
-                self.submit_worktree_open_via_api();
-                needs_render = true;
-            }
-
-            if self.state.request_submit_worktree_remove {
-                self.state.request_submit_worktree_remove = false;
-                self.submit_worktree_remove_via_api();
-                needs_render = true;
-            }
-
-            if self.state.request_reload_config {
-                self.state.request_reload_config = false;
-                self.reload_config();
-                needs_render = true;
-            }
-
-            if self.ensure_default_workspace() {
-                needs_render = true;
-            }
-
-            if self.pane_graphics.retain_live_panes(&self.state) {
-                needs_render = true;
-            }
-
-            let now = Instant::now();
-            self.render_dirty
-                .set_immediate_pty_sources(self.state.app_surface_pane_ids());
-            self.sync_host_mouse_capture(&mut host_mouse_capture_active)?;
-            self.sync_host_keyboard_report_all(&mut host_keyboard_report_all_active)?;
-
-            if needs_render && self.can_render_now(now) {
-                let render_request = self.render_dirty.take();
-                self.sync_terminal_titles(&render_request.terminal_title_sources);
-                if self.window_title_configured() {
-                    let title = self
-                        .window_title()
-                        .and_then(|title| crate::config::sanitize_window_title_text(&title));
-                    if sent_window_title.as_ref() != Some(&title) {
-                        crate::terminal_effects::write_window_title(
-                            &mut std::io::stdout(),
-                            title.as_deref(),
-                        )?;
-                        sent_window_title = Some(title);
-                    }
-                }
-                let _sync_output = SyncOutputGuard::begin()?;
-                let kitty_graphics_enabled = self.state.kitty_graphics_enabled;
-                if self.full_redraw_pending {
-                    for cell in &mut terminal.current_buffer_mut().content {
-                        cell.set_skip(true);
-                    }
-                    terminal.swap_buffers();
-                    self.full_redraw_pending = false;
-                }
-                let mut cell_size = self.state.host_cell_size;
-                terminal.draw(|frame| {
-                    let area = frame.area();
-                    if kitty_graphics_enabled {
-                        if let Some(observed_cell_size) =
-                            crate::kitty_graphics::HostCellSize::try_from_terminal(area)
-                        {
-                            self.state.host_cell_size = observed_cell_size;
-                            cell_size = observed_cell_size;
-                        } else if !cell_size.is_known() {
-                            cell_size =
-                                crate::kitty_graphics::HostCellSize::fallback_for_area(area);
-                        }
-                        crate::ui::compute_view_with_cell_size(
-                            &mut self.state,
-                            &self.terminal_runtimes,
-                            area,
-                            cell_size,
-                        );
-                    } else {
-                        crate::ui::compute_view_with_runtime_registry(
-                            &mut self.state,
-                            &self.terminal_runtimes,
-                            area,
-                        );
-                    }
-                    crate::ui::render_with_runtime_registry(
-                        &self.state,
-                        &self.terminal_runtimes,
-                        frame,
-                    );
-                })?;
-                if kitty_graphics_enabled {
-                    crate::kitty_graphics::paint_local_pane_graphics(
-                        &self.state,
-                        &self.pane_graphics,
-                        &self.terminal_runtimes,
-                        cell_size,
-                    )?;
-                }
-                self.sync_pending_agent_resume_deadline(now);
-                if self.start_pending_agent_resumes(self.pending_agent_resume_due(now)) {
-                    self.render_dirty.request_generic();
-                    self.render_notify.notify_one();
-                }
-                self.record_render_attempt(now, true);
-                needs_render = false;
-                continue;
-            }
-
-            let next_deadline = self.next_loop_deadline(now, needs_render);
-            let event = {
-                let input_rx = self.input_rx.as_mut();
-                tokio::select! {
-                    maybe_api = self.api_rx.recv() => match maybe_api {
-                        Some(msg) => LoopEvent::Api(Box::new(msg)),
-                        None => LoopEvent::Timer,
-                    },
-                    maybe_ev = self.event_rx.recv() => match maybe_ev {
-                        Some(ev) => LoopEvent::Internal(ev),
-                        None => LoopEvent::Timer,
-                    },
-                    maybe_input = recv_raw_input_or_pending(input_rx) => match maybe_input {
-                        Some(input) => LoopEvent::RawInput(input),
-                        None => LoopEvent::InputClosed,
-                    },
-                    _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
-                    _ = self.render_notify.notified() => LoopEvent::RenderRequested,
-                }
-            };
-
-            match event {
-                LoopEvent::Timer => {}
-                LoopEvent::Internal(ev) => {
-                    if self.handle_internal_event_with_prefix_sync(ev) {
-                        needs_render = true;
-                    }
-                }
-                LoopEvent::Api(msg) => {
-                    if self.handle_api_request_message(*msg) {
-                        needs_render = true;
-                    }
-                }
-                LoopEvent::RawInput(input) => {
-                    if self.handle_raw_input_batch(input).await {
-                        needs_render = true;
-                    }
-                }
-                LoopEvent::InputClosed => {
-                    self.input_rx = None;
-                }
-                LoopEvent::RenderRequested => {
-                    if self.render_dirty.is_pending() {
-                        needs_render = true;
-                    }
-                }
-            }
-        }
-
-        // Save session on exit (skip in --no-session mode)
-        if !self.no_session {
-            self.save_session_now();
-        }
-
-        Ok(())
-    }
-
-    fn sync_host_keyboard_report_all(&self, active: &mut bool) -> io::Result<()> {
-        let desired = self.host_keyboard_report_all_requested();
-        if desired == *active {
-            return Ok(());
-        }
-        crate::terminal_modes::set_host_kitty_keyboard_report_all(&mut io::stdout(), desired)?;
-        *active = desired;
-        Ok(())
-    }
-
-    fn sync_host_mouse_capture(&self, active: &mut bool) -> io::Result<()> {
-        let desired = self
-            .state
-            .should_capture_host_mouse_from(&self.terminal_runtimes);
-        if desired == *active {
-            return Ok(());
-        }
-        crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
-        if desired {
-            execute!(io::stdout(), EnableMouseCapture)?;
-        } else {
-            execute!(io::stdout(), DisableMouseCapture)?;
-        }
-        *active = desired;
-        Ok(())
     }
 
     pub(crate) fn ensure_default_workspace(&mut self) -> bool {
@@ -1580,7 +1202,6 @@ impl App {
             self.state.kitty_graphics_enabled = config.experimental.kitty_graphics;
             crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
             if was_kitty_graphics_enabled && !config.experimental.kitty_graphics {
-                let _ = crate::kitty_graphics::clear_all_host_graphics();
                 self.pane_graphics.clear();
                 self.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
             }
@@ -1775,7 +1396,7 @@ impl App {
     ///
     /// The input bytes are parsed into `RawInputEvent`s and then processed.
     /// In terminal mode, keys are routed through the same semantic
-    /// key-handling path as monolithic herdr so they are re-encoded for the
+    /// endpoint key-handling path so they are re-encoded for the
     /// focused pane's negotiated keyboard protocol instead of passing host
     /// terminal escape sequences through unchanged.
     #[cfg(test)]
@@ -1870,7 +1491,7 @@ impl App {
                 }
                 crate::raw_input::RawInputEvent::Mouse(mouse) => {
                     if self.state.popup_pane.is_some() || self.state.mouse_capture {
-                        self.handle_mouse_event_headless(source_id, mouse);
+                        self.handle_mouse_from_input_source(source_id, mouse);
                     } else {
                         self.state
                             .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
@@ -1937,7 +1558,7 @@ impl App {
     /// Handles a key event in non-terminal mode for the headless server.
     ///
     /// Uses the standalone handler functions that work on `&mut AppState`
-    /// since the server doesn't have the async context of the monolithic App.
+    /// without requiring an async input loop.
     fn handle_non_terminal_key_headless(&mut self, key: crate::input::TerminalKey) {
         let key_event = key.as_key_event();
         if input::modal_paste_target_active(&self.state)
@@ -2006,19 +1627,6 @@ impl App {
             }
         }
     }
-
-    /// Handles a mouse event for the headless server.
-    ///
-    /// Delegates to the same mouse handling logic used in the monolithic
-    /// mode (hit-testing against the rendered UI), which works because
-    /// the server's AppState maintains view geometry from virtual rendering.
-    fn handle_mouse_event_headless(
-        &mut self,
-        source_id: InputSourceId,
-        mouse: crossterm::event::MouseEvent,
-    ) {
-        self.handle_mouse_from_input_source(source_id, mouse);
-    }
 }
 
 #[cfg(test)]
@@ -2029,8 +1637,6 @@ mod tests {
     use crate::terminal::TerminalRuntime;
     use crate::workspace::Workspace;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-    use std::cell::Cell;
-    use std::rc::Rc;
     use std::sync::Mutex;
 
     fn raw_key(
@@ -2169,45 +1775,6 @@ mod tests {
         "/usr/bin/true"
     }
 
-    #[derive(Clone, Default)]
-    struct FakePrefixInputSource {
-        switch_calls: Rc<Cell<usize>>,
-        restore_calls: Rc<Cell<usize>>,
-        switched: Rc<Cell<bool>>,
-        will_switch: bool,
-    }
-
-    impl FakePrefixInputSource {
-        fn switching() -> Self {
-            Self {
-                will_switch: true,
-                ..Self::default()
-            }
-        }
-
-        fn no_op() -> Self {
-            Self {
-                will_switch: false,
-                ..Self::default()
-            }
-        }
-    }
-
-    impl crate::platform::PrefixInputSource for FakePrefixInputSource {
-        fn switch_to_ascii(&mut self) {
-            self.switch_calls.set(self.switch_calls.get() + 1);
-            if self.will_switch {
-                self.switched.set(true);
-            }
-        }
-
-        fn restore(&mut self) {
-            if self.switched.replace(false) {
-                self.restore_calls.set(self.restore_calls.get() + 1);
-            }
-        }
-    }
-
     /// Drain the app event channel, returning the `active` flags of any emitted
     /// `PrefixInputSource` events (the host-local input-source intents).
     fn drained_prefix_active(app: &mut App) -> Vec<bool> {
@@ -2329,39 +1896,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_internal_event_prefix_input_source_applies_switch_and_restore() {
-        // The monolithic (in-process) path applies the host switch when it consumes the event.
-        let mut app = test_app();
-        let fake = FakePrefixInputSource::switching();
-        let switch_calls = fake.switch_calls.clone();
-        let restore_calls = fake.restore_calls.clone();
-        app.set_prefix_input_source(Box::new(fake));
-
-        app.handle_internal_event(crate::events::AppEvent::PrefixInputSource { active: true });
-        assert_eq!(switch_calls.get(), 1);
-        assert_eq!(restore_calls.get(), 0);
-
-        app.handle_internal_event(crate::events::AppEvent::PrefixInputSource { active: false });
-        assert_eq!(restore_calls.get(), 1);
-    }
-
-    #[test]
-    fn handle_internal_event_prefix_input_source_restore_is_safe_when_switch_was_noop() {
-        // Already-ASCII / failed-switch case: the restore on leave must stay harmless.
-        let mut app = test_app();
-        let fake = FakePrefixInputSource::no_op();
-        let switch_calls = fake.switch_calls.clone();
-        let restore_calls = fake.restore_calls.clone();
-        app.set_prefix_input_source(Box::new(fake));
-
-        app.handle_internal_event(crate::events::AppEvent::PrefixInputSource { active: true });
-        app.handle_internal_event(crate::events::AppEvent::PrefixInputSource { active: false });
-        assert_eq!(switch_calls.get(), 1);
-        assert_eq!(restore_calls.get(), 0);
-    }
-
-    #[tokio::test]
-    async fn raw_input_dispatch_emits_input_source_intent_when_leaving_prefix() {
+    fn client_input_dispatch_emits_input_source_intent_when_leaving_prefix() {
         // Leaving prefix mode happens inside the raw-input dispatch, not in `handle_key` itself —
         // the sync must sit at the dispatch layer so any event that exits prefix (here Esc) still
         // emits the restore intent.
@@ -2373,22 +1908,26 @@ mod tests {
         app.state.mode = Mode::Terminal;
 
         // ctrl+b (the default prefix key) enters prefix mode → switch intent.
-        app.handle_raw_input_event(raw_key(
-            KeyCode::Char('b'),
-            KeyModifiers::CONTROL,
-            KeyEventKind::Press,
-        ))
-        .await;
+        app.route_client_events(
+            vec![raw_key(
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            )],
+            true,
+        );
         assert_eq!(app.state.mode, Mode::Prefix);
         assert_eq!(drained_prefix_active(&mut app), vec![true]);
 
         // Esc leaves prefix mode → restore intent.
-        app.handle_raw_input_event(raw_key(
-            KeyCode::Esc,
-            KeyModifiers::empty(),
-            KeyEventKind::Press,
-        ))
-        .await;
+        app.route_client_events(
+            vec![raw_key(
+                KeyCode::Esc,
+                KeyModifiers::empty(),
+                KeyEventKind::Press,
+            )],
+            true,
+        );
         assert_eq!(app.state.mode, Mode::Terminal);
         assert_eq!(drained_prefix_active(&mut app), vec![false]);
     }
@@ -2516,9 +2055,7 @@ mod tests {
     fn clipboard_write_event_shows_feedback_toast() {
         let mut app = test_app();
 
-        app.handle_internal_event(AppEvent::ClipboardWrite {
-            content: b"copied".to_vec(),
-        });
+        app.show_clipboard_feedback();
 
         assert!(app.state.toast.is_none());
         let feedback = app.state.copy_feedback.as_ref().expect("copy feedback");
@@ -2531,9 +2068,7 @@ mod tests {
         let mut app = test_app();
         app.state.toast_config.clipboard.enabled = false;
 
-        app.handle_internal_event(AppEvent::ClipboardWrite {
-            content: b"copied".to_vec(),
-        });
+        app.show_clipboard_feedback();
 
         assert!(app.state.copy_feedback.is_none());
         assert!(app.copy_feedback_deadline.is_none());
@@ -2551,9 +2086,7 @@ mod tests {
         });
         let original_toast = app.state.toast.clone();
 
-        app.handle_internal_event(AppEvent::ClipboardWrite {
-            content: b"copied".to_vec(),
-        });
+        app.show_clipboard_feedback();
 
         assert_eq!(app.state.toast, original_toast);
         assert_eq!(
@@ -2599,38 +2132,6 @@ mod tests {
             Some(crate::config::ToastHerdrPosition::TopLeft)
         );
         assert!(app.toast_deadline.is_some());
-    }
-
-    #[test]
-    fn notification_show_api_herdr_toast_expires() {
-        let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
-
-        let response =
-            app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
-                id: "notify".into(),
-                method: crate::api::schema::Method::NotificationShow(
-                    crate::api::schema::NotificationShowParams {
-                        title: "build failed".into(),
-                        body: None,
-                        position: None,
-                        sound: crate::api::schema::NotificationShowSound::None,
-                    },
-                ),
-            });
-
-        let parsed: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
-        assert_eq!(
-            parsed.result,
-            crate::api::schema::ResponseResult::NotificationShow {
-                shown: true,
-                reason: crate::api::schema::NotificationShowReason::Shown,
-            }
-        );
-        let deadline = app.toast_deadline.expect("api toast deadline");
-        assert!(app.handle_scheduled_tasks(deadline, false));
-        assert!(app.state.toast.is_none());
-        assert!(app.toast_deadline.is_none());
     }
 
     #[test]
@@ -3869,33 +3370,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_input_waits_when_reader_is_gone() {
-        let result =
-            tokio::time::timeout(Duration::from_millis(20), recv_raw_input_or_pending(None)).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn terminal_mode_handles_repeat_key_events() {
-        let mut app = test_app();
-        app.state.workspaces = vec![Workspace::test_new("test")];
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-
-        let handled = app
-            .handle_raw_input_event(raw_key(
-                KeyCode::Backspace,
-                KeyModifiers::empty(),
-                KeyEventKind::Repeat,
-            ))
-            .await;
-
-        assert!(handled);
-    }
-
-    #[tokio::test]
-    async fn monolithic_input_forwards_report_all_printable_event_kinds() {
+    async fn client_input_forwards_report_all_printable_event_kinds() {
         let mut app = test_app();
         let mut workspace = Workspace::test_new("test");
         let focused = workspace.focused_pane_id().unwrap();
@@ -3907,14 +3382,17 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
 
-        for kind in [
-            KeyEventKind::Press,
-            KeyEventKind::Repeat,
-            KeyEventKind::Release,
-        ] {
-            app.handle_raw_input_event(raw_key(KeyCode::Char('j'), KeyModifiers::empty(), kind))
-                .await;
-        }
+        app.route_client_events(
+            [
+                KeyEventKind::Press,
+                KeyEventKind::Repeat,
+                KeyEventKind::Release,
+            ]
+            .into_iter()
+            .map(|kind| raw_key(KeyCode::Char('j'), KeyModifiers::empty(), kind))
+            .collect(),
+            true,
+        );
 
         assert_eq!(
             rx.recv().await.unwrap(),
@@ -3931,216 +3409,27 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    #[tokio::test]
-    async fn outer_focus_gained_marks_visible_done_panes_seen() {
-        let mut app = test_app();
-        let mut workspace = Workspace::test_new("test");
-        let root_pane = workspace.tabs[0].root_pane;
-        let split_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
-        let background_tab = workspace.test_add_tab(Some("background"));
-        let background_pane = workspace.tabs[background_tab].root_pane;
-
-        app.state.workspaces = vec![workspace];
-        app.state.ensure_test_terminals();
-        let root_terminal_id = app.state.workspaces[0].tabs[0].panes[&root_pane]
-            .attached_terminal_id
-            .clone();
-        app.state
-            .terminals
-            .get_mut(&root_terminal_id)
-            .unwrap()
-            .state = AgentState::Idle;
-        app.state.workspaces[0].tabs[0]
-            .panes
-            .get_mut(&root_pane)
-            .unwrap()
-            .seen = false;
-        let split_terminal_id = app.state.workspaces[0].tabs[0].panes[&split_pane]
-            .attached_terminal_id
-            .clone();
-        app.state
-            .terminals
-            .get_mut(&split_terminal_id)
-            .unwrap()
-            .state = AgentState::Idle;
-        app.state.workspaces[0].tabs[0]
-            .panes
-            .get_mut(&split_pane)
-            .unwrap()
-            .seen = false;
-        let bg_terminal_id = app.state.workspaces[0].tabs[background_tab].panes[&background_pane]
-            .attached_terminal_id
-            .clone();
-        app.state.terminals.get_mut(&bg_terminal_id).unwrap().state = AgentState::Idle;
-        app.state.workspaces[0].tabs[background_tab]
-            .panes
-            .get_mut(&background_pane)
-            .unwrap()
-            .seen = false;
-
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-        app.state.outer_terminal_focus = Some(false);
-
-        let handled = app
-            .handle_raw_input_event(crate::raw_input::RawInputEvent::OuterFocusGained)
-            .await;
-
-        assert!(handled);
-        assert_eq!(app.state.outer_terminal_focus, Some(true));
-        assert!(app.state.workspaces[0].tabs[0].panes[&root_pane].seen);
-        assert!(app.state.workspaces[0].tabs[0].panes[&split_pane].seen);
-        assert!(!app.state.workspaces[0].tabs[background_tab].panes[&background_pane].seen);
-    }
-
-    #[tokio::test]
-    async fn outer_focus_gained_does_not_require_full_redraw_when_disabled() {
-        let mut app = test_app();
-        app.state.redraw_on_focus_gained = false;
-
-        let handled = app
-            .handle_raw_input_event(crate::raw_input::RawInputEvent::OuterFocusGained)
-            .await;
-
-        assert!(handled);
-        assert_eq!(app.state.outer_terminal_focus, Some(true));
-        assert!(!app.full_redraw_pending);
-    }
-
-    #[tokio::test]
-    async fn monolithic_outer_focus_events_reach_reporting_pane() {
-        let mut app = test_app();
-        let mut workspace = Workspace::test_new("focus-reporting");
-        let pane_id = workspace.tabs[0].root_pane;
-        let (runtime, mut input_rx) =
-            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
-                80,
-                24,
-                0,
-                b"\x1b[?1004h",
-                4,
-            );
-        workspace.insert_test_runtime(pane_id, runtime);
-        app.state.workspaces = vec![workspace];
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-
-        assert!(
-            app.handle_raw_input_event(crate::raw_input::RawInputEvent::OuterFocusGained)
-                .await
-        );
-        assert_eq!(
-            input_rx
-                .recv()
-                .await
-                .expect("forwarded focus gained report"),
-            bytes::Bytes::from_static(b"\x1b[I")
-        );
-
-        assert!(
-            !app.handle_raw_input_event(crate::raw_input::RawInputEvent::OuterFocusLost)
-                .await
-        );
-        assert_eq!(
-            input_rx.recv().await.expect("forwarded focus lost report"),
-            bytes::Bytes::from_static(b"\x1b[O")
-        );
-    }
-
-    #[tokio::test]
-    async fn outer_focus_events_reconcile_pending_pane_focus() {
-        let mut app = test_app();
-        let mut workspace = Workspace::test_new("focus-transition");
-        let previous_pane = workspace.tabs[0].root_pane;
-        let next_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
-        workspace.tabs[0].layout.focus_pane(previous_pane);
-        let (runtime, mut input_rx) =
-            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
-                80,
-                24,
-                0,
-                b"\x1b[?1004h",
-                4,
-            );
-        workspace.insert_test_runtime(next_pane, runtime);
-        app.state.workspaces = vec![workspace];
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-        app.last_focus = Some((0, previous_pane));
-
-        assert!(app.state.focus_pane_in_workspace(0, next_pane));
-        assert!(
-            !app.handle_raw_input_event(crate::raw_input::RawInputEvent::OuterFocusLost)
-                .await
-        );
-        app.sync_focus_events();
-        assert_eq!(
-            input_rx.try_recv().unwrap(),
-            bytes::Bytes::from_static(b"\x1b[O")
-        );
-        assert!(input_rx.try_recv().is_err());
-
-        assert!(app.state.focus_pane_in_workspace(0, previous_pane));
-        app.sync_focus_events();
-        assert_eq!(
-            input_rx.try_recv().unwrap(),
-            bytes::Bytes::from_static(b"\x1b[O")
-        );
-
-        assert!(app.state.focus_pane_in_workspace(0, next_pane));
-        app.sync_focus_events();
-        assert_eq!(
-            input_rx.try_recv().unwrap(),
-            bytes::Bytes::from_static(b"\x1b[O")
-        );
-
-        assert!(
-            app.handle_raw_input_event(crate::raw_input::RawInputEvent::OuterFocusGained)
-                .await
-        );
-        assert_eq!(
-            input_rx.try_recv().unwrap(),
-            bytes::Bytes::from_static(b"\x1b[I")
-        );
-
-        assert!(app.state.focus_pane_in_workspace(0, previous_pane));
-        app.sync_focus_events();
-        assert_eq!(
-            input_rx.try_recv().unwrap(),
-            bytes::Bytes::from_static(b"\x1b[O")
-        );
-        assert!(app.state.focus_pane_in_workspace(0, next_pane));
-        app.sync_focus_events();
-        assert_eq!(
-            input_rx.try_recv().unwrap(),
-            bytes::Bytes::from_static(b"\x1b[I")
-        );
-    }
-
-    #[tokio::test]
-    async fn repeat_key_events_are_ignored_outside_terminal_mode() {
+    #[test]
+    fn repeat_key_events_are_ignored_outside_terminal_mode() {
         let mut app = test_app();
         app.state.mode = Mode::ReleaseNotes;
         app.state.release_notes = Some(release_notes_state());
 
-        let handled = app
-            .handle_raw_input_event(raw_key(
+        app.route_client_events(
+            vec![raw_key(
                 KeyCode::Enter,
                 KeyModifiers::empty(),
                 KeyEventKind::Repeat,
-            ))
-            .await;
+            )],
+            true,
+        );
 
-        assert!(!handled);
         assert_eq!(app.state.mode, Mode::ReleaseNotes);
         assert!(app.state.release_notes.is_some());
     }
 
-    #[tokio::test]
-    async fn modal_press_does_not_leak_repeat_into_terminal_mode() {
+    #[test]
+    fn modal_press_does_not_leak_repeat_into_terminal_mode() {
         let mut app = test_app();
         app.state.workspaces = vec![Workspace::test_new("test")];
         app.state.active = Some(0);
@@ -4148,40 +3437,26 @@ mod tests {
         app.state.mode = Mode::ReleaseNotes;
         app.state.release_notes = Some(release_notes_state());
 
-        let press_handled = app
-            .handle_raw_input_event(raw_key(
+        app.route_client_events(
+            vec![raw_key(
                 KeyCode::Enter,
                 KeyModifiers::empty(),
                 KeyEventKind::Press,
-            ))
-            .await;
-        let repeat_handled = app
-            .handle_raw_input_event(raw_key(
-                KeyCode::Enter,
-                KeyModifiers::empty(),
-                KeyEventKind::Repeat,
-            ))
-            .await;
-        let release_handled = app
-            .handle_raw_input_event(raw_key(
-                KeyCode::Enter,
-                KeyModifiers::empty(),
-                KeyEventKind::Release,
-            ))
-            .await;
-        let next_press_handled = app
-            .handle_raw_input_event(raw_key(
-                KeyCode::Enter,
-                KeyModifiers::empty(),
-                KeyEventKind::Press,
-            ))
-            .await;
-
-        assert!(press_handled);
+            )],
+            true,
+        );
         assert_eq!(app.state.mode, Mode::Terminal);
-        assert!(!repeat_handled);
-        assert!(!release_handled);
-        assert!(next_press_handled);
+
+        app.route_client_events(
+            vec![
+                raw_key(KeyCode::Enter, KeyModifiers::empty(), KeyEventKind::Repeat),
+                raw_key(KeyCode::Enter, KeyModifiers::empty(), KeyEventKind::Release),
+                raw_key(KeyCode::Enter, KeyModifiers::empty(), KeyEventKind::Press),
+            ],
+            true,
+        );
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.release_notes.is_none());
     }
 
     #[test]
@@ -5159,24 +4434,9 @@ mod tests {
     }
 
     #[test]
-    fn next_loop_deadline_includes_session_save_deadline() {
-        let mut app = test_app();
-        let now = Instant::now();
-        app.session_save_deadline = Some(now + Duration::from_secs(2));
-        app.next_resize_poll = now + Duration::from_secs(5);
-        app.next_auto_update_check = Some(now + Duration::from_secs(6));
-
-        assert_eq!(
-            app.next_loop_deadline(now, false),
-            app.session_save_deadline
-        );
-    }
-
-    #[test]
     fn headless_next_loop_deadline_ignores_resize_poll() {
         let mut app = test_app();
         let now = Instant::now();
-        app.next_resize_poll = now + Duration::from_millis(100);
         app.session_save_deadline = Some(now + Duration::from_secs(2));
         app.next_auto_update_check = Some(now + Duration::from_secs(6));
 
@@ -5190,7 +4450,6 @@ mod tests {
     fn headless_next_loop_deadline_returns_none_when_resize_poll_is_only_deadline() {
         let mut app = test_app();
         let now = Instant::now();
-        app.next_resize_poll = now - Duration::from_millis(1);
         app.config_diagnostic_deadline = None;
         app.toast_deadline = None;
         app.next_auto_update_check = None;
@@ -5201,16 +4460,6 @@ mod tests {
             app.next_headless_loop_deadline_with_git_refresh(now, false, true),
             None
         );
-    }
-
-    #[test]
-    fn due_session_save_deadline_is_cleared() {
-        let mut app = test_app();
-        app.session_save_deadline = Some(Instant::now() - Duration::from_secs(1));
-
-        app.handle_scheduled_tasks(Instant::now(), false);
-
-        assert!(app.session_save_deadline.is_none());
     }
 
     #[test]
@@ -5226,7 +4475,7 @@ mod tests {
         app.state.ensure_test_terminals();
         app.session_save_deadline = Some(Instant::now() - Duration::from_secs(1));
 
-        app.handle_scheduled_tasks(Instant::now(), false);
+        app.start_background_session_save();
 
         assert!(app.session_save_thread.is_some());
         assert!(app.session_save_deadline.is_none());
@@ -5279,14 +4528,13 @@ mod tests {
     }
 
     #[test]
-    fn next_loop_deadline_includes_selection_autoscroll_deadline() {
+    fn headless_loop_deadline_includes_selection_autoscroll_deadline() {
         let mut app = test_app();
         let now = Instant::now();
-        app.next_resize_poll = now + Duration::from_millis(300);
         app.selection_autoscroll_deadline = Some(now + Duration::from_millis(5));
         app.session_save_deadline = Some(now + Duration::from_millis(200));
         assert_eq!(
-            app.next_loop_deadline(now, false),
+            app.next_headless_loop_deadline_with_git_refresh(now, false, true),
             app.selection_autoscroll_deadline
         );
     }
@@ -5433,7 +4681,6 @@ mod tests {
         app.state.workspaces = vec![Workspace::test_new("test")];
         app.state.active = Some(0);
         app.state.selected = 0;
-        app.state.detach_exits = false;
         app.state.mode = Mode::Navigate;
 
         app.route_client_events(
@@ -5454,7 +4701,6 @@ mod tests {
         app.state.workspaces = vec![Workspace::test_new("test")];
         app.state.active = Some(0);
         app.state.selected = 0;
-        app.state.detach_exits = false;
 
         // Start in navigate mode.
         app.state.mode = Mode::Navigate;
@@ -5480,7 +4726,6 @@ mod tests {
         app.state.workspaces = vec![Workspace::test_new("test")];
         app.state.active = Some(0);
         app.state.selected = 0;
-        app.state.detach_exits = false;
 
         // Start in terminal mode (default after workspace creation).
         app.state.mode = Mode::Terminal;
@@ -6494,13 +5739,13 @@ last_pane = "prefix+tab"
         assert!(tiled_rx.try_recv().is_err());
 
         app.state.mode = Mode::Settings;
-        assert!(
-            app.handle_raw_input_event(raw_key(
+        app.route_client_events(
+            vec![raw_key(
                 KeyCode::Char('y'),
                 KeyModifiers::NONE,
                 KeyEventKind::Repeat,
-            ))
-            .await
+            )],
+            true,
         );
         assert_eq!(
             popup_rx.try_recv().unwrap(),
@@ -6543,16 +5788,6 @@ last_pane = "prefix+tab"
             true,
         );
 
-        assert!(tiled_rx.try_recv().is_err());
-        assert!(app.state.popup_pane.is_none());
-
-        install_missing_popup(&mut app);
-        assert!(
-            app.handle_raw_input_event(crate::raw_input::RawInputEvent::Paste(
-                "discard-monolithic".into(),
-            ))
-            .await
-        );
         assert!(tiled_rx.try_recv().is_err());
         assert!(app.state.popup_pane.is_none());
     }
@@ -6631,22 +5866,6 @@ last_pane = "prefix+tab"
             true,
         );
 
-        assert!(popup_rx.try_recv().is_ok());
-        assert!(tiled_rx.try_recv().is_err());
-
-        assert!(
-            app.handle_raw_input_event(crate::raw_input::RawInputEvent::Mouse(
-                crossterm::event::MouseEvent {
-                    kind: crossterm::event::MouseEventKind::Down(
-                        crossterm::event::MouseButton::Left,
-                    ),
-                    column: inner.x + 1,
-                    row: inner.y,
-                    modifiers: crossterm::event::KeyModifiers::NONE,
-                },
-            ))
-            .await
-        );
         assert!(popup_rx.try_recv().is_ok());
         assert!(tiled_rx.try_recv().is_err());
     }
@@ -6740,31 +5959,5 @@ last_pane = "prefix+tab"
         app.route_client_input(b"\x1b]".to_vec());
 
         assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn parse_raw_input_bytes_with_ranges_tracks_offsets() {
-        // Verify that the range-aware parser correctly tracks byte offsets
-        // for events within a multi-event input buffer.
-        let input = b"\x1b[Aa".to_vec(); // Up arrow + 'a'
-        let events = crate::raw_input::parse_raw_input_bytes_with_ranges(&input);
-
-        assert_eq!(events.len(), 2, "should parse Up arrow and 'a'");
-        // Up arrow: \x1b[A = 3 bytes starting at offset 0
-        assert_eq!(events[0].start, 0);
-        assert_eq!(events[0].len, 3);
-        // 'a': 1 byte starting at offset 3
-        assert_eq!(events[1].start, 3);
-        assert_eq!(events[1].len, 1);
-
-        // Verify the raw bytes for each event are correct.
-        assert_eq!(
-            &input[events[0].start..events[0].start + events[0].len],
-            b"\x1b[A"
-        );
-        assert_eq!(
-            &input[events[1].start..events[1].start + events[1].len],
-            b"a"
-        );
     }
 }

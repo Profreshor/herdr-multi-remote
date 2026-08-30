@@ -151,13 +151,3 @@ newline-delimited JSON commands on stdin. `terminal.input` sends text or
 base64 bytes, `terminal.resize` changes the controller viewport,
 `terminal.scroll` scrolls the attached viewport, and `terminal.release` closes
 the controller. Only one controller owns input and resize at a time.
-
-## Single-process escape hatch
-
-Use `--no-session` to run Herdr without the background server/client split:
-
-```bash
-herdr --no-session
-```
-
-Use `--no-session` mainly for debugging or compatibility. Persistent session mode remains the default.

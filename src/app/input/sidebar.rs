@@ -654,9 +654,8 @@ mod tests {
     }
 
     #[test]
-    fn persistence_mode_menu_surfaces_detach_action() {
+    fn menu_surfaces_detach_action() {
         let mut app = app_for_mouse_test();
-        app.state.detach_exits = false;
 
         let launcher = app.state.global_launcher_rect();
         app.handle_mouse(mouse(

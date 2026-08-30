@@ -5,6 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use tracing::warn;
 
 use crate::app::PaneClickState;
+#[cfg(test)]
 use crate::input::TerminalKey;
 #[cfg(test)]
 use ratatui::layout::Direction;
@@ -83,51 +84,12 @@ use super::App;
 // ---------------------------------------------------------------------------
 
 impl App {
+    #[cfg(test)]
     pub(super) async fn handle_key(
         &mut self,
         key: TerminalKey,
     ) -> Option<super::TerminalInputTarget> {
-        if self.state.popup_pane.is_some() {
-            return self.handle_terminal_key(key).await;
-        }
-        let key_event = key.as_key_event();
-        if modal_paste_target_active(&self.state) && is_modal_paste_shortcut(&key_event) {
-            if let Some(text) = crate::platform::read_clipboard_text() {
-                self.paste_into_active_text_input(&text);
-            }
-            return None;
-        }
-
-        match self.state.mode {
-            Mode::Terminal => return self.handle_terminal_key(key).await,
-            Mode::Prefix => self.handle_prefix_key(key),
-            Mode::Navigate => self.handle_navigate_key(key),
-            Mode::Copy => self.handle_copy_mode_key(key),
-            _ => match self.state.mode {
-                Mode::Onboarding => self.handle_onboarding_key(key_event),
-                Mode::ReleaseNotes => self.handle_release_notes_key(key_event),
-                Mode::ProductAnnouncement => self.handle_product_announcement_key(key_event),
-                Mode::Prefix | Mode::Navigate | Mode::Copy => unreachable!(),
-                Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
-                    self.handle_rename_key_via_api(key_event)
-                }
-                Mode::NewLinkedWorktree => self.handle_worktree_create_key(key_event),
-                Mode::OpenExistingWorktree => self.handle_worktree_open_key(key_event),
-                Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
-                Mode::Resize => self.handle_resize_key_via_api(key),
-                Mode::ConfirmClose => self.handle_confirm_close_key_via_api(key_event),
-                Mode::ContextMenu => {
-                    self.handle_context_menu_key_via_api(key_event);
-                }
-                Mode::Settings => self.handle_settings_key(key_event),
-                Mode::GlobalMenu => handle_global_menu_key(&mut self.state, key_event),
-                Mode::KeybindHelp => handle_keybind_help_key(&mut self.state, key),
-                Mode::Navigator => {
-                    handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event)
-                }
-                Mode::Terminal => unreachable!(),
-            },
-        }
+        self.route_client_events(vec![crate::raw_input::RawInputEvent::Key(key)], true);
         None
     }
 
@@ -161,58 +123,9 @@ impl App {
         }
     }
 
-    pub(super) async fn handle_text_commit(&mut self, text: String) {
-        if text.is_empty() {
-            return;
-        }
-        if self.state.popup_pane.is_some() {
-            if let Some(runtime) = self.popup_runtime() {
-                let _ = runtime.send_bytes(Bytes::from(text)).await;
-            } else {
-                self.close_popup_pane();
-            }
-            return;
-        }
-        if self.state.mode != Mode::Terminal {
-            self.paste_into_active_text_input(&text);
-            return;
-        }
-
-        self.state.clear_selection();
-        self.selection_autoscroll_deadline = None;
-        self.state.update_dismissed = true;
-        if let Some(ws_idx) = self.state.active {
-            if let Some(runtime) = self
-                .state
-                .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
-            {
-                let _ = runtime.send_bytes(Bytes::from(text)).await;
-            }
-        }
-    }
-
+    #[cfg(test)]
     pub(super) async fn handle_paste(&mut self, text: String) {
-        if self.state.popup_pane.is_some() {
-            if let Some(runtime) = self.popup_runtime() {
-                let _ = runtime.send_paste(text).await;
-            } else {
-                self.close_popup_pane();
-            }
-            return;
-        }
-        if self.state.mode != Mode::Terminal {
-            self.paste_into_active_text_input(&text);
-            return;
-        }
-
-        if let Some(ws_idx) = self.state.active {
-            if let Some(rt) = self
-                .state
-                .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
-            {
-                let _ = rt.send_paste(text).await;
-            }
-        }
+        self.route_client_events(vec![crate::raw_input::RawInputEvent::Paste(text)], true);
     }
 
     pub(crate) fn paste_into_active_text_input(&mut self, text: &str) -> bool {
@@ -334,6 +247,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
         self.handle_mouse_from_input_source(super::LOCAL_INPUT_SOURCE, mouse);
     }

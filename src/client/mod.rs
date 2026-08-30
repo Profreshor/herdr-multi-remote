@@ -1349,7 +1349,7 @@ fn run_client_with_mode(
         err
     })?;
 
-    // Install a panic hook to restore the terminal on panic (same as monolithic).
+    // Install a panic hook so the foreground client always restores its terminal.
     let panic_resets_modify_other_keys = terminal_guard.reset_modify_other_keys;
     let panic_resets_host_color_scheme_reports = terminal_guard.reset_host_color_scheme_reports;
     #[cfg(windows)]

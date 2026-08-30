@@ -2,9 +2,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::hash::{Hash, Hasher};
-use std::io::{self, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 use base64::Engine;
 use ratatui::layout::Rect;
@@ -34,39 +33,8 @@ pub(crate) struct HostCellSize {
 }
 
 impl HostCellSize {
-    pub(crate) fn try_from_terminal(area: Rect) -> Option<Self> {
-        let Ok(size) = crossterm::terminal::window_size() else {
-            return None;
-        };
-        if size.columns == 0 || size.rows == 0 || size.width == 0 || size.height == 0 {
-            return None;
-        }
-        Some(
-            Self {
-                width_px: (size.width as u32 / size.columns as u32).max(1),
-                height_px: (size.height as u32 / size.rows as u32).max(1),
-            }
-            .for_area(area),
-        )
-    }
-
     pub(crate) fn is_known(self) -> bool {
         self.width_px > 0 && self.height_px > 0
-    }
-
-    pub(crate) fn fallback_for_area(area: Rect) -> Self {
-        Self {
-            width_px: 8,
-            height_px: 16,
-        }
-        .for_area(area)
-    }
-
-    fn for_area(self, area: Rect) -> Self {
-        if area.width == 0 || area.height == 0 {
-            return Self::default();
-        }
-        self
     }
 }
 
@@ -156,7 +124,6 @@ pub(crate) struct HostGraphicsCache {
 }
 
 static KITTY_GRAPHICS_ENABLED: AtomicBool = AtomicBool::new(false);
-static LOCAL_HOST_GRAPHICS: OnceLock<Mutex<HostGraphicsCache>> = OnceLock::new();
 
 pub(crate) fn set_enabled(enabled: bool) {
     KITTY_GRAPHICS_ENABLED.store(enabled, Ordering::Release);
@@ -164,60 +131,6 @@ pub(crate) fn set_enabled(enabled: bool) {
 
 pub(crate) fn is_enabled() -> bool {
     KITTY_GRAPHICS_ENABLED.load(Ordering::Acquire)
-}
-
-pub(crate) fn paint_local_pane_graphics(
-    app: &AppState,
-    graphics: &crate::app::pane_graphics::Runtime,
-    terminal_runtimes: &TerminalRuntimeRegistry,
-    cell_size: HostCellSize,
-) -> io::Result<()> {
-    let cache = LOCAL_HOST_GRAPHICS.get_or_init(|| Mutex::new(HostGraphicsCache::default()));
-    let Ok(mut cache) = cache.lock() else {
-        return Ok(());
-    };
-    if graphics.slots.is_empty() && !cache.has_pane_sources() {
-        let encoded = encode_local_pane_graphics(
-            app,
-            graphics,
-            terminal_runtimes,
-            app.view.tab_surface(),
-            cell_size,
-            None,
-            &mut cache,
-        );
-        drop(cache);
-        if encoded.bytes.is_empty() {
-            return Ok(());
-        }
-        let mut stdout = io::stdout().lock();
-        stdout.write_all(b"\x1b7")?;
-        stdout.write_all(&encoded.bytes)?;
-        stdout.write_all(b"\x1b8")?;
-        return stdout.flush();
-    }
-
-    let mut stdout = io::stdout().lock();
-    loop {
-        let encoded = encode_local_pane_graphics(
-            app,
-            graphics,
-            terminal_runtimes,
-            app.view.tab_surface(),
-            cell_size,
-            None,
-            &mut cache,
-        );
-        if !encoded.bytes.is_empty() {
-            stdout.write_all(b"\x1b7")?;
-            stdout.write_all(&encoded.bytes)?;
-            stdout.write_all(b"\x1b8")?;
-        }
-        if !encoded.incomplete {
-            break;
-        }
-    }
-    stdout.flush()
 }
 
 pub(crate) struct EncodedGraphics {
@@ -886,20 +799,6 @@ fn encode_graphics_update(
     *images = cache.images;
     *host_placements = cache.placements;
     *sources = cache.sources;
-}
-
-pub(crate) fn clear_all_host_graphics() -> io::Result<()> {
-    let cache = LOCAL_HOST_GRAPHICS.get_or_init(|| Mutex::new(HostGraphicsCache::default()));
-    let mut bytes = Vec::new();
-    if let Ok(mut cache) = cache.lock() {
-        bytes = cache.clear_bytes();
-    }
-    if bytes.is_empty() {
-        return Ok(());
-    }
-    let mut stdout = io::stdout().lock();
-    stdout.write_all(&bytes)?;
-    stdout.flush()
 }
 
 impl HostGraphicsCache {
@@ -1735,18 +1634,6 @@ fn encode_kitty_data(out: &mut Vec<u8>, control: &str, data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fallback_cell_size_is_usable_only_for_nonempty_areas() {
-        assert_eq!(
-            HostCellSize::fallback_for_area(Rect::new(0, 0, 80, 24)),
-            HostCellSize {
-                width_px: 8,
-                height_px: 16,
-            }
-        );
-        assert!(!HostCellSize::fallback_for_area(Rect::default()).is_known());
-    }
 
     fn test_placement(viewport_col: i32, viewport_row: i32) -> HostPlacement {
         HostPlacement {

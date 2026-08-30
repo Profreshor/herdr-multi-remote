@@ -143,46 +143,6 @@ fn spawn_client_process_with_args_and_env(
     }
 }
 
-fn spawn_no_session_process(config_home: &PathBuf, runtime_dir: &PathBuf) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
-    fs::create_dir_all(runtime_dir).unwrap();
-    register_runtime_dir(runtime_dir);
-    fs::write(
-        config_home.join(app_dir_name()).join("config.toml"),
-        "onboarding = false\n[ui]\nwindow_title = \"monolithic\"\n",
-    )
-    .unwrap();
-
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .unwrap();
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
-    cmd.arg("--no-session");
-    cmd.env("XDG_CONFIG_HOME", config_home);
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
-    cmd.env("SHELL", "/bin/sh");
-    cmd.env_remove("HERDR_ENV");
-    cmd.env_remove("HERDR_SOCKET_PATH");
-    cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
-    cmd.env_remove("HERDR_SESSION");
-    cmd.env_remove("HERDR_WORKSPACE_ID");
-    cmd.env_remove("HERDR_TAB_ID");
-    cmd.env_remove("HERDR_PANE_ID");
-    let child = pair.slave.spawn_command(cmd).unwrap();
-    register_spawned_herdr_pid(child.process_id());
-    drop(pair.slave);
-
-    SpawnedHerdr {
-        _master: Some(pair.master),
-        child,
-    }
-}
-
 fn spawn_server(
     config_home: &PathBuf,
     runtime_dir: &PathBuf,
@@ -1075,26 +1035,6 @@ fn send_pane_shell_command(socket_path: &PathBuf, pane_id: &str, command: &str) 
     });
     let response = send_json_request(socket_path, &request.to_string());
     assert_eq!(response["result"]["type"], "ok", "{response}");
-}
-
-#[test]
-fn configured_window_title_is_emitted_in_no_session_mode() {
-    let _lock = test_lock();
-    let base = unique_test_dir();
-    let config_home = base.join("config");
-    let runtime_dir = base.join("runtime");
-    let no_session = spawn_no_session_process(&config_home, &runtime_dir);
-    let reader = no_session
-        ._master
-        .as_ref()
-        .expect("no-session PTY master")
-        .try_clone_reader()
-        .expect("clone no-session PTY reader");
-    let output = spawn_pty_drain(reader);
-
-    wait_for_window_title(&output, "monolithic");
-
-    cleanup_spawned_herdr(no_session, base);
 }
 
 #[test]

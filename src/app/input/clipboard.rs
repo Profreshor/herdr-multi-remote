@@ -159,7 +159,8 @@ mod tests {
         assert!(app.state.selection.is_none());
         assert!(input_rx.try_recv().is_err());
 
-        app.handle_internal_event(AppEvent::ClipboardWrite { content });
+        let _ = content;
+        app.show_clipboard_feedback();
         assert_eq!(
             app.state
                 .copy_feedback

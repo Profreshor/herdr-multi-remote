@@ -3686,9 +3686,8 @@ navigate_pane_down = "ctrl+j"
     }
 
     #[test]
-    fn navigate_q_detaches_in_persistence_mode() {
+    fn navigate_q_detaches() {
         let mut state = crate::app::state::AppState::test_new();
-        state.detach_exits = false;
 
         handle_navigate_key(
             &mut state,

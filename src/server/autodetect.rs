@@ -3,10 +3,7 @@
 //! When the user runs `herdr` with no subcommand:
 //! 1. Check if a server is already listening on the client socket
 //! 2. If no server → spawn one as a background daemon → wait for socket readiness (up to 15s)
-//! 3. Attach as a thin client to the server
-//!
-//! The `--no-session` flag bypasses server/client entirely and runs monolithically
-//! (escape hatch for users who want the traditional single-process behavior).
+//! 3. Attach as a client to the server
 
 use std::io;
 use std::path::Path;
@@ -281,7 +278,7 @@ pub fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Resu
 /// attach as a thin client.
 ///
 /// This is the entry point called from `main.rs` when the user runs `herdr`
-/// without `--no-session` and without a subcommand.
+/// without a subcommand.
 ///
 /// Flow:
 /// 1. Check if a server is listening on the client socket

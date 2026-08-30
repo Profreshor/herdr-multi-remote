@@ -492,8 +492,7 @@ impl HeadlessServer {
 
     /// Runs the headless server event loop until shutdown.
     ///
-    /// This is the server's main loop — analogous to `App::run()` but without
-    /// a real terminal. It:
+    /// This is the server's main runtime loop. It:
     /// - Drains internal events (pane death, state changes)
     /// - Drains API requests (from the JSON socket)
     /// - Accepts new client connections
@@ -507,10 +506,6 @@ impl HeadlessServer {
         let should_quit = self.should_quit.clone();
         let quit_notify = self.server_event_tx.clone();
         ctrlc_handler(should_quit, quit_notify);
-
-        // No input_rx needed — server doesn't read stdin.
-        // We use None for input_rx so the event loop doesn't try to read from stdin.
-        self.app.input_rx = None;
 
         let mut needs_render = true;
         let mut needs_full_render = true;
@@ -2763,13 +2758,7 @@ impl HeadlessServer {
     /// Drains internal events, forwarding clipboard, sound, and toast
     /// notifications to connected clients instead of processing them locally.
     ///
-    /// In the monolithic mode:
-    /// - `ClipboardWrite` events are written to stdout via `write_osc52_bytes`.
-    /// - Sound notifications are played locally via `sound::play`.
-    /// - Toast notifications are set on AppState and rendered into the frame.
-    ///
-    /// In the headless server, there is no stdout terminal or audio subsystem,
-    /// so we:
+    /// The server has no host terminal or audio subsystem, so we:
     /// - Forward `ClipboardWrite` as `ServerMessage::Clipboard` to the
     ///   foreground client only.
     /// - Detect when a sound would be played and forward as
@@ -5770,15 +5759,6 @@ pub fn run_server() -> io::Result<()> {
         );
         seed_startup_workspace_if_empty(&mut app);
 
-        // The server runs headless — disable local notification side effects.
-        // Sound and terminal notifications are forwarded to connected clients
-        // as ServerMessage::Notify instead of emitted by the server process.
-        // The prefix input-source switch is likewise forwarded to the foreground
-        // client (ServerMessage::PrefixInputSource), never applied in-process.
-        app.state.local_sound_playback = false;
-        app.local_terminal_notifications = false;
-        app.local_input_source_switch = false;
-
         // Create the headless server.
         let mut server = match HeadlessServer::new(
             app,
@@ -5870,7 +5850,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         .map_err(io::Error::other)?;
 
     let result = rt.block_on(async {
-        let mut app = app::App::new_from_handoff(
+        let app = app::App::new_from_handoff(
             &loaded_config.config,
             config::config_diagnostic_summary(&loaded_config.diagnostics),
             api_rx,
@@ -5878,9 +5858,6 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             &received.manifest.snapshot,
             &mut imports,
         )?;
-        app.state.local_sound_playback = false;
-        app.local_terminal_notifications = false;
-        app.local_input_source_switch = false;
         crate::server::handoff::report_restored(&mut received.stream)?;
         if std::env::var("HERDR_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("after_restored") {
             return Err(io::Error::other(
@@ -6024,10 +6001,7 @@ mod tests {
     fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServer {
         let config = crate::config::Config::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = crate::app::App::new(&config, true, None, api_rx, event_hub);
-        app.state.local_sound_playback = false;
-        app.local_terminal_notifications = false;
-        app.local_input_source_switch = false;
+        let app = crate::app::App::new(&config, true, None, api_rx, event_hub);
 
         let dir = std::env::temp_dir().join(format!(
             "hh-{}-{}",
@@ -12472,49 +12446,6 @@ next_tab = ""
                 body: Some("mixed body".into()),
             }
         );
-    }
-
-    #[test]
-    fn headless_app_keeps_prefix_input_source_switch_off_process() {
-        // An App-internal drain (e.g. the exhaustive drain at the top of
-        // handle_api_request) can consume a queued PrefixInputSource intent
-        // before the forwarding drain sees it. The headless App must treat the
-        // event as inert instead of switching the host input source from the
-        // server process.
-        struct CountingPrefixInputSource(std::rc::Rc<std::cell::Cell<usize>>);
-        impl crate::platform::PrefixInputSource for CountingPrefixInputSource {
-            fn switch_to_ascii(&mut self) {
-                self.0.set(self.0.get() + 1);
-            }
-            fn restore(&mut self) {
-                self.0.set(self.0.get() + 1);
-            }
-        }
-
-        let mut server = test_headless_server();
-        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
-        server
-            .app
-            .set_prefix_input_source(Box::new(CountingPrefixInputSource(calls.clone())));
-
-        server
-            .app
-            .handle_internal_event(AppEvent::PrefixInputSource { active: true });
-        server
-            .app
-            .handle_internal_event(AppEvent::PrefixInputSource { active: false });
-        assert_eq!(
-            calls.get(),
-            0,
-            "headless server must not apply the host input-source switch"
-        );
-
-        // Sanity: the same event does apply once the flag is on (monolithic semantics).
-        server.app.local_input_source_switch = true;
-        server
-            .app
-            .handle_internal_event(AppEvent::PrefixInputSource { active: true });
-        assert_eq!(calls.get(), 1);
     }
 
     #[test]
