@@ -15,8 +15,8 @@ use serde_json::Value;
 use support::{
     cleanup_test_base, client_shell_handshake, drain_messages, register_runtime_dir,
     register_spawned_herdr_pid, send_detach, unregister_spawned_herdr_pid,
-    wait_for_client_shell_bootstrap, wait_for_message_variant, CURRENT_PROTOCOL,
-    SERVER_MESSAGE_PANE_SURFACE,
+    wait_for_client_shell_bootstrap, wait_for_message_variant, wait_for_message_variants,
+    CURRENT_PROTOCOL, SERVER_MESSAGE_PANE_SURFACE, SERVER_MESSAGE_PANE_SURFACE_PATCH,
 };
 
 fn unique_test_dir() -> PathBuf {
@@ -287,7 +287,7 @@ fn effective_size_uses_smallest_foreground_client_and_recovers_on_disconnect() {
 }
 
 #[test]
-fn api_pane_output_is_fanned_out_as_pane_surfaces() {
+fn api_pane_output_is_fanned_out_as_pane_surface_updates() {
     let _lock = test_lock();
     let base = unique_test_dir();
     let config = base.join("config");
@@ -311,14 +311,12 @@ fn api_pane_output_is_fanned_out_as_pane_surfaces() {
     );
     pane_input(&api, &pane, &format!("printf '{marker}\\n'"));
     assert!(pane_contains(&api, &pane, &marker, Duration::from_secs(5)));
-    assert!(
-        wait_for_message_variant(&mut a, Duration::from_secs(5), SERVER_MESSAGE_PANE_SURFACE)
-            .unwrap()
-    );
-    assert!(
-        wait_for_message_variant(&mut b, Duration::from_secs(5), SERVER_MESSAGE_PANE_SURFACE)
-            .unwrap()
-    );
+    let surface_updates = [
+        SERVER_MESSAGE_PANE_SURFACE,
+        SERVER_MESSAGE_PANE_SURFACE_PATCH,
+    ];
+    assert!(wait_for_message_variants(&mut a, Duration::from_secs(5), &surface_updates).unwrap());
+    assert!(wait_for_message_variants(&mut b, Duration::from_secs(5), &surface_updates).unwrap());
     cleanup(server, base);
 }
 

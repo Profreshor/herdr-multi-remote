@@ -2312,7 +2312,14 @@ impl HeadlessServer {
                 if let Err(err) = apply_client_pane_input_events(runtime, &events) {
                     warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
                 }
-                true
+                // Mouse motion must still reach the PTY, but repeated motion from
+                // the foreground client must not drive a full render on every
+                // event. Promotion remains a render-causing interaction.
+                if client_pane_input_is_motion_only(&events) {
+                    foreground_changed
+                } else {
+                    true
+                }
             }
             ServerEvent::ClientShellPopupInput {
                 client_id,
@@ -2369,7 +2376,11 @@ impl HeadlessServer {
                 if let Err(err) = apply_client_popup_input_events(runtime, &events) {
                     warn!(client_id, terminal_id, err = %err, "targeted client popup input failed");
                 }
-                true
+                if client_pane_input_is_motion_only(&events) {
+                    foreground_changed
+                } else {
+                    true
+                }
             }
             ServerEvent::ClientShellEndpointRequest {
                 client_id,
@@ -3269,6 +3280,19 @@ fn client_pane_input_has_interaction(events: &[protocol::ClientPaneInputEvent]) 
     events
         .iter()
         .any(|event| !client_pane_input_releases_press(event))
+}
+
+fn client_pane_input_is_motion_only(events: &[protocol::ClientPaneInputEvent]) -> bool {
+    !events.is_empty()
+        && events.iter().all(|event| {
+            matches!(
+                event,
+                protocol::ClientPaneInputEvent::Mouse {
+                    kind: protocol::ClientMouseKind::Moved,
+                    ..
+                }
+            )
+        })
 }
 
 impl Drop for HeadlessServer {

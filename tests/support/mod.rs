@@ -373,13 +373,21 @@ pub fn wait_for_message_variant(
     timeout: Duration,
     variant: u32,
 ) -> Result<bool, String> {
+    wait_for_message_variants(stream, timeout, &[variant])
+}
+
+pub fn wait_for_message_variants(
+    stream: &mut UnixStream,
+    timeout: Duration,
+    variants: &[u32],
+) -> Result<bool, String> {
     stream
         .set_read_timeout(Some(Duration::from_millis(200)))
         .map_err(|e| e.to_string())?;
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         match read_server_message(stream) {
-            Ok((got, _)) if got == variant => return Ok(true),
+            Ok((got, _)) if variants.contains(&got) => return Ok(true),
             Ok(_) => continue,
             Err(_) => continue,
         }

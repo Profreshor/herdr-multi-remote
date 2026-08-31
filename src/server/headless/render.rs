@@ -367,7 +367,6 @@ impl HeadlessServer {
             .any(|(_, _, _, _, mode)| matches!(mode, ClientConnectionMode::ClientShell))
             .then(|| client_shell_snapshot(&self.app, &self.client_shell_boot_id, 0, None));
         let mut broken_clients: Vec<u64> = Vec::new();
-        let mut deferred_frame = false;
         for (client_id, (cols, rows), cell_size, is_foreground, mode) in render_targets {
             let area = Rect::new(0, 0, cols, rows);
             let mut shell_projection_revision = 0;
@@ -576,7 +575,6 @@ impl HeadlessServer {
                     client.render_state.commit_sent_frame(prepared);
                     if shell_graphics_pending || shell_assets_deferred {
                         client.defer_full_render();
-                        deferred_frame = true;
                     } else {
                         client.clear_deferred_render();
                     }
@@ -584,7 +582,6 @@ impl HeadlessServer {
                 }
                 Err(std::sync::mpsc::TrySendError::Full(_)) => {
                     client.defer_full_render();
-                    deferred_frame = true;
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                     broken_clients.push(client_id);
@@ -599,9 +596,10 @@ impl HeadlessServer {
         }
 
         let (cols, rows) = self.effective_size;
-        if !deferred_frame {
-            self.app.full_redraw_pending = false;
-        }
+        // Full-frame recovery is tracked per connection. A slow client must not
+        // keep responsive peers on the global full-render path while it waits
+        // for its render slot to drain.
+        self.app.full_redraw_pending = false;
         crate::render_prof::duration_since("full_render.total", full_started);
         debug!(cols, rows, foreground_client_id = ?self.foreground_client_id, "rendered virtual frame(s)");
     }

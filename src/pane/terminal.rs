@@ -2430,12 +2430,16 @@ fn ghostty_collect_dirty_patch(
     if render_state.update(terminal).is_err() {
         fallback!("render_state_update_error");
     }
-    match render_state.dirty() {
+    let collect_all_rows = match render_state.dirty() {
         Ok(crate::ghostty::Dirty::Clean) => finish!(TerminalDirtyPatchOutcome::Clean),
-        Ok(crate::ghostty::Dirty::Partial) => {}
-        Ok(crate::ghostty::Dirty::Full) => fallback!("dirty_full"),
+        Ok(crate::ghostty::Dirty::Partial) => false,
+        // A full dirty state means that every visible row may have changed. It
+        // is still safe to send this as a bounded patch: the client replaces
+        // only this pane's viewport, rather than falling back to the whole
+        // shell surface.
+        Ok(crate::ghostty::Dirty::Full) => true,
         Err(_) => fallback!("dirty_read_error"),
-    }
+    };
 
     let colors = render_state.colors().ok();
     let default_bg = colors
@@ -2466,7 +2470,7 @@ fn ghostty_collect_dirty_patch(
         let Ok(dirty) = rows.dirty() else {
             fallback!("row_dirty_read_error");
         };
-        if dirty {
+        if collect_all_rows || dirty {
             match rows.selection() {
                 Ok(None) => {}
                 Ok(Some(_)) => fallback!("row_selection_present"),
@@ -2515,6 +2519,9 @@ fn ghostty_collect_dirty_patch(
         y += 1;
     }
 
+    // Nothing above mutates dirty state. Only clear it after every row has
+    // been collected successfully, so a safety fallback leaves the next
+    // collection with the same information.
     let dirty_ys: std::collections::HashSet<u16> = patch_rows.iter().map(|(row, _)| *row).collect();
     if !dirty_ys.is_empty() {
         let Ok(mut clear_row_iterator) = crate::ghostty::RowIterator::new() else {
@@ -3411,6 +3418,30 @@ mod tests {
 
     fn rgb(r: u8, g: u8, b: u8) -> crate::ghostty::RgbColor {
         crate::ghostty::RgbColor { r, g, b }
+    }
+
+    #[test]
+    fn dirty_full_collects_bounded_viewport_patch() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(4, 3, 200).unwrap();
+        terminal.write(b"one\r\ntwo\r\nthree");
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap());
+
+        let patch = match pane.collect_dirty_patch(4, 3) {
+            TerminalDirtyPatchOutcome::Patch(patch) => patch,
+            outcome => panic!("expected viewport patch, got {outcome:?}"),
+        };
+
+        assert_eq!(patch.rows.len(), 3);
+        assert_eq!(
+            patch.rows.iter().map(|(row, _)| *row).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(patch.rows.iter().all(|(_, cells)| cells.len() == 4));
+        assert!(matches!(
+            pane.collect_dirty_patch(4, 3),
+            TerminalDirtyPatchOutcome::Clean
+        ));
     }
 
     #[test]

@@ -14,17 +14,18 @@ fn patch_intersects_hyperlinks(
         return false;
     }
     let width = usize::from(frame.width);
-    patch.rows.iter().any(|(local_y, _)| {
-        if *local_y >= area.height {
-            return true;
-        }
-        let start = usize::from(area.y + *local_y) * width + usize::from(area.x);
-        let end = start + usize::from(area.width);
-        end > frame.cells.len()
-            || frame.cells[start..end]
-                .iter()
-                .any(|cell| cell.hyperlink.is_some())
-    })
+    patch
+        .rows
+        .iter()
+        .filter(|(local_y, _)| *local_y < area.height)
+        .any(|(local_y, _)| {
+            let start = usize::from(area.y + *local_y) * width + usize::from(area.x);
+            let end = start + usize::from(area.width);
+            end > frame.cells.len()
+                || frame.cells[start..end]
+                    .iter()
+                    .any(|cell| cell.hyperlink.is_some())
+        })
 }
 
 fn apply_patch_row(frame: &mut FrameData, row: &protocol::PaneSurfacePatchRow) -> Option<bool> {
@@ -53,14 +54,18 @@ fn apply_rows(
     }
     let mut rows = Vec::with_capacity(patch.rows.len());
     for (local_y, cells) in &patch.rows {
-        if *local_y >= area.height || cells.len() != usize::from(area.width) {
+        if *local_y >= area.height {
+            continue;
+        }
+        let width = usize::from(area.width);
+        if cells.len() < width {
             return None;
         }
         let y = area.y + *local_y;
         let row = protocol::PaneSurfacePatchRow {
             x: area.x,
             y,
-            cells: cells.clone(),
+            cells: cells[..width].to_vec(),
         };
         apply_patch_row(frame, &row)?;
         rows.push(row);
@@ -72,12 +77,12 @@ fn retained_scrollbar_patch(
     app: &app::App,
     frame: &mut FrameData,
     pane: &mut protocol::PaneSurfacePane,
-    runtime: &crate::terminal::TerminalRuntime,
+    alternate_screen_active: bool,
     metrics: Option<crate::pane::ScrollMetrics>,
 ) -> Option<Vec<protocol::PaneSurfacePatchRow>> {
     let next_rect = metrics
         .filter(|metrics| metrics.max_offset_from_bottom > 0)
-        .filter(|_| app.state.pane_scrollbars && !runtime.alternate_screen_active())
+        .filter(|_| app.state.pane_scrollbars && !alternate_screen_active)
         .and_then(|_| {
             let rect = protocol::SurfaceRect {
                 x: pane.inner_rect.x.checked_add(pane.inner_rect.width)?,
@@ -159,6 +164,27 @@ fn retained_cursor(
         })
 }
 
+struct RetainedRecipient {
+    client_id: u64,
+    surface: protocol::PaneSurfaceFrame,
+}
+
+struct CollectedPanePatch {
+    pane_id: String,
+    patch: crate::pane::TerminalDirtyPatch,
+    content_revision: u64,
+    scroll_metrics: Option<crate::pane::ScrollMetrics>,
+    mouse_reporting: bool,
+    sgr_pixel_mouse: bool,
+    alternate_screen_active: bool,
+}
+
+struct RetainedRecipientUpdate {
+    client_id: u64,
+    surface: protocol::PaneSurfaceFrame,
+    patch: protocol::PaneSurfacePatch,
+}
+
 impl HeadlessServer {
     /// Applies terminal dirty rows to the committed origin-relative pane surface.
     /// Any presentation or geometry uncertainty falls back to the complete renderer.
@@ -192,45 +218,70 @@ impl HeadlessServer {
             fallback!("unsafe_state");
         }
         let targets = render_targets(&self.clients, self.foreground_client_id);
-        let [(client_id, (cols, rows), _, _, ClientConnectionMode::ClientShell)] =
-            targets.as_slice()
-        else {
-            fallback!("not_single_shell");
-        };
-        let Some(client) = self.clients.get(client_id) else {
-            fallback!("client_missing");
-        };
-        if client.deferred_render() != DeferredRender::None {
-            fallback!("render_deferred");
-        }
-        let Some(mut next_surface) = client.render_state.last_pane_surface().cloned() else {
-            fallback!("no_baseline");
-        };
-        if next_surface.boot_id != self.client_shell_boot_id
-            || next_surface.projection_revision != client.shell_projection_revision
-            || next_surface.frame.width != *cols
-            || next_surface.frame.height != *rows
-            || next_surface.popup.is_some()
-            || !next_surface.graphics.assets.is_empty()
-            || !next_surface.graphics.placements.is_empty()
-            || !next_surface.graphics.retained_assets.is_empty()
-            || !next_surface.frame.graphics.is_empty()
+        if targets.is_empty()
+            || targets
+                .iter()
+                .any(|target| !matches!(target.4, ClientConnectionMode::ClientShell))
         {
-            fallback!("baseline_mismatch");
+            fallback!("non_shell_target");
         }
 
-        let mut changed_panes = Vec::new();
-        let mut patch_rows = Vec::new();
-        let mut metadata_changed = false;
-        let mut matched_sources = HashSet::new();
-        for pane in &mut next_surface.panes {
-            let Some((workspace_index, pane_id)) = self.app.parse_pane_id(&pane.pane_id) else {
-                fallback!("pane_missing");
+        let mut recipients = Vec::with_capacity(targets.len());
+        for (client_id, (cols, rows), _, _, _) in &targets {
+            let Some(client) = self.clients.get(client_id) else {
+                fallback!("client_missing");
             };
-            if !pty_sources.contains(&pane_id) {
+            if client.deferred_render() != DeferredRender::None {
+                crate::render_prof::event("retained_surface.recipient_deferred");
                 continue;
             }
-            matched_sources.insert(pane_id);
+            let Some(surface) = client.render_state.last_pane_surface() else {
+                fallback!("no_baseline");
+            };
+            if surface.boot_id != self.client_shell_boot_id
+                || surface.projection_revision != client.shell_projection_revision
+                || surface.frame.width != *cols
+                || surface.frame.height != *rows
+                || surface.popup.is_some()
+                || !surface.graphics.assets.is_empty()
+                || !surface.graphics.placements.is_empty()
+                || !surface.graphics.retained_assets.is_empty()
+                || !surface.frame.graphics.is_empty()
+            {
+                fallback!("baseline_mismatch");
+            }
+            recipients.push(RetainedRecipient {
+                client_id: *client_id,
+                surface: surface.clone(),
+            });
+        }
+        if recipients.is_empty() {
+            success!("all_recipients_deferred");
+        }
+
+        let mut collected = Vec::with_capacity(pty_sources.len());
+        for source in pty_sources {
+            let mut public_pane_id = None;
+            let mut width = 0u16;
+            let mut height = 0u16;
+            for recipient in &recipients {
+                let Some(pane) = recipient.surface.panes.iter().find(|pane| {
+                    self.app
+                        .parse_pane_id(&pane.pane_id)
+                        .is_some_and(|(_, pane_id)| pane_id == *source)
+                }) else {
+                    fallback!("source_not_visible");
+                };
+                public_pane_id.get_or_insert_with(|| pane.pane_id.clone());
+                width = width.max(pane.inner_rect.width);
+                height = height.max(pane.inner_rect.height);
+            }
+            let Some(public_pane_id) = public_pane_id else {
+                fallback!("pane_missing");
+            };
+            let Some((workspace_index, pane_id)) = self.app.parse_pane_id(&public_pane_id) else {
+                fallback!("pane_missing");
+            };
             let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
                 &self.app.terminal_runtimes,
                 workspace_index,
@@ -242,105 +293,180 @@ impl HeadlessServer {
             if !revision_before.is_multiple_of(2) {
                 fallback!("unstable_content");
             }
-            let patch =
-                match runtime.collect_dirty_patch(pane.inner_rect.width, pane.inner_rect.height) {
-                    crate::pane::TerminalDirtyPatchOutcome::Clean => {
-                        crate::render_prof::event("retained_surface.pane_clean");
-                        crate::pane::TerminalDirtyPatch { rows: Vec::new() }
-                    }
-                    crate::pane::TerminalDirtyPatchOutcome::Patch(patch) => patch,
-                    crate::pane::TerminalDirtyPatchOutcome::Fallback => {
-                        fallback!("terminal_patch");
-                    }
-                };
+            let patch = match runtime.collect_dirty_patch(width, height) {
+                crate::pane::TerminalDirtyPatchOutcome::Clean => {
+                    crate::render_prof::event("retained_surface.pane_clean");
+                    crate::pane::TerminalDirtyPatch { rows: Vec::new() }
+                }
+                crate::pane::TerminalDirtyPatchOutcome::Patch(patch) => patch,
+                crate::pane::TerminalDirtyPatchOutcome::Fallback => {
+                    fallback!("terminal_patch");
+                }
+            };
             let revision = runtime.content_seq();
             if revision != revision_before || !revision.is_multiple_of(2) {
                 fallback!("content_changed");
             }
-            if patch_intersects_hyperlinks(&next_surface.frame, pane.inner_rect, &patch) {
-                fallback!("hyperlink");
-            }
-            let previous_pane = pane.clone();
-            let Some(rows) = apply_rows(&mut next_surface.frame, pane.inner_rect, &patch) else {
-                fallback!("invalid_patch");
-            };
-            patch_rows.extend(rows);
-            let scroll_metrics = runtime.scroll_metrics();
-            let Some(scrollbar_rows) = retained_scrollbar_patch(
-                &self.app,
-                &mut next_surface.frame,
-                pane,
-                runtime,
-                scroll_metrics,
-            ) else {
-                fallback!("scrollbar_patch");
-            };
-            patch_rows.extend(scrollbar_rows);
-            pane.content_revision = revision;
-            pane.mouse_reporting = runtime.mouse_reporting_enabled();
-            pane.sgr_pixel_mouse = runtime.sgr_pixel_mouse_enabled();
-            pane.scroll = scroll_metrics.map(|metrics| protocol::PaneSurfaceScrollMetrics {
-                offset_from_bottom: metrics.offset_from_bottom as u64,
-                max_offset_from_bottom: metrics.max_offset_from_bottom as u64,
-                viewport_rows: metrics.viewport_rows as u64,
+            collected.push(CollectedPanePatch {
+                pane_id: public_pane_id,
+                patch,
+                content_revision: revision,
+                scroll_metrics: runtime.scroll_metrics(),
+                mouse_reporting: runtime.mouse_reporting_enabled(),
+                sgr_pixel_mouse: runtime.sgr_pixel_mouse_enabled(),
+                alternate_screen_active: runtime.alternate_screen_active(),
             });
-            metadata_changed |= *pane != previous_pane;
-            changed_panes.push(pane.clone());
-        }
-        if !pty_sources.is_subset(&matched_sources) {
-            fallback!("source_not_visible");
         }
 
-        let cursor = retained_cursor(&self.app, &next_surface.panes);
-        let cursor_changed = cursor != next_surface.frame.cursor;
-        next_surface.frame.cursor = cursor.clone();
-        if patch_rows.is_empty() && !cursor_changed && !metadata_changed {
+        let mut updates = Vec::with_capacity(recipients.len());
+        for recipient in recipients {
+            let client_id = recipient.client_id;
+            let mut surface = recipient.surface;
+            let projection_revision = surface.projection_revision;
+            let base_surface_revision = surface.surface_revision;
+            let mut changed_panes = Vec::with_capacity(collected.len());
+            let mut patch_rows = Vec::new();
+            let mut metadata_changed = false;
+            for collected_pane in &collected {
+                let Some(pane) = surface
+                    .panes
+                    .iter_mut()
+                    .find(|pane| pane.pane_id == collected_pane.pane_id)
+                else {
+                    fallback!("pane_missing");
+                };
+                // Alternate-screen transitions change whether the pane reserves
+                // a scrollbar gutter. Recompute layout and resize the runtime
+                // through the complete renderer before retaining further rows.
+                if pane.alternate_screen_active != collected_pane.alternate_screen_active {
+                    fallback!("alternate_screen_geometry");
+                }
+                if patch_intersects_hyperlinks(
+                    &surface.frame,
+                    pane.inner_rect,
+                    &collected_pane.patch,
+                ) {
+                    fallback!("hyperlink");
+                }
+                let previous_pane = pane.clone();
+                let Some(rows) =
+                    apply_rows(&mut surface.frame, pane.inner_rect, &collected_pane.patch)
+                else {
+                    fallback!("invalid_patch");
+                };
+                patch_rows.extend(rows);
+                let Some(scrollbar_rows) = retained_scrollbar_patch(
+                    &self.app,
+                    &mut surface.frame,
+                    pane,
+                    collected_pane.alternate_screen_active,
+                    collected_pane.scroll_metrics,
+                ) else {
+                    fallback!("scrollbar_patch");
+                };
+                patch_rows.extend(scrollbar_rows);
+                pane.content_revision = collected_pane.content_revision;
+                pane.mouse_reporting = collected_pane.mouse_reporting;
+                pane.sgr_pixel_mouse = collected_pane.sgr_pixel_mouse;
+                pane.alternate_screen_active = collected_pane.alternate_screen_active;
+                pane.scroll = collected_pane.scroll_metrics.map(|metrics| {
+                    protocol::PaneSurfaceScrollMetrics {
+                        offset_from_bottom: metrics.offset_from_bottom as u64,
+                        max_offset_from_bottom: metrics.max_offset_from_bottom as u64,
+                        viewport_rows: metrics.viewport_rows as u64,
+                    }
+                });
+                metadata_changed |= *pane != previous_pane;
+                changed_panes.push(pane.clone());
+            }
+
+            let cursor = retained_cursor(&self.app, &surface.panes);
+            let cursor_changed = cursor != surface.frame.cursor;
+            surface.frame.cursor = cursor.clone();
+            if patch_rows.is_empty() && !cursor_changed && !metadata_changed {
+                continue;
+            }
+            let patch = protocol::PaneSurfacePatch {
+                boot_id: self.client_shell_boot_id.clone(),
+                projection_revision,
+                base_surface_revision,
+                surface_revision: 0,
+                rows: patch_rows,
+                panes: changed_panes,
+                cursor,
+            };
+            updates.push(RetainedRecipientUpdate {
+                client_id,
+                surface,
+                patch,
+            });
+        }
+        if updates.is_empty() {
             success!("unchanged");
         }
 
-        let patch = protocol::PaneSurfacePatch {
-            boot_id: self.client_shell_boot_id.clone(),
-            projection_revision: client.shell_projection_revision,
-            base_surface_revision: next_surface.surface_revision,
-            surface_revision: 0,
-            rows: patch_rows,
-            panes: changed_panes,
-            cursor,
-        };
-        let Some(client) = self.clients.get_mut(client_id) else {
-            fallback!("client_disappeared");
-        };
-        let Some(writer) = client.writer.as_ref().cloned() else {
-            fallback!("writer_missing");
-        };
-        let Some(prepared) = client
-            .render_state
-            .prepare_pane_surface_patch(patch, next_surface)
-        else {
-            fallback!("prepare");
-        };
-        let serialized = match Self::frame_server_message(prepared.message()) {
-            Ok(serialized) => serialized,
-            Err(error) => {
-                warn!(client_id, %error, "failed to serialize retained pane surface patch");
-                fallback!("serialize");
-            }
-        };
-        crate::render_prof::counter("retained_surface.bytes", serialized.len() as u64);
-        match writer.render.try_send(serialized) {
-            Ok(()) => {
-                client.clear_deferred_render();
-                client.render_state.commit_sent_frame(prepared);
-                success!("sent");
-            }
-            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+        let mut sent = 0u64;
+        let mut deferred = 0u64;
+        let mut disconnected = Vec::new();
+        for update in updates {
+            let RetainedRecipientUpdate {
+                client_id,
+                surface,
+                patch,
+            } = update;
+            let Some(client) = self.clients.get_mut(&client_id) else {
+                continue;
+            };
+            let Some(writer) = client.writer.as_ref().cloned() else {
                 client.defer_full_render();
-                success!("queue_full");
-            }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                self.remove_client_and_resize_if_needed(*client_id);
-                success!("disconnected");
+                deferred += 1;
+                continue;
+            };
+            let Some(prepared) = client
+                .render_state
+                .prepare_pane_surface_patch(patch, surface)
+            else {
+                client.defer_full_render();
+                deferred += 1;
+                continue;
+            };
+            let serialized = match Self::frame_server_message(prepared.message()) {
+                Ok(serialized) => serialized,
+                Err(error) => {
+                    warn!(
+                        client_id,
+                        %error,
+                        "failed to serialize retained pane surface patch"
+                    );
+                    client.defer_full_render();
+                    deferred += 1;
+                    continue;
+                }
+            };
+            crate::render_prof::counter("retained_surface.bytes", serialized.len() as u64);
+            match writer.render.try_send(serialized) {
+                Ok(()) => {
+                    client.clear_deferred_render();
+                    client.render_state.commit_sent_frame(prepared);
+                    sent += 1;
+                }
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    client.defer_full_render();
+                    deferred += 1;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    disconnected.push(client_id);
+                }
             }
         }
+        for client_id in disconnected {
+            self.remove_client_and_resize_if_needed(client_id);
+        }
+        crate::render_prof::counter("retained_surface.recipients.sent", sent);
+        crate::render_prof::counter("retained_surface.recipients.deferred", deferred);
+        if sent > 0 {
+            success!("sent");
+        }
+        success!("recovery_queued");
     }
 }

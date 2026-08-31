@@ -1027,6 +1027,7 @@ pub struct PaneSurfacePane {
     pub focused: bool,
     pub mouse_reporting: bool,
     pub sgr_pixel_mouse: bool,
+    pub alternate_screen_active: bool,
     pub pixel_width: u32,
     pub pixel_height: u32,
 }

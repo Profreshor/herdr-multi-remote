@@ -123,6 +123,7 @@ fn surface() -> PaneSurfaceFrame {
             focused: true,
             mouse_reporting: false,
             sgr_pixel_mouse: false,
+            alternate_screen_active: false,
             pixel_width: 0,
             pixel_height: 0,
         }],

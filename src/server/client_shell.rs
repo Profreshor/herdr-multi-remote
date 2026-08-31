@@ -298,6 +298,8 @@ pub(super) fn render_pane_surface(
                             focused: pane.is_focused,
                             mouse_reporting,
                             sgr_pixel_mouse,
+                            alternate_screen_active: runtime
+                                .is_some_and(|runtime| runtime.alternate_screen_active()),
                             pixel_width,
                             pixel_height,
                         }
