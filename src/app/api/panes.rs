@@ -114,7 +114,7 @@ impl App {
             self.state.switch_workspace_tab(ws_idx, target_tab_idx);
             self.state
                 .record_pane_focus_change(previous_focus, ws_idx, new_pane.pane_id);
-            self.state.settle_terminal_mode_after_focus();
+            self.state.mode = crate::app::Mode::Terminal;
         }
         self.terminal_runtimes
             .insert(new_pane.terminal.id.clone(), new_pane.runtime);
@@ -206,26 +206,31 @@ impl App {
         }
     }
 
-    pub(super) fn handle_pane_selection_read(
-        &mut self,
-        id: String,
-        params: PaneSelectionReadParams,
-    ) -> String {
+    pub(crate) fn pane_selection_text(
+        &self,
+        params: &PaneSelectionReadParams,
+    ) -> Result<String, (&'static str, String)> {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+            return Err((
+                "pane_not_found",
+                format!("pane not found: {}", params.pane_id),
+            ));
         };
         let Some(runtime) =
             self.state
                 .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
         else {
-            return pane_not_found(id, &params.pane_id);
+            return Err((
+                "pane_not_found",
+                format!("pane not found: {}", params.pane_id),
+            ));
         };
         let before = runtime.content_seq();
         if params
             .content_revision
             .is_some_and(|revision| revision != before || !before.is_multiple_of(2))
         {
-            return encode_error(id, "stale_content", "pane content changed");
+            return Err(("stale_content", "pane content changed".to_owned()));
         }
         let selection = crate::selection::Selection::absolute_range(
             pane_id,
@@ -233,18 +238,32 @@ impl App {
             (params.cursor.row, params.cursor.col),
         );
         let Some(text) = runtime.extract_selection(&selection) else {
-            return encode_error(id, "selection_unavailable", "selection text is unavailable");
+            return Err((
+                "selection_unavailable",
+                "selection text is unavailable".to_owned(),
+            ));
         };
         if params.content_revision.is_some() && runtime.content_seq() != before {
-            return encode_error(id, "stale_content", "pane content changed");
+            return Err(("stale_content", "pane content changed".to_owned()));
         }
-        encode_success(
-            id,
-            ResponseResult::PaneSelection {
-                pane_id: params.pane_id,
-                text,
-            },
-        )
+        Ok(text)
+    }
+
+    pub(super) fn handle_pane_selection_read(
+        &mut self,
+        id: String,
+        params: PaneSelectionReadParams,
+    ) -> String {
+        match self.pane_selection_text(&params) {
+            Ok(text) => encode_success(
+                id,
+                ResponseResult::PaneSelection {
+                    pane_id: params.pane_id,
+                    text,
+                },
+            ),
+            Err((code, message)) => encode_error(id, code, message),
+        }
     }
 
     pub(super) fn handle_pane_copy_motion(
@@ -287,10 +306,10 @@ impl App {
                 };
                 let col = match params.motion {
                     PaneCopyMotion::LineEnd => {
-                        crate::app::input::copy_mode::last_character_col(&text).unwrap_or(0)
+                        crate::copy_mode::last_character_col(&text).unwrap_or(0)
                     }
                     PaneCopyMotion::FirstNonBlank => {
-                        crate::app::input::copy_mode::first_non_blank_col(&text).unwrap_or(0)
+                        crate::copy_mode::first_non_blank_col(&text).unwrap_or(0)
                     }
                     _ => unreachable!(),
                 };
@@ -456,7 +475,7 @@ impl App {
 
         self.state.focus_pane_in_workspace(ws_idx, pane_id);
         self.state.mark_active_tab_seen();
-        self.state.settle_terminal_mode_after_focus();
+        self.state.mode = crate::app::Mode::Terminal;
 
         let Some(pane) = self.pane_info(ws_idx, pane_id) else {
             return pane_not_found(id, &target.pane_id);
@@ -648,7 +667,7 @@ impl App {
         if let Some(target_pane_id) = target {
             self.state.focus_pane_in_workspace(ws_idx, target_pane_id);
             self.state.switch_workspace_tab(ws_idx, tab_idx);
-            self.state.settle_terminal_mode_after_focus();
+            self.state.mode = crate::app::Mode::Terminal;
         }
         let focused_pane_id = self
             .state
@@ -1231,7 +1250,7 @@ impl App {
                 .switch_workspace_tab(target_ws_idx, target_tab_idx);
             self.state
                 .record_pane_focus_change(previous_focus, target_ws_idx, moved_pane_id);
-            self.state.settle_terminal_mode_after_focus();
+            self.state.mode = crate::app::Mode::Terminal;
         }
         let created_workspace = created_workspace.then(|| self.workspace_info(target_ws_idx));
         let created_tab = if created_tab {
@@ -1388,7 +1407,7 @@ impl App {
         if outcome.changed || outcome.focus_changed {
             self.schedule_session_save();
         }
-        self.state.settle_terminal_mode_after_focus();
+        self.state.mode = crate::app::Mode::Terminal;
         let Some(layout) = self.pane_layout_snapshot(ws_idx, tab_idx) else {
             return encode_error(id, "pane_layout_unavailable", "pane layout unavailable");
         };
@@ -2193,7 +2212,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -2802,7 +2821,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -2852,7 +2871,6 @@ mod tests {
 
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(success.id, "req");
-        assert_eq!(app.state.request_remove_linked_worktree, None);
         assert!(app.state.workspaces.is_empty());
     }
 
@@ -2962,7 +2980,11 @@ mod tests {
         let source = app.state.workspaces[0].tabs[0].root_pane;
         let target = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         app.state.workspaces[0].tabs[0].layout.focus_pane(source);
-        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 100, 20));
+        crate::ui::compute_view_with_runtime_registry(
+            &mut app.state,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+            ratatui::layout::Rect::new(0, 0, 100, 20),
+        );
         let source_public = app.public_pane_id(0, source).unwrap();
         let target_public = app.public_pane_id(0, target).unwrap();
 
@@ -2990,45 +3012,15 @@ mod tests {
     }
 
     #[test]
-    fn api_pane_swap_unfocused_source_updates_last_pane_history() {
-        let mut app = app_with_linked_worktree();
-        let source = app.state.workspaces[0].tabs[0].root_pane;
-        let focused = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
-        let target = app.state.workspaces[0].test_split(ratatui::layout::Direction::Vertical);
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.workspaces[0].tabs[0].layout.focus_pane(focused);
-        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 100, 20));
-        let source_public = app.public_pane_id(0, source).unwrap();
-        let target_public = app.public_pane_id(0, target).unwrap();
-
-        let response = app.handle_pane_swap(
-            "req".into(),
-            PaneSwapParams {
-                source_pane_id: Some(source_public),
-                target_pane_id: Some(target_public),
-                ..PaneSwapParams::default()
-            },
-        );
-
-        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
-        let ResponseResult::PaneSwap { swap } = success.result else {
-            panic!("expected pane swap response");
-        };
-        assert!(swap.changed);
-        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(source));
-
-        app.state.last_pane();
-
-        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(focused));
-    }
-
-    #[test]
     fn api_pane_swap_direction_no_neighbor_returns_unchanged_layout() {
         let mut app = app_with_linked_worktree();
         let source = app.state.workspaces[0].tabs[0].root_pane;
         app.state.workspaces[0].tabs[0].layout.focus_pane(source);
-        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 100, 20));
+        crate::ui::compute_view_with_runtime_registry(
+            &mut app.state,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+            ratatui::layout::Rect::new(0, 0, 100, 20),
+        );
         let source_public = app.public_pane_id(0, source).unwrap();
 
         let response = app.handle_pane_swap(
@@ -3184,124 +3176,6 @@ mod tests {
             Some(&source_terminal)
         );
     }
-
-    #[test]
-    fn api_pane_move_focuses_copy_mode_pane_back_into_copy_mode() {
-        let mut app = app_with_linked_worktree();
-        let source = app.state.workspaces[0].tabs[0].root_pane;
-        let target_tab = app.state.workspaces[0].test_add_tab(Some("target"));
-        let target = app.state.workspaces[0].tabs[target_tab].root_pane;
-        seed_terminal_states(&mut app);
-        app.state.copy_mode = Some(crate::app::state::CopyModeState {
-            pane_id: source,
-            cursor_row: 0,
-            cursor_col: 0,
-            entry_offset_from_bottom: 0,
-            selection: None,
-            search: Default::default(),
-        });
-        let source_public = app.public_pane_id(0, source).unwrap();
-        let target_public = app.public_pane_id(0, target).unwrap();
-        let target_tab_public = app.public_tab_id(0, target_tab).unwrap();
-
-        let response = app.handle_pane_move(
-            "req".into(),
-            PaneMoveParams {
-                pane_id: source_public,
-                destination: PaneMoveDestination::Tab {
-                    tab_id: target_tab_public,
-                    target_pane_id: Some(target_public),
-                    split: SplitDirection::Right,
-                    ratio: None,
-                },
-                focus: true,
-            },
-        );
-
-        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
-        let ResponseResult::PaneMove { move_result } = success.result else {
-            panic!("expected pane move response");
-        };
-        assert!(move_result.changed);
-        assert_eq!(app.state.mode, Mode::Copy);
-        assert_eq!(app.state.copy_mode.expect("copy mode").pane_id, source);
-        assert_eq!(app.state.workspaces[0].tabs[0].layout.focused(), source);
-    }
-
-    #[tokio::test]
-    async fn key_release_follows_pane_moved_across_workspaces() {
-        let mut app = app_with_linked_worktree();
-        let source = app.state.workspaces[0].tabs[0].root_pane;
-        let source_terminal_id = app.state.workspaces[0].tabs[0]
-            .terminal_id(source)
-            .unwrap()
-            .clone();
-        let (runtime, mut rx) =
-            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
-                80,
-                24,
-                0,
-                b"\x1b[>15u",
-                2,
-            );
-        app.terminal_runtimes.insert(source_terminal_id, runtime);
-        app.state.workspaces.push(Workspace::test_new("other"));
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-        let source_public = app.public_pane_id(0, source).unwrap();
-        let target = app.state.workspaces[1].tabs[0].root_pane;
-        let target_tab_id = app.public_tab_id(1, 0).unwrap();
-        let target_pane_id = app.public_pane_id(1, target).unwrap();
-
-        app.route_client_events_from(
-            42,
-            vec![crate::raw_input::RawInputEvent::Key(
-                crate::input::TerminalKey::new(
-                    crossterm::event::KeyCode::Char('j'),
-                    crossterm::event::KeyModifiers::empty(),
-                ),
-            )],
-            false,
-        );
-        let response = app.handle_pane_move(
-            "req".into(),
-            PaneMoveParams {
-                pane_id: source_public,
-                destination: PaneMoveDestination::Tab {
-                    tab_id: target_tab_id,
-                    target_pane_id: Some(target_pane_id),
-                    split: SplitDirection::Down,
-                    ratio: None,
-                },
-                focus: false,
-            },
-        );
-        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
-        assert!(matches!(success.result, ResponseResult::PaneMove { .. }));
-        app.route_client_events_from(
-            42,
-            vec![crate::raw_input::RawInputEvent::Key(
-                crate::input::TerminalKey::new(
-                    crossterm::event::KeyCode::Char('j'),
-                    crossterm::event::KeyModifiers::empty(),
-                )
-                .with_kind(crossterm::event::KeyEventKind::Release),
-            )],
-            false,
-        );
-
-        assert_eq!(
-            rx.try_recv().expect("forwarded press"),
-            bytes::Bytes::from_static(b"\x1b[106;1:1u")
-        );
-        assert_eq!(
-            rx.try_recv().expect("forwarded release after pane move"),
-            bytes::Bytes::from_static(b"\x1b[106;1:3u")
-        );
-        assert!(app.input_leases.is_empty());
-    }
-
     #[test]
     fn api_pane_move_to_existing_tab_across_workspace_reassigns_public_pane_id() {
         let mut app = app_with_linked_worktree();
@@ -3863,86 +3737,6 @@ mod tests {
     }
 
     #[test]
-    fn api_pane_zoom_explicit_background_pane_updates_focus_history() {
-        let mut app = app_with_linked_worktree();
-        app.state.workspaces.push(Workspace::test_new("other"));
-        let first = app.state.workspaces[0].tabs[0].root_pane;
-        let target = app.state.workspaces[1].tabs[0].root_pane;
-        let _other = app.state.workspaces[1].test_split(ratatui::layout::Direction::Horizontal);
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.workspaces[0].tabs[0].layout.focus_pane(first);
-        let target_public = app.public_pane_id(1, target).unwrap();
-
-        let response = app.handle_pane_zoom(
-            "req".into(),
-            PaneZoomParams {
-                pane_id: Some(target_public.clone()),
-                mode: PaneZoomMode::On,
-            },
-        );
-
-        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
-        let ResponseResult::PaneZoom { zoom } = success.result else {
-            panic!("expected pane zoom response");
-        };
-        assert!(zoom.changed);
-        assert!(zoom.zoom_changed);
-        assert!(zoom.focus_changed);
-        assert_eq!(zoom.pane_id, target_public);
-        assert_eq!(app.state.active, Some(1));
-        assert_eq!(app.state.workspaces[1].focused_pane_id(), Some(target));
-        assert!(app.state.workspaces[1].tabs[0].zoomed);
-
-        app.state.last_pane();
-
-        assert_eq!(app.state.active, Some(0));
-        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(first));
-    }
-
-    #[test]
-    fn api_pane_zoom_focuses_copy_mode_pane_back_into_copy_mode() {
-        let mut app = app_with_linked_worktree();
-        app.state.workspaces.push(Workspace::test_new("other"));
-        let source = app.state.workspaces[0].tabs[0].root_pane;
-        let target = app.state.workspaces[1].tabs[0].root_pane;
-        let _other = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
-        let _target_other =
-            app.state.workspaces[1].test_split(ratatui::layout::Direction::Horizontal);
-        app.state.workspaces[1].tabs[0].layout.focus_pane(target);
-        app.state.active = Some(1);
-        app.state.selected = 1;
-        app.state.mode = Mode::Terminal;
-        app.state.copy_mode = Some(crate::app::state::CopyModeState {
-            pane_id: source,
-            cursor_row: 0,
-            cursor_col: 0,
-            entry_offset_from_bottom: 0,
-            selection: None,
-            search: Default::default(),
-        });
-        let source_public = app.public_pane_id(0, source).unwrap();
-
-        let response = app.handle_pane_zoom(
-            "req".into(),
-            PaneZoomParams {
-                pane_id: Some(source_public),
-                mode: PaneZoomMode::On,
-            },
-        );
-
-        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
-        let ResponseResult::PaneZoom { zoom } = success.result else {
-            panic!("expected pane zoom response");
-        };
-        assert!(zoom.focus_changed);
-        assert_eq!(app.state.active, Some(0));
-        assert_eq!(app.state.mode, Mode::Copy);
-        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(source));
-        assert_eq!(app.state.workspaces[1].focused_pane_id(), Some(target));
-    }
-
-    #[test]
     fn api_pane_zoom_single_pane_returns_noop() {
         let mut app = app_with_linked_worktree();
         app.state.active = Some(0);
@@ -4112,7 +3906,11 @@ mod tests {
         let root = app.state.workspaces[0].tabs[0].root_pane;
         let right = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         app.state.workspaces[0].tabs[0].layout.focus_pane(root);
-        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 100, 20));
+        crate::ui::compute_view_with_runtime_registry(
+            &mut app.state,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+            ratatui::layout::Rect::new(0, 0, 100, 20),
+        );
         let root_public = app.public_pane_id(0, root).unwrap();
         let right_public = app.public_pane_id(0, right).unwrap();
 
@@ -4143,7 +3941,11 @@ mod tests {
         let root = app.state.workspaces[0].tabs[0].root_pane;
         let right = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         app.state.workspaces[0].tabs[0].layout.focus_pane(root);
-        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 100, 20));
+        crate::ui::compute_view_with_runtime_registry(
+            &mut app.state,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+            ratatui::layout::Rect::new(0, 0, 100, 20),
+        );
         let root_public = app.public_pane_id(0, root).unwrap();
         let right_public = app.public_pane_id(0, right).unwrap();
 
@@ -4170,7 +3972,11 @@ mod tests {
         let root = app.state.workspaces[0].tabs[0].root_pane;
         let right = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         app.state.workspaces[0].tabs[0].layout.focus_pane(root);
-        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 100, 20));
+        crate::ui::compute_view_with_runtime_registry(
+            &mut app.state,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+            ratatui::layout::Rect::new(0, 0, 100, 20),
+        );
         let right_public = app.public_pane_id(0, right).unwrap();
 
         let response = app.handle_pane_edges(
@@ -4197,7 +4003,11 @@ mod tests {
         let root = app.state.workspaces[0].tabs[0].root_pane;
         let right = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         app.state.workspaces[0].tabs[0].layout.focus_pane(right);
-        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 100, 20));
+        crate::ui::compute_view_with_runtime_registry(
+            &mut app.state,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+            ratatui::layout::Rect::new(0, 0, 100, 20),
+        );
         let root_public = app.public_pane_id(0, root).unwrap();
         let right_public = app.public_pane_id(0, right).unwrap();
 
@@ -4235,7 +4045,11 @@ mod tests {
         let root = app.state.workspaces[0].tabs[0].root_pane;
         let right = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         app.state.workspaces[0].tabs[0].layout.focus_pane(root);
-        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 100, 20));
+        crate::ui::compute_view_with_runtime_registry(
+            &mut app.state,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+            ratatui::layout::Rect::new(0, 0, 100, 20),
+        );
         let root_public = app.public_pane_id(0, root).unwrap();
         let right_public = app.public_pane_id(0, right).unwrap();
 
@@ -4343,7 +4157,11 @@ mod tests {
         let mut app = app_with_linked_worktree();
         let root = app.state.workspaces[0].tabs[0].root_pane;
         app.state.workspaces[0].tabs[0].layout.focus_pane(root);
-        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 100, 20));
+        crate::ui::compute_view_with_runtime_registry(
+            &mut app.state,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+            ratatui::layout::Rect::new(0, 0, 100, 20),
+        );
         let root_public = app.public_pane_id(0, root).unwrap();
 
         let response = app.handle_pane_focus_direction(

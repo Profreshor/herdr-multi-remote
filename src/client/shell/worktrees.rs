@@ -1,6 +1,12 @@
 use super::*;
 
 impl ClientShellState {
+    fn endpoint_worktree_directory(&self) -> Option<std::path::PathBuf> {
+        self.snapshot
+            .as_deref()
+            .map(|snapshot| std::path::PathBuf::from(&snapshot.worktree_directory))
+    }
+
     pub(super) fn insert_worktree_overlay_text(&mut self, text: &str) -> bool {
         match self.overlay.as_mut() {
             Some(ClientShellOverlay::WorktreeCreate(create)) if !create.creating => {
@@ -229,11 +235,14 @@ impl ClientShellState {
     }
 
     pub(super) fn sync_worktree_create_path(&mut self) {
+        let Some(worktree_directory) = self.endpoint_worktree_directory() else {
+            return;
+        };
         let Some(ClientShellOverlay::WorktreeCreate(create)) = self.overlay.as_mut() else {
             return;
         };
         create.checkout_path = crate::worktree::default_checkout_path(
-            &self.config.worktree_directory,
+            &worktree_directory,
             &create.repo_name,
             &create.branch,
         )
@@ -243,6 +252,9 @@ impl ClientShellState {
     }
 
     pub(super) fn submit_worktree_create(&mut self, outcome: &mut ClientShellInput) {
+        let Some(worktree_directory) = self.endpoint_worktree_directory() else {
+            return;
+        };
         let Some(ClientShellOverlay::WorktreeCreate(create)) = self.overlay.as_mut() else {
             return;
         };
@@ -257,24 +269,20 @@ impl ClientShellState {
         }
         create.branch = branch.clone();
         create.replace_on_type = false;
-        create.checkout_path = crate::worktree::default_checkout_path(
-            &self.config.worktree_directory,
-            &create.repo_name,
-            &branch,
-        )
-        .display()
-        .to_string();
+        create.checkout_path =
+            crate::worktree::default_checkout_path(&worktree_directory, &create.repo_name, &branch)
+                .display()
+                .to_string();
         create.creating = true;
         create.error = None;
         let workspace_id = create.source_workspace_id.clone();
-        let path = create.checkout_path.clone();
         self.push_endpoint_method_with_kind(
             crate::api::schema::Method::WorktreeCreate(crate::api::schema::WorktreeCreateParams {
                 workspace_id: Some(workspace_id),
                 cwd: None,
                 branch: Some(branch),
                 base: Some("HEAD".to_owned()),
-                path: Some(path),
+                path: None,
                 label: None,
                 focus: true,
                 trust_repository: false,
@@ -376,8 +384,11 @@ impl ClientShellState {
                     .map(|duration| duration.as_micros().min(u128::from(u64::MAX)) as u64)
                     .unwrap_or(0);
                 let branch = crate::worktree::generated_branch_slug(seed);
+                let Some(worktree_directory) = self.endpoint_worktree_directory() else {
+                    return false;
+                };
                 let checkout_path = crate::worktree::default_checkout_path(
-                    &self.config.worktree_directory,
+                    &worktree_directory,
                     &source.repo_name,
                     &branch,
                 )
@@ -518,9 +529,10 @@ impl ClientShellState {
                 | PendingEndpointKind::ReloadConfig
                 | PendingEndpointKind::IntegrationList
                 | PendingEndpointKind::IntegrationInstall
-                | PendingEndpointKind::SelectionCopy
+                | PendingEndpointKind::SelectionCopy { .. }
                 | PendingEndpointKind::PaneScroll { .. }
                 | PendingEndpointKind::WordSelection { .. }
+                | PendingEndpointKind::PaneLinkActivate { .. }
                 | PendingEndpointKind::CopyMotion { .. }
                 | PendingEndpointKind::CopySearch { .. },
                 Err(error),

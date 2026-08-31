@@ -26,6 +26,7 @@ pub(crate) fn supports_client_shell_method(method: &Method) -> bool {
             | Method::PaneFocus(_)
             | Method::PaneFocusDirection(_)
             | Method::PaneInputSet(_)
+            | Method::PaneLinkActivate(_)
             | Method::PaneRename(_)
             | Method::PaneResize(_)
             | Method::PaneScroll(_)
@@ -139,6 +140,15 @@ mod tests {
     fn client_shell_lane_excludes_api_front_door_and_lifecycle_methods() {
         assert!(supports_client_shell_method(&Method::ServerReloadConfig(
             crate::api::schema::EmptyParams::default(),
+        )));
+        assert!(supports_client_shell_method(&Method::PaneLinkActivate(
+            crate::api::schema::PaneLinkActivateParams {
+                pane_id: "w1:p1".into(),
+                viewport_row: 0,
+                col: 0,
+                content_revision: None,
+                offset_from_bottom: None,
+            },
         )));
         assert!(!supports_client_shell_method(&Method::Ping(
             crate::api::schema::PingParams::default(),

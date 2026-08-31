@@ -4,8 +4,6 @@ pub(crate) enum ConfigEdit<'a> {
     StatusIndicators(super::StatusIndicatorStyle),
     Sound(bool),
     ToastDelivery(super::ToastDelivery),
-    AgentBorderLabels(bool),
-    AgentPanelSort(super::AgentPanelSortConfig),
 }
 
 impl ConfigEdit<'_> {
@@ -15,8 +13,6 @@ impl ConfigEdit<'_> {
             Self::StatusIndicators(_) => "status indicators",
             Self::Sound(_) => "sound setting",
             Self::ToastDelivery(_) => "toast setting",
-            Self::AgentBorderLabels(_) => "agent border labels",
-            Self::AgentPanelSort(_) => "agent panel sort",
         }
     }
 
@@ -46,32 +42,20 @@ impl ConfigEdit<'_> {
                 let content = super::upsert_section_value(content, "ui.toast", "delivery", value);
                 super::remove_section_key(&content, "ui.toast", "enabled")
             }
-            Self::AgentBorderLabels(enabled) => super::upsert_section_bool(
-                content,
-                "ui",
-                "show_agent_labels_on_pane_borders",
-                enabled,
-            ),
-            Self::AgentPanelSort(sort) => super::upsert_section_value(
-                content,
-                "ui",
-                "agent_panel_sort",
-                &format!("\"{}\"", sort.as_str()),
-            ),
         }
     }
 }
 
-pub(crate) fn update_file(
+pub(crate) fn update_file_at(
+    path: &std::path::Path,
     description: &str,
     update: impl FnOnce(&str) -> String,
 ) -> Result<(), String> {
-    let path = super::config_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create config directory: {error}"))?;
     }
-    let content = match std::fs::read_to_string(&path) {
+    let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => {
@@ -80,24 +64,12 @@ pub(crate) fn update_file(
             ));
         }
     };
-    std::fs::write(&path, update(&content))
+    std::fs::write(path, update(&content))
         .map_err(|error| format!("failed to save {description}: {error}"))
 }
 
 pub(crate) fn write_edit(edit: ConfigEdit<'_>) -> Result<(), String> {
-    update_file(edit.description(), |content| edit.apply(content))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn edits_preserve_unrelated_config() {
-        let content = "[terminal]\ndefault_shell = \"fish\"\n";
-        let edited =
-            ConfigEdit::AgentPanelSort(super::super::AgentPanelSortConfig::Priority).apply(content);
-        assert!(edited.contains("default_shell = \"fish\""));
-        assert!(edited.contains("agent_panel_sort = \"priority\""));
-    }
+    update_file_at(&super::config_path(), edit.description(), |content| {
+        edit.apply(content)
+    })
 }

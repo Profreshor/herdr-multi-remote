@@ -178,9 +178,11 @@ impl ClientShellState {
         if self.snapshot.is_none() {
             return;
         }
-        if let Err(error) = crate::config::update_file("onboarding setting", |content| {
-            crate::config::upsert_top_level_bool(content, "onboarding", false)
-        }) {
+        if let Err(error) = crate::config::update_file_at(
+            &self.config.local_config_path,
+            "onboarding setting",
+            |content| crate::config::upsert_top_level_bool(content, "onboarding", false),
+        ) {
             self.set_local_config_diagnostic(Some(error));
         }
         self.config.startup_onboarding = false;
@@ -423,7 +425,8 @@ impl ClientShellState {
                 true
             }
             Some(ClientShellOverlay::Help(help)) if help.search_focused => {
-                help.query.push_str(text);
+                help.query
+                    .extend(text.chars().filter(|character| !character.is_control()));
                 help.scroll = 0;
                 true
             }

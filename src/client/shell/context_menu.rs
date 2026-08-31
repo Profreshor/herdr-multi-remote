@@ -282,6 +282,7 @@ impl ClientShellState {
                     if !self.collapsed_groups.remove(&key) {
                         self.collapsed_groups.insert(key);
                     }
+                    self.persist_chrome_preferences(outcome);
                 }
             }
             _ => {}

@@ -1712,6 +1712,17 @@
                 "null"
               ]
             },
+            "selection": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/PaneSelectionReadParams"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Client-owned selection coordinates, validated against the pane's content revision."
+            },
             "tab_id": {
               "type": [
                 "string",
@@ -2697,6 +2708,47 @@
               ]
             }
           },
+          "type": "object"
+        },
+        "PaneLinkActivateParams": {
+          "properties": {
+            "col": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "content_revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "offset_from_bottom": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "viewport_row": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "pane_id",
+            "viewport_row",
+            "col"
+          ],
           "type": "object"
         },
         "PaneListParams": {
@@ -5763,6 +5815,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneInputSetParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.link.activate",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneLinkActivateParams"
             }
           },
           "required": [
@@ -10275,6 +10343,28 @@
                 "action",
                 "context",
                 "log"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "handled": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "pane_link_activated",
+                  "type": "string"
+                },
+                "url": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "type",
+                "handled"
               ],
               "type": "object"
             },

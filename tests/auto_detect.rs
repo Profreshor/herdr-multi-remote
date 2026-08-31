@@ -2,7 +2,7 @@
 
 #![cfg(not(target_os = "macos"))]
 
-mod support;
+pub mod support;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};

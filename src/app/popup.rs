@@ -37,18 +37,6 @@ impl App {
         true
     }
 
-    pub(crate) fn try_route_paste_to_popup(&mut self, text: &str) -> bool {
-        if self.state.popup_pane.is_none() {
-            return false;
-        }
-        let Some(runtime) = self.popup_runtime() else {
-            self.close_popup_pane();
-            return true;
-        };
-        let _ = runtime.try_send_paste(text.to_owned());
-        true
-    }
-
     pub(crate) fn spawn_popup_shell_command(
         &mut self,
         command: &str,
@@ -218,7 +206,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),

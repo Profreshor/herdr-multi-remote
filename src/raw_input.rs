@@ -4,6 +4,7 @@ use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 ///
 /// This directly extracts events without going through a channel, making it
 /// suitable for synchronous use.
+#[cfg(any(unix, test))]
 pub fn parse_raw_input_bytes_sync(data: &[u8]) -> Vec<RawInputEvent> {
     let mut framer = RawInputFramer::default();
     let mut events = framer.push(data);
@@ -518,6 +519,7 @@ fn plausible_control_string_tail(family: ControlStringFamily, buffer: &[u8]) -> 
     }
 }
 
+#[cfg(any(unix, test))]
 pub(crate) fn events_require_host_surface_redraw(
     events: &[RawInputEvent],
     redraw_on_focus_gained: bool,

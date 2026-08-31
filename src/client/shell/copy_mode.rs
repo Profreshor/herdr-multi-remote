@@ -196,8 +196,7 @@ impl ClientShellState {
             _ => {}
         }
 
-        let Some(command) = crate::app::input::copy_mode::copy_mode_command_char(key.clone())
-        else {
+        let Some(command) = crate::copy_mode::copy_mode_command_char(key.clone()) else {
             return;
         };
         match command {
@@ -304,8 +303,7 @@ impl ClientShellState {
                 }
             }
             _ => {
-                if let Some(ch) = crate::app::input::copy_mode::copy_mode_command_char(key.clone())
-                {
+                if let Some(ch) = crate::copy_mode::copy_mode_command_char(key.clone()) {
                     if let Some(prompt) = self
                         .copy_mode
                         .as_mut()
@@ -331,7 +329,9 @@ impl ClientShellState {
         else {
             return false;
         };
-        prompt.query.push_str(text);
+        prompt
+            .query
+            .extend(text.chars().filter(|character| !character.is_control()));
         true
     }
 
@@ -560,8 +560,7 @@ impl ClientShellState {
         let Some(hit) = self.copy_hit() else {
             return;
         };
-        let lines =
-            crate::app::input::copy_mode::copy_mode_page_lines(hit.inner_rect.height, half_page);
+        let lines = crate::copy_mode::copy_mode_page_lines(hit.inner_rect.height, half_page);
         let Some((pane_id, next_offset)) = self.copy_mode.as_mut().map(|copy_mode| {
             if direction < 0 {
                 copy_mode.cursor.row = copy_mode.cursor.row.saturating_sub(lines as u32);

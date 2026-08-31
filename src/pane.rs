@@ -44,8 +44,8 @@ use self::agent_detection::{
 pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
-    TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot, TerminalSearchDirection,
-    TerminalSearchWindow, TerminalTextMatch, TerminalTextPoint, TerminalWordMotion,
+    TerminalReadSnapshot, TerminalSearchDirection, TerminalSearchWindow, TerminalTextPoint,
+    TerminalWordMotion,
 };
 pub use self::{
     state::PaneState,
@@ -55,21 +55,6 @@ pub use self::{
 const RELEASE_REACQUIRE_SUPPRESSION: std::time::Duration = std::time::Duration::from_secs(1);
 const PANE_TERM: &str = "xterm-256color";
 const PANE_COLORTERM: &str = "truecolor";
-
-#[cfg(test)]
-thread_local! {
-    static AGGREGATE_INPUT_STATE_READS: Cell<usize> = const { Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_aggregate_input_state_reads() {
-    AGGREGATE_INPUT_STATE_READS.set(0);
-}
-
-#[cfg(test)]
-pub(crate) fn aggregate_input_state_reads() -> usize {
-    AGGREGATE_INPUT_STATE_READS.get()
-}
 
 fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
     // Each pane is rendered by herdr's own terminal layer, not the outer terminal
@@ -2607,11 +2592,6 @@ impl PaneRuntime {
         self.detect_reset_notify.clone()
     }
 
-    #[cfg(test)]
-    pub(crate) fn agent_detection_enabled_for_test(&self) -> bool {
-        self.detect_handle.is_some()
-    }
-
     pub fn set_full_lifecycle_authority_active(&self, active: bool) {
         let previous = self
             .full_lifecycle_authority_active
@@ -2690,14 +2670,6 @@ impl PaneRuntime {
         self.terminal.scroll_metrics()
     }
 
-    pub(crate) fn search_text_matches(
-        &self,
-        query: &str,
-        case_sensitive: bool,
-    ) -> Vec<crate::pane::TerminalTextMatch> {
-        self.terminal.search_text_matches(query, case_sensitive)
-    }
-
     pub(crate) fn search_text_window(
         &self,
         query: &str,
@@ -2712,17 +2684,6 @@ impl PaneRuntime {
     ) -> crate::pane::TerminalSearchWindow {
         self.terminal
             .search_text_window(query, case_sensitive, direction, cursor, previous, limit)
-    }
-
-    pub(crate) fn text_match_is_current(&self, text_match: crate::pane::TerminalTextMatch) -> bool {
-        self.terminal.text_match_is_current(text_match)
-    }
-
-    pub(crate) fn text_matches_are_current(
-        &self,
-        text_matches: &[crate::pane::TerminalTextMatch],
-    ) -> Vec<bool> {
-        self.terminal.text_matches_are_current(text_matches)
     }
 
     pub(crate) fn word_motion_target(
@@ -2748,13 +2709,7 @@ impl PaneRuntime {
 
     #[cfg(any(unix, test))]
     pub fn input_state(&self) -> Option<InputState> {
-        #[cfg(test)]
-        AGGREGATE_INPUT_STATE_READS.set(AGGREGATE_INPUT_STATE_READS.get() + 1);
         self.terminal.input_state()
-    }
-
-    pub fn keyboard_report_all_requested(&self) -> bool {
-        self.terminal.keyboard_report_all_requested()
     }
 
     pub fn bracketed_paste_enabled(&self) -> bool {
@@ -2858,14 +2813,6 @@ impl PaneRuntime {
         self.terminal.render(frame, area, show_cursor);
     }
 
-    pub(crate) fn collect_dirty_patch(
-        &self,
-        area_width: u16,
-        area_height: u16,
-    ) -> TerminalDirtyPatchOutcome {
-        self.terminal.collect_dirty_patch(area_width, area_height)
-    }
-
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
         self.terminal.visible_hyperlinks(area)
     }
@@ -2886,6 +2833,10 @@ impl PaneRuntime {
             self.kitty_keyboard_flags.load(Ordering::Relaxed),
         );
         self.terminal.keyboard_protocol(fallback)
+    }
+
+    pub fn modify_other_keys_level(&self) -> u8 {
+        self.terminal.modify_other_keys_level()
     }
 
     pub fn encode_terminal_key(&self, key: crate::input::TerminalKey) -> Vec<u8> {

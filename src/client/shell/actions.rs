@@ -186,11 +186,43 @@ impl ClientShellState {
                 let Some(snapshot) = self.snapshot.as_deref() else {
                     return;
                 };
+                let selection = (action == crate::protocol::ClientShellCommandAction::PluginAction)
+                    .then(|| {
+                        let selection = self.selection.as_ref()?;
+                        if !selection.is_visible() {
+                            return None;
+                        }
+                        if snapshot.focused_pane_id.as_deref() != Some(selection.pane_id.as_str()) {
+                            return None;
+                        }
+                        let content_revision = self
+                            .pane_surface
+                            .as_ref()?
+                            .panes
+                            .iter()
+                            .find(|pane| pane.pane_id == selection.pane_id)?
+                            .content_revision;
+                        let (anchor, cursor) = selection.ordered_cells();
+                        Some(crate::api::schema::PaneSelectionReadParams {
+                            pane_id: selection.pane_id.clone(),
+                            anchor: crate::api::schema::PaneTextPoint {
+                                row: anchor.0,
+                                col: anchor.1,
+                            },
+                            cursor: crate::api::schema::PaneTextPoint {
+                                row: cursor.0,
+                                col: cursor.1,
+                            },
+                            content_revision: Some(content_revision),
+                        })
+                    })
+                    .flatten();
                 let params = crate::api::schema::CommandInvokeParams {
                     command_id,
                     workspace_id: snapshot.focused_workspace_id.clone(),
                     tab_id: snapshot.focused_tab_id.clone(),
                     pane_id: snapshot.focused_pane_id.clone(),
+                    selection,
                 };
                 if action == crate::protocol::ClientShellCommandAction::Popup {
                     self.popup_pending = true;
@@ -211,6 +243,14 @@ impl ClientShellState {
     }
 
     pub(super) fn request_selection_copy(&mut self, outcome: &mut ClientShellInput) {
+        self.request_selection_copy_with_fallback(outcome, None);
+    }
+
+    pub(super) fn request_selection_copy_with_fallback(
+        &mut self,
+        outcome: &mut ClientShellInput,
+        fallback_key: Option<crate::input::TerminalKey>,
+    ) {
         let Some(selection) = self.selection.as_ref() else {
             return;
         };
@@ -221,6 +261,27 @@ impl ClientShellState {
             .and_then(|surface| surface.panes.iter().find(|pane| pane.pane_id == pane_id))
             .map(|pane| pane.content_revision);
         let (anchor, cursor) = selection.ordered_cells();
+        let fallback = fallback_key.and_then(|key| {
+            let press = ClientPaneInputEvent::from_terminal_key(key.clone())?;
+            let tracks_release = matches!(
+                &press,
+                ClientPaneInputEvent::Key {
+                    tracks_release: true,
+                    ..
+                }
+            );
+            let mut message =
+                super::target_event_message(ClientInputTarget::Pane(pane_id.clone()), press);
+            if tracks_release {
+                let release = ClientPaneInputEvent::from_terminal_key(
+                    key.with_kind(crossterm::event::KeyEventKind::Release),
+                )?;
+                if let ClientMessage::ClientShellPaneInput { events, .. } = &mut message {
+                    events.push(release);
+                }
+            }
+            Some(message)
+        });
         self.push_endpoint_method_with_kind(
             crate::api::schema::Method::PaneSelectionRead(
                 crate::api::schema::PaneSelectionReadParams {
@@ -236,7 +297,7 @@ impl ClientShellState {
                     content_revision,
                 },
             ),
-            PendingEndpointKind::SelectionCopy,
+            PendingEndpointKind::SelectionCopy { fallback },
             outcome,
         );
     }
@@ -431,34 +492,34 @@ impl ClientShellState {
                 let repaint = self.complete_pane_scroll(pane_id, serial, result, &mut outcome);
                 return (repaint, outcome.actions);
             }
-            PendingEndpointKind::SelectionCopy => {
+            PendingEndpointKind::SelectionCopy { fallback } => {
+                let fallback = || {
+                    fallback
+                        .map(ClientShellAction::Request)
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                };
                 return match result {
                     Ok(crate::api::schema::ResponseResult::PaneSelection { text, .. })
                         if !text.is_empty() =>
                     {
-                        if self.config.clipboard_toast_enabled {
-                            self.copy_feedback = Some(crate::app::state::CopyFeedback {
-                                message: "copied to clipboard".to_owned(),
-                            });
-                            self.copy_feedback_deadline =
-                                Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
-                        }
+                        let repaint = self.show_copy_feedback(std::time::Instant::now());
                         (
-                            self.config.clipboard_toast_enabled,
+                            repaint,
                             vec![ClientShellAction::ClipboardWrite(text.into_bytes())],
                         )
                     }
                     Ok(crate::api::schema::ResponseResult::PaneSelection { .. }) => {
-                        (false, Vec::new())
+                        (false, fallback())
                     }
                     Ok(_) => {
                         self.endpoint_error =
                             Some("endpoint returned an unexpected selection result".to_owned());
-                        (true, Vec::new())
+                        (true, fallback())
                     }
                     Err(error) => {
                         self.endpoint_error = Some(error.message);
-                        (true, Vec::new())
+                        (true, fallback())
                     }
                 };
             }
@@ -520,6 +581,70 @@ impl ClientShellState {
                 let mut outcome = ClientShellInput::default();
                 self.request_selection_copy(&mut outcome);
                 return (true, outcome.actions);
+            }
+            PendingEndpointKind::PaneLinkActivate {
+                pane_id,
+                inner_rect,
+                fallback_events,
+            } => {
+                let completed_before_release = !fallback_events.iter().any(|event| {
+                    event.kind
+                        == crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
+                });
+                let replay = (self.mode == ClientShellMode::Terminal
+                    && self.overlay.is_none()
+                    && self
+                        .hits
+                        .panes
+                        .iter()
+                        .any(|hit| hit.pane_id == pane_id && hit.inner_rect == inner_rect))
+                .then_some(fallback_events);
+                if replay.is_none() {
+                    self.url_click_consumes_until_up = completed_before_release;
+                }
+                let replay_action = |events: Option<Vec<crossterm::event::MouseEvent>>| {
+                    events
+                        .map(ClientShellAction::ReplayMouse)
+                        .into_iter()
+                        .collect()
+                };
+                return match result {
+                    Ok(crate::api::schema::ResponseResult::PaneLinkActivated {
+                        handled: true,
+                        ..
+                    }) => {
+                        self.url_click_consumes_until_up = completed_before_release;
+                        (false, Vec::new())
+                    }
+                    Ok(crate::api::schema::ResponseResult::PaneLinkActivated {
+                        url: Some(url),
+                        handled: false,
+                    }) if crate::app::actions::safe_web_url(&url).is_some() => {
+                        self.url_click_consumes_until_up = completed_before_release;
+                        (false, vec![ClientShellAction::OpenSafeWebUrl(url)])
+                    }
+                    Ok(crate::api::schema::ResponseResult::PaneLinkActivated { .. }) => {
+                        (false, replay_action(replay))
+                    }
+                    Ok(_) => {
+                        self.endpoint_error =
+                            Some("endpoint returned an unexpected link result".to_owned());
+                        (true, replay_action(replay))
+                    }
+                    Err(error)
+                        if matches!(
+                            error.code.as_deref(),
+                            Some("stale_content" | "stale_target")
+                        ) =>
+                    {
+                        self.url_click_consumes_until_up = completed_before_release;
+                        (false, Vec::new())
+                    }
+                    Err(error) => {
+                        self.endpoint_error = Some(error.message);
+                        (true, replay_action(replay))
+                    }
+                };
             }
             PendingEndpointKind::CopyMotion {
                 pane_id,
@@ -662,7 +787,7 @@ impl ClientShellState {
     }
 
     pub(super) fn endpoint_method_for_action(
-        &self,
+        &mut self,
         action: crate::input::KeybindAction,
     ) -> Option<crate::api::schema::Method> {
         use crate::api::schema::{
@@ -710,47 +835,61 @@ impl ClientShellState {
                 if agents.is_empty() {
                     return None;
                 }
-                let current = agents
-                    .iter()
-                    .position(|pane_id| {
-                        Some(pane_id.as_str()) == snapshot.focused_pane_id.as_deref()
-                    })
-                    .unwrap_or(0);
-                let next = if action == KeybindAction::PreviousAgent {
-                    (current + agents.len() - 1) % agents.len()
-                } else {
-                    (current + 1) % agents.len()
+                let current = agents.iter().position(|pane_id| {
+                    Some(pane_id.as_str()) == snapshot.focused_pane_id.as_deref()
+                });
+                let next = match (current, action) {
+                    (Some(current), KeybindAction::PreviousAgent) => {
+                        (current + agents.len() - 1) % agents.len()
+                    }
+                    (Some(current), KeybindAction::NextAgent) => (current + 1) % agents.len(),
+                    (None, KeybindAction::PreviousAgent) => agents.len() - 1,
+                    (None, KeybindAction::NextAgent) => 0,
+                    _ => unreachable!("relative agent action"),
                 };
-                Some(Method::PaneFocus(PaneTarget {
-                    pane_id: agents[next].clone(),
-                }))
+                let pane_id = agents[next].clone();
+                if !self
+                    .hits
+                    .agents
+                    .iter()
+                    .any(|(_, visible_pane_id)| visible_pane_id == &pane_id)
+                {
+                    self.agent_scroll = next.min(self.hits.agent_max_scroll);
+                }
+                Some(Method::PaneFocus(PaneTarget { pane_id }))
             }
             KeybindAction::SwitchWorkspace(index) => {
                 let entries = self.navigation_workspace_entries(snapshot);
-                Some(Method::WorkspaceFocus(WorkspaceTarget {
-                    workspace_id: snapshot
-                        .workspaces
-                        .get(entries.get(index)?.index)?
-                        .workspace_id
-                        .clone(),
-                }))
+                let workspace_id = snapshot
+                    .workspaces
+                    .get(entries.get(index)?.index)?
+                    .workspace_id
+                    .clone();
+                self.reveal_workspace(&workspace_id);
+                Some(Method::WorkspaceFocus(WorkspaceTarget { workspace_id }))
             }
             KeybindAction::PreviousWorkspace | KeybindAction::NextWorkspace => {
                 let entries = self.navigation_workspace_entries(snapshot);
-                let current = entries.iter().position(|entry| {
-                    snapshot.workspaces[entry.index].workspace_id == focused_workspace
-                })?;
+                if entries.is_empty() {
+                    return None;
+                }
+                let current = entries
+                    .iter()
+                    .position(|entry| {
+                        snapshot.workspaces[entry.index].workspace_id == focused_workspace
+                    })
+                    .unwrap_or(0);
                 let delta = if action == KeybindAction::PreviousWorkspace {
                     -1
                 } else {
                     1
                 };
                 let next = (current as isize + delta).rem_euclid(entries.len() as isize) as usize;
-                Some(Method::WorkspaceFocus(WorkspaceTarget {
-                    workspace_id: snapshot.workspaces[entries[next].index]
-                        .workspace_id
-                        .clone(),
-                }))
+                let workspace_id = snapshot.workspaces[entries[next].index]
+                    .workspace_id
+                    .clone();
+                self.reveal_workspace(&workspace_id);
+                Some(Method::WorkspaceFocus(WorkspaceTarget { workspace_id }))
             }
             KeybindAction::SwitchTab(index) => {
                 let tabs = snapshot

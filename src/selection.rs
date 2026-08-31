@@ -56,23 +56,6 @@ impl<P> Selection<P> {
         }
     }
 
-    /// Create an active selection from an explicit viewport-row range.
-    pub(crate) fn range(
-        pane_id: P,
-        viewport_row: u16,
-        start_col: u16,
-        end_col: u16,
-        metrics: Option<ScrollMetrics>,
-    ) -> Self {
-        let row = absolute_row_for_viewport_row(viewport_row, metrics);
-        Self {
-            pane_id,
-            anchor: (row, start_col),
-            cursor: (row, end_col),
-            phase: Phase::Dragging,
-        }
-    }
-
     pub(crate) fn absolute_anchor(pane_id: P, anchor: (u32, u16)) -> Self {
         Self {
             pane_id,
@@ -161,13 +144,9 @@ impl<P> Selection<P> {
     }
 
     /// Whether this selection was already finalized.
+    #[cfg(test)]
     pub fn is_finalized(&self) -> bool {
         self.phase == Phase::Done
-    }
-
-    /// Whether the user just clicked without dragging (not a selection).
-    pub fn was_just_click(&self) -> bool {
-        self.phase == Phase::Anchored
     }
 
     /// Whether the user just clicked without dragging (not a selection).
@@ -490,7 +469,7 @@ mod tests {
     #[test]
     fn click_without_drag() {
         let mut sel = Selection::anchor(PaneId::from_raw(0), 5, 10, None);
-        assert!(sel.was_just_click());
+        assert!(sel.is_just_click());
         let copied = sel.finish();
         assert!(!copied);
     }
@@ -500,7 +479,7 @@ mod tests {
         let mut sel = Selection::anchor(PaneId::from_raw(0), 5, 10, None);
         sel.drag(20, 7, Rect::new(10, 5, 80, 24), None);
         assert!(sel.is_visible());
-        assert!(!sel.was_just_click());
+        assert!(!sel.is_just_click());
         let copied = sel.finish();
         assert!(copied);
     }

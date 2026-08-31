@@ -63,7 +63,7 @@ fn is_server_listening_at(socket_path: &Path) -> bool {
             Ok(_) => {
                 // Server is listening. Close the test connection immediately.
                 // The server's handshake handler will time out on this connection
-                // since we don't send Hello, which is fine.
+                // since we don't send a handshake, which is fine.
                 true
             }
             Err(err)
@@ -114,15 +114,13 @@ fn client_protocol_accepts_hello(socket_path: &Path) -> io::Result<bool> {
         Err(err) => return Err(err),
     };
 
-    let hello = crate::protocol::ClientMessage::Hello {
+    let hello = crate::protocol::ClientMessage::TerminalHello {
         version: crate::protocol::PROTOCOL_VERSION,
         cols: 80,
         rows: 24,
         cell_width_px: 0,
         cell_height_px: 0,
-        requested_encoding: crate::protocol::RenderEncoding::SemanticFrame,
-        keybindings: crate::protocol::ClientKeybindings::Server,
-        launch_mode: crate::protocol::ClientLaunchMode::App,
+        pixel_mouse: false,
     };
 
     match crate::protocol::write_message(&mut stream, &hello) {

@@ -1,7 +1,12 @@
+use std::fs;
+use std::io::{self, Write};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::App;
+use ratatui::layout::Direction;
+
+use super::{App, Mode};
 
 static NEXT_COMMAND_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 
@@ -87,7 +92,36 @@ impl App {
         if let Err((code, message)) = self.focus_client_shell_command_target(&params) {
             return crate::app::api::responses::encode_error(id, code, message);
         }
-        match self.execute_custom_command_binding(&binding) {
+        let selected_text = if binding.action == crate::config::CustomCommandAction::PluginAction {
+            let Some(selection) = params.selection.as_ref() else {
+                return self.execute_custom_command_response(id, &binding, None);
+            };
+            if params.pane_id.as_deref() != Some(selection.pane_id.as_str()) {
+                return crate::app::api::responses::encode_error(
+                    id,
+                    "command_target_mismatch",
+                    "command selection does not belong to the requested pane",
+                );
+            }
+            match self.pane_selection_text(selection) {
+                Ok(text) => Some(text),
+                Err((code, message)) => {
+                    return crate::app::api::responses::encode_error(id, code, message);
+                }
+            }
+        } else {
+            None
+        };
+        self.execute_custom_command_response(id, &binding, selected_text)
+    }
+
+    fn execute_custom_command_response(
+        &mut self,
+        id: String,
+        binding: &crate::config::CustomCommandKeybind,
+        selected_text: Option<String>,
+    ) -> String {
+        match self.execute_custom_command_binding(binding, selected_text) {
             Ok(()) => crate::app::api::responses::encode_success(
                 id,
                 crate::api::schema::ResponseResult::Ok {},
@@ -175,6 +209,363 @@ impl App {
         }
         Ok(())
     }
+    pub(crate) fn execute_custom_command_binding(
+        &mut self,
+        binding: &crate::config::CustomCommandKeybind,
+        selected_text: Option<String>,
+    ) -> io::Result<()> {
+        match binding.action {
+            crate::config::CustomCommandAction::Shell => self.spawn_custom_command(binding),
+            crate::config::CustomCommandAction::Pane => {
+                self.spawn_pane_command(&binding.command, Vec::new())
+            }
+            crate::config::CustomCommandAction::Popup => self.spawn_custom_popup_command(binding),
+            crate::config::CustomCommandAction::PluginAction => self
+                .invoke_plugin_action_from_keybind(binding.command.clone(), selected_text)
+                .map_err(io::Error::other),
+        }
+    }
+
+    fn spawn_custom_popup_command(
+        &mut self,
+        binding: &crate::config::CustomCommandKeybind,
+    ) -> io::Result<()> {
+        self.spawn_popup_shell_command(
+            &binding.command,
+            None,
+            self.custom_command_env().0,
+            crate::app::popup::PopupGeometry {
+                width: binding.width,
+                height: binding.height,
+            },
+        )
+    }
+
+    pub(crate) fn custom_command_env(&self) -> (Vec<(String, String)>, Option<std::path::PathBuf>) {
+        let mut env = vec![(
+            crate::api::SOCKET_PATH_ENV_VAR.to_string(),
+            crate::api::socket_path().display().to_string(),
+        )];
+        if let Ok(current_exe) = std::env::current_exe() {
+            env.push((
+                "HERDR_BIN_PATH".to_string(),
+                current_exe.display().to_string(),
+            ));
+        }
+
+        let mut cwd = None;
+        if let Some(ws_idx) = self.state.active {
+            env.push((
+                "HERDR_ACTIVE_WORKSPACE_ID".to_string(),
+                self.public_workspace_id(ws_idx),
+            ));
+            if let Some(workspace) = self.state.workspaces.get(ws_idx) {
+                let tab_idx = workspace.active_tab_index();
+                if let Some(tab_id) = self.public_tab_id(ws_idx, tab_idx) {
+                    env.push(("HERDR_ACTIVE_TAB_ID".to_string(), tab_id));
+                }
+                if let Some(pane_id) = workspace.focused_pane_id() {
+                    if let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) {
+                        env.push(("HERDR_ACTIVE_PANE_ID".to_string(), public_pane_id));
+                    }
+                    if let Some(pane_cwd) = workspace.active_tab().and_then(|tab| {
+                        tab.cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
+                    }) {
+                        env.push((
+                            "HERDR_ACTIVE_PANE_CWD".to_string(),
+                            pane_cwd.display().to_string(),
+                        ));
+                        if pane_cwd.is_dir() {
+                            cwd = Some(pane_cwd);
+                        }
+                    }
+                }
+            }
+        }
+        (env, cwd)
+    }
+
+    fn spawn_custom_command(
+        &mut self,
+        binding: &crate::config::CustomCommandKeybind,
+    ) -> std::io::Result<()> {
+        let mut command = crate::platform::detached_custom_command_process(&binding.command);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let (env, cwd) = self.custom_command_env();
+        command.envs(env);
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        let child = command.spawn()?;
+        self.detached_process_children.push(child);
+        Ok(())
+    }
+
+    pub(crate) fn open_focused_scrollback_in_editor(&mut self) -> std::io::Result<()> {
+        let ws_idx = self
+            .state
+            .active
+            .ok_or_else(|| std::io::Error::other("no active workspace"))?;
+        let ws = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .ok_or_else(|| std::io::Error::other("active workspace disappeared"))?;
+        let pane_id = ws
+            .focused_pane_id()
+            .ok_or_else(|| std::io::Error::other("no focused pane"))?;
+        let scrollback = self
+            .state
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+            .ok_or_else(|| std::io::Error::other("focused pane has no scrollback runtime"))?
+            .recent_unwrapped_text_snapshot(usize::MAX)
+            .text;
+
+        let path = write_scrollback_temp_file(&scrollback)?;
+
+        let argv = match crate::platform::scrollback_editor_argv(&path) {
+            Ok(argv) => argv,
+            Err(err) => {
+                let _ = fs::remove_file(&path);
+                return Err(err);
+            }
+        };
+        let (env, _) = self.custom_command_env();
+        let new_pane = match self.spawn_overlay_argv_command(&argv, None, env, vec![path.clone()]) {
+            Ok((_, new_pane)) => new_pane,
+            Err(err) => {
+                let _ = fs::remove_file(&path);
+                return Err(err);
+            }
+        };
+        let terminal_id = new_pane.terminal.id.clone();
+        self.terminal_runtimes
+            .insert(terminal_id.clone(), new_pane.runtime);
+        self.state
+            .remove_alias_shadowed_by_new_pane(new_pane.pane_id);
+        self.state.terminals.insert(terminal_id, new_pane.terminal);
+
+        if let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) {
+            self.state.toast = Some(crate::app::state::ToastNotification {
+                kind: crate::app::state::ToastKind::Finished,
+                title: "opened scrollback".to_string(),
+                context: format!("focused pane {public_pane_id}"),
+                position: None,
+                target: None,
+            });
+        }
+        Ok(())
+    }
+
+    fn spawn_pane_command(
+        &mut self,
+        command: &str,
+        temp_files: Vec<std::path::PathBuf>,
+    ) -> std::io::Result<()> {
+        let Some(ws_idx) = self.state.active else {
+            return Err(std::io::Error::other("no active workspace"));
+        };
+        let previous_focus_target = self.state.current_pane_focus_target();
+        let (rows, cols) = self.state.estimate_pane_size();
+        let new_rows = rows.max(4);
+        let new_cols = cols.max(10);
+        let (env, _) = self.custom_command_env();
+
+        let ws = self
+            .state
+            .workspaces
+            .get_mut(ws_idx)
+            .ok_or_else(|| std::io::Error::other("active workspace disappeared"))?;
+        let tab_idx = ws.active_tab_index();
+        let previous_focus = ws
+            .focused_pane_id()
+            .ok_or_else(|| std::io::Error::other("no focused pane"))?;
+        let previous_zoomed = ws.active_tab().map(|tab| tab.zoomed).unwrap_or(false);
+        let cwd = ws.active_tab().and_then(|tab| {
+            tab.cwd_for_pane(
+                previous_focus,
+                &self.state.terminals,
+                &self.terminal_runtimes,
+            )
+        });
+        let new_pane = ws.split_focused_command(
+            Direction::Horizontal,
+            new_rows,
+            new_cols,
+            cwd,
+            command,
+            env,
+            self.state.pane_scrollback_limit_bytes,
+            self.state.host_terminal_theme,
+            self.state.host_terminal_appearance,
+        )?;
+        let new_pane_id = new_pane.pane_id;
+        self.terminal_runtimes
+            .insert(new_pane.terminal.id.clone(), new_pane.runtime);
+        self.state
+            .terminals
+            .insert(new_pane.terminal.id.clone(), new_pane.terminal);
+        let new_focus_target = crate::app::state::PaneFocusTarget {
+            workspace_id: ws.id.clone(),
+            pane_id: new_pane_id,
+        };
+        if previous_focus_target.as_ref() != Some(&new_focus_target) {
+            self.state.previous_pane_focus = previous_focus_target;
+        }
+        ws.active_tab_mut()
+            .expect("workspace must have an active tab")
+            .layout
+            .focus_pane(new_pane_id);
+        ws.active_tab_mut()
+            .expect("workspace must have an active tab")
+            .zoomed = true;
+        self.overlay_panes.insert(
+            new_pane_id,
+            super::OverlayPaneState {
+                ws_idx,
+                tab_idx,
+                previous_focus,
+                previous_zoomed,
+                temp_files,
+            },
+        );
+        self.state.remove_alias_shadowed_by_new_pane(new_pane_id);
+        self.state.mode = Mode::Terminal;
+        Ok(())
+    }
+
+    pub(crate) fn spawn_overlay_argv_command(
+        &mut self,
+        argv: &[String],
+        cwd: Option<std::path::PathBuf>,
+        extra_env: Vec<(String, String)>,
+        temp_files: Vec<std::path::PathBuf>,
+    ) -> std::io::Result<(usize, crate::workspace::NewPane)> {
+        let Some(ws_idx) = self.state.active else {
+            return Err(std::io::Error::other("no active workspace"));
+        };
+        let previous_focus_target = self.state.current_pane_focus_target();
+        let (rows, cols) = self.state.estimate_pane_size();
+        let new_rows = rows.max(4);
+        let new_cols = cols.max(10);
+
+        let ws = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .ok_or_else(|| std::io::Error::other("active workspace disappeared"))?;
+        let previous_focus = ws
+            .focused_pane_id()
+            .ok_or_else(|| std::io::Error::other("no focused pane"))?;
+        let cwd = cwd.or_else(|| {
+            ws.active_tab().and_then(|tab| {
+                tab.cwd_for_pane(
+                    previous_focus,
+                    &self.state.terminals,
+                    &self.terminal_runtimes,
+                )
+            })
+        });
+
+        let (tab_idx, new_pane, workspace_id) = {
+            let ws = self
+                .state
+                .workspaces
+                .get_mut(ws_idx)
+                .ok_or_else(|| std::io::Error::other("active workspace disappeared"))?;
+            let previous_zoomed = ws.active_tab().map(|tab| tab.zoomed).unwrap_or(false);
+            let result = ws.split_pane_argv_command(
+                previous_focus,
+                Direction::Horizontal,
+                new_rows,
+                new_cols,
+                cwd,
+                argv,
+                extra_env,
+                self.state.pane_scrollback_limit_bytes,
+                self.state.host_terminal_theme,
+                self.state.host_terminal_appearance,
+                true,
+            );
+            let (tab_idx, new_pane) = match result {
+                Some(Ok(result)) => result,
+                Some(Err(err)) => return Err(err),
+                None => return Err(std::io::Error::other("focused pane disappeared")),
+            };
+            ws.tabs
+                .get_mut(tab_idx)
+                .ok_or_else(|| std::io::Error::other("plugin overlay tab disappeared"))?
+                .zoomed = true;
+            self.overlay_panes.insert(
+                new_pane.pane_id,
+                super::OverlayPaneState {
+                    ws_idx,
+                    tab_idx,
+                    previous_focus,
+                    previous_zoomed,
+                    temp_files,
+                },
+            );
+            (tab_idx, new_pane, ws.id.clone())
+        };
+
+        let new_focus_target = crate::app::state::PaneFocusTarget {
+            workspace_id,
+            pane_id: new_pane.pane_id,
+        };
+        if previous_focus_target.as_ref() != Some(&new_focus_target) {
+            self.state.previous_pane_focus = previous_focus_target;
+        }
+        self.state.switch_workspace_tab(ws_idx, tab_idx);
+        self.state.mode = Mode::Terminal;
+        Ok((ws_idx, new_pane))
+    }
+}
+
+fn write_scrollback_temp_file(content: &str) -> io::Result<std::path::PathBuf> {
+    let mut last_collision = None;
+    for attempt in 0..16 {
+        let path = unique_scrollback_path(attempt);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        match options.open(&path) {
+            Ok(mut file) => {
+                file.write_all(content.as_bytes())?;
+                return Ok(path);
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                last_collision = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_collision.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "failed to create unique scrollback temp file",
+        )
+    }))
+}
+
+fn unique_scrollback_path(attempt: u32) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "herdr-scrollback-{}-{nanos}-{attempt}.txt",
+        std::process::id()
+    ))
 }
 
 #[cfg(test)]
@@ -183,7 +574,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         crate::app::App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -239,6 +630,7 @@ mod tests {
                 workspace_id: None,
                 tab_id: None,
                 pane_id: None,
+                selection: None,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -287,10 +679,53 @@ mod tests {
                 workspace_id: None,
                 tab_id: None,
                 pane_id: None,
+                selection: None,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "command_not_found");
+    }
+
+    #[tokio::test]
+    async fn plugin_command_rejects_stale_client_selection_before_invocation() {
+        let mut app = test_app();
+        let workspace = crate::workspace::Workspace::test_new("plugin-selection");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.terminal_runtimes.insert(
+            terminal_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"selected text\n"),
+        );
+        let mut plugin = binding(crate::config::CustomCommandAction::PluginAction);
+        plugin.command = "missing.plugin-action".into();
+        install(&mut app, plugin);
+        let command_id = app.client_shell_command_manifest()[0].command_id.clone();
+        let workspace_id = app.public_workspace_id(0);
+        let tab_id = app.public_tab_id(0, 0).unwrap();
+        let pane_id = app.public_pane_id(0, pane_id).unwrap();
+
+        let response = app.handle_command_invoke(
+            "request-selection".into(),
+            crate::api::schema::CommandInvokeParams {
+                command_id,
+                workspace_id: Some(workspace_id),
+                tab_id: Some(tab_id),
+                pane_id: Some(pane_id.clone()),
+                selection: Some(crate::api::schema::PaneSelectionReadParams {
+                    pane_id,
+                    anchor: crate::api::schema::PaneTextPoint { row: 0, col: 0 },
+                    cursor: crate::api::schema::PaneTextPoint { row: 0, col: 7 },
+                    content_revision: Some(u64::MAX),
+                }),
+            },
+        );
+
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "stale_content");
     }
 
     #[cfg(unix)]
@@ -318,6 +753,7 @@ mod tests {
                 workspace_id: None,
                 tab_id: None,
                 pane_id: None,
+                selection: None,
             },
         );
         let success: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();

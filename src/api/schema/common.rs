@@ -120,14 +120,6 @@ impl NotificationShowSound {
     pub fn is_none(&self) -> bool {
         matches!(self, Self::None)
     }
-
-    pub fn to_sound(self) -> Option<crate::sound::Sound> {
-        match self {
-            Self::None => None,
-            Self::Done => Some(crate::sound::Sound::Done),
-            Self::Request => Some(crate::sound::Sound::Request),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

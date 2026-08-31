@@ -134,10 +134,6 @@ impl BlitEncoder {
     pub(crate) fn is_current(&self, frame: &FrameData) -> bool {
         self.last_frame.as_ref() == Some(frame)
     }
-
-    pub(crate) fn last_frame(&self) -> Option<&FrameData> {
-        self.last_frame.as_ref()
-    }
 }
 
 pub(crate) fn frame_with_drawn_cursor(mut frame: FrameData) -> FrameData {

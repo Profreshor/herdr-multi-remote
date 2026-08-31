@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
@@ -16,9 +14,12 @@ static CLEANUP_GUARD: OnceLock<CleanupGuard> = OnceLock::new();
 const WATCHDOG_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_OWNER_MARKER: &str = ".herdr-test-owner-pid";
 pub const CURRENT_PROTOCOL: u32 = 21;
-pub const SERVER_MESSAGE_CLIENT_SHELL_SNAPSHOT: u32 = 15;
-pub const SERVER_MESSAGE_PANE_SURFACE: u32 = 16;
-const CLIENT_MESSAGE_CLIENT_SHELL_HELLO: u32 = 13;
+pub const SERVER_MESSAGE_SERVER_SHUTDOWN: u32 = 3;
+pub const SERVER_MESSAGE_CLIENT_SHELL_SNAPSHOT: u32 = 12;
+pub const SERVER_MESSAGE_PANE_SURFACE: u32 = 13;
+pub const SERVER_MESSAGE_SEMANTIC_NOTIFICATION: u32 = 14;
+const CLIENT_MESSAGE_CLIENT_SHELL_HELLO: u32 = 11;
+const CLIENT_MESSAGE_CLIENT_SHELL_PANE_INPUT: u32 = 13;
 
 pub fn register_spawned_herdr_pid(pid: Option<u32>) {
     let Some(pid) = pid else {
@@ -111,7 +112,7 @@ pub fn wait_for_file(path: &Path, timeout: Duration) {
     panic!("file did not appear at {}", path.display());
 }
 
-pub fn encode_varint_u32(v: u32) -> Vec<u8> {
+fn encode_varint_u32(v: u32) -> Vec<u8> {
     if v < 251 {
         vec![v as u8]
     } else if v < 65536 {
@@ -125,7 +126,7 @@ pub fn encode_varint_u32(v: u32) -> Vec<u8> {
     }
 }
 
-pub fn encode_varint_u16(v: u16) -> Vec<u8> {
+fn encode_varint_u16(v: u16) -> Vec<u8> {
     if v < 251 {
         vec![v as u8]
     } else {
@@ -135,14 +136,14 @@ pub fn encode_varint_u16(v: u16) -> Vec<u8> {
     }
 }
 
-pub fn frame_message(payload: &[u8]) -> Vec<u8> {
+fn frame_message(payload: &[u8]) -> Vec<u8> {
     let len = payload.len() as u32;
     let mut framed = len.to_le_bytes().to_vec();
     framed.extend_from_slice(payload);
     framed
 }
 
-pub fn decode_varint_u32(payload: &[u8], offset: usize) -> Result<(u32, usize), String> {
+fn decode_varint_u32(payload: &[u8], offset: usize) -> Result<(u32, usize), String> {
     if offset >= payload.len() {
         return Err("payload too short for varint".into());
     }
@@ -260,9 +261,7 @@ pub fn client_handshake(
             &encode_varint_u16(rows),
             &encode_varint_u32(8),  // cell_width_px
             &encode_varint_u32(16), // cell_height_px
-            &encode_varint_u32(0),  // RenderEncoding::SemanticFrame
-            &encode_varint_u32(0),  // ClientKeybindings::Server
-            &encode_varint_u32(0),  // ClientLaunchMode::App
+            &[0],                   // pixel_mouse = false
         ],
     );
     finish_handshake(stream, &hello_payload)
@@ -271,8 +270,6 @@ pub fn client_handshake(
 pub fn client_shell_handshake(
     stream: &mut UnixStream,
     version: u32,
-    cols: u16,
-    rows: u16,
     surface_cols: u16,
     surface_rows: u16,
 ) -> Result<(u32, Option<String>), String> {
@@ -280,16 +277,14 @@ pub fn client_shell_handshake(
         CLIENT_MESSAGE_CLIENT_SHELL_HELLO,
         &[
             &encode_varint_u32(version),
-            &encode_varint_u16(cols),
-            &encode_varint_u16(rows),
             &encode_varint_u32(8),
             &encode_varint_u32(16),
-            &encode_varint_u32(0),
             &encode_varint_u16(surface_cols),
             &encode_varint_u16(surface_rows),
-            &[0],
-            &[0],
+            &[0], // pixel mouse disabled
+            &[0], // direct graphics disabled
             &[0], // client-owned keybindings
+            &[0], // mouse capture disabled
         ],
     );
     finish_handshake(stream, &hello_payload)
@@ -317,16 +312,27 @@ pub fn read_server_message(stream: &mut UnixStream) -> Result<(u32, Vec<u8>), St
     Ok((variant, payload[consumed..].to_vec()))
 }
 
-pub fn send_input(stream: &mut UnixStream, data: &[u8]) -> Result<(), String> {
-    let mut buf = encode_varint_u32(1);
-    buf.extend_from_slice(&encode_varint_u32(data.len() as u32));
-    buf.extend_from_slice(data);
-    let framed = frame_message(&buf);
+pub fn send_client_shell_shift_enter(stream: &mut UnixStream, pane_id: &str) -> Result<(), String> {
+    let mut payload = encode_varint_u32(CLIENT_MESSAGE_CLIENT_SHELL_PANE_INPUT);
+    payload.extend_from_slice(&encode_varint_u32(pane_id.len() as u32));
+    payload.extend_from_slice(pane_id.as_bytes());
+    payload.extend_from_slice(&encode_varint_u32(1)); // one pane input event
+    payload.extend_from_slice(&encode_varint_u32(0)); // Key
+    payload.extend_from_slice(&encode_varint_u32(1)); // Enter
+    payload.push(1); // Shift
+    payload.extend_from_slice(&encode_varint_u32(0)); // Press
+    payload.extend_from_slice(&encode_varint_u16(1));
+    payload.push(0); // no shifted codepoint
+    payload.push(0); // no generated text
+    payload.push(0); // does not track release
+    payload.push(0); // no physical key id
+
     stream
-        .write_all(&framed)
-        .map_err(|e| format!("write input: {e}"))?;
-    stream.flush().map_err(|e| format!("flush input: {e}"))?;
-    Ok(())
+        .write_all(&frame_message(&payload))
+        .map_err(|e| format!("write client shell key: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("flush client shell key: {e}"))
 }
 
 pub fn send_detach(stream: &mut UnixStream) -> Result<(), String> {

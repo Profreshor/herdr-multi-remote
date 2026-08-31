@@ -28,36 +28,6 @@ enum RuntimeExitAction {
 }
 
 impl App {
-    pub(crate) fn dispatch_api_request(
-        &mut self,
-        id: &'static str,
-        method: crate::api::schema::Method,
-    ) -> String {
-        self.handle_api_request(crate::api::schema::Request {
-            id: id.to_string(),
-            method,
-        })
-    }
-
-    pub(crate) fn dispatch_deferred_api_request(
-        &mut self,
-        id: &'static str,
-        method: crate::api::schema::Method,
-    ) -> Option<String> {
-        let (respond_to, response_rx) = std::sync::mpsc::channel();
-        if !self.handle_deferred_worktree_api_request(
-            crate::api::schema::Request {
-                id: id.to_string(),
-                method,
-            },
-            respond_to,
-        ) {
-            return None;
-        }
-
-        response_rx.try_recv().ok()
-    }
-
     pub(crate) fn handle_internal_event_with_render_impact(&mut self, ev: AppEvent) -> bool {
         match ev {
             AppEvent::GitStatusRefreshed {
@@ -115,9 +85,7 @@ impl App {
     ) -> Vec<crate::app::actions::PaneStateUpdate> {
         if matches!(
             &ev,
-            AppEvent::TerminalBell { .. }
-                | AppEvent::ClipboardWrite { .. }
-                | AppEvent::PrefixInputSource { .. }
+            AppEvent::TerminalBell { .. } | AppEvent::ClipboardWrite { .. }
         ) {
             return Vec::new();
         }
@@ -173,12 +141,12 @@ impl App {
         }
 
         if let AppEvent::WorktreeAddFinished(result) = ev {
-            self.handle_worktree_add_finished(*result);
+            self.handle_api_worktree_add_finished(*result);
             return Vec::new();
         }
 
         if let AppEvent::WorktreeRemoveFinished(result) = ev {
-            self.handle_worktree_remove_finished(*result);
+            self.handle_api_worktree_remove_finished(*result);
             return Vec::new();
         }
 
@@ -419,18 +387,6 @@ impl App {
                 }
             }
         }
-    }
-
-    pub(crate) fn show_clipboard_feedback(&mut self) {
-        if !self.state.toast_config.clipboard.enabled {
-            self.state.copy_feedback = None;
-            self.copy_feedback_deadline = None;
-            return;
-        }
-        self.state.copy_feedback = Some(crate::app::state::CopyFeedback {
-            message: "copied to clipboard".to_string(),
-        });
-        self.copy_feedback_deadline = Some(Instant::now() + super::COPY_FEEDBACK_DURATION);
     }
 
     fn restore_overlay_after_exit(
@@ -701,7 +657,7 @@ impl App {
         self.sync_focus_events_with_outer_event(None);
     }
 
-    pub(super) fn send_outer_focus_event(&mut self, event: crate::ghostty::FocusEvent) {
+    pub(crate) fn send_outer_focus_event(&mut self, event: crate::ghostty::FocusEvent) {
         self.sync_focus_events_with_outer_event(Some(event));
     }
 
@@ -780,6 +736,7 @@ impl App {
         runtime.try_send_focus_event(event);
     }
 
+    #[cfg(test)]
     pub(crate) fn handle_api_request(&mut self, request: crate::api::schema::Request) -> String {
         self.drain_all_internal_events();
         self.handle_api_request_after_internal_events_drained(request)
@@ -1015,6 +972,9 @@ impl App {
             Method::PaneGet(target) => return self.handle_pane_get(request.id, target),
             Method::PaneFocus(target) => return self.handle_pane_focus(request.id, target),
             Method::PaneInputSet(params) => return self.handle_pane_input_set(request.id, params),
+            Method::PaneLinkActivate(params) => {
+                return self.handle_pane_link_activate(request.id, params);
+            }
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
             Method::PaneGraphicsSet(params) => {
@@ -1283,7 +1243,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -1310,7 +1270,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -1349,7 +1309,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -1395,7 +1355,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -1435,7 +1395,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -1476,7 +1436,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -1519,7 +1479,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -1564,7 +1524,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -1606,7 +1566,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -1640,7 +1600,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -1676,7 +1636,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -1769,7 +1729,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -1894,7 +1854,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             event_hub.clone(),
@@ -1931,7 +1891,7 @@ mod tests {
             let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
             let mut app = App::new(
                 &crate::config::Config::default(),
-                true,
+                crate::app::AppPolicy::TEST,
                 None,
                 api_rx,
                 event_hub.clone(),
@@ -1975,7 +1935,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             event_hub.clone(),
@@ -2026,7 +1986,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             event_hub.clone(),
@@ -2112,7 +2072,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -2162,7 +2122,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -2196,7 +2156,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -2219,7 +2179,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),

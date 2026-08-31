@@ -30,6 +30,8 @@ impl ClientShellState {
         let Some(path) = self.config.preferences_path.as_deref() else {
             return;
         };
+        let mut collapsed_groups = self.collapsed_groups.iter().cloned().collect::<Vec<_>>();
+        collapsed_groups.sort();
         let preferences = preferences::ClientChromePreferences {
             sidebar_width: self.sidebar_width_manual.then_some(self.sidebar_width),
             sidebar_section_split: self
@@ -41,6 +43,7 @@ impl ClientShellState {
             agent_panel_sort: self
                 .agent_panel_sort_manual
                 .then_some(self.config.agent_panel_sort),
+            collapsed_groups,
         };
         if let Err(error) = preferences::store(path, preferences) {
             self.endpoint_error = Some(error);
@@ -57,6 +60,12 @@ impl ClientShellState {
                     &loaded.diagnostics,
                     &loaded.invalid_sections,
                 );
+                if let Some(appearance) = self.host_appearance {
+                    self.config.palette = crate::app::client_palette_for_appearance(
+                        &self.config.theme_runtime,
+                        appearance,
+                    );
+                }
                 if !self.sidebar_width_manual {
                     self.sidebar_width = self.config.sidebar_width;
                 }
@@ -79,6 +88,7 @@ impl ClientShellState {
                 self.set_local_config_diagnostic(self.config.local_config_diagnostic(&diagnostics));
             }
         }
+        self.reconcile_input_source();
     }
 }
 
@@ -123,9 +133,11 @@ impl ClientShellConfig {
             mouse_capture: config.ui.mouse_capture,
             mouse_scroll_lines: config.ui.mouse_scroll_lines(),
             right_click_passthrough_modifiers: config.ui.right_click_passthrough_modifiers(),
-            worktree_directory: crate::worktree::expand_tilde_absolute_path(
-                &config.worktrees.directory,
-            ),
+            redraw_on_focus_gained: config.ui.redraw_on_focus_gained,
+            switch_ascii_input_source_in_prefix: config
+                .experimental
+                .switch_ascii_input_source_in_prefix,
+            local_config_path: crate::config::config_path(),
             preferences_path: None,
             preferences: preferences::ClientChromePreferences::default(),
             startup_config_diagnostic: None,
@@ -304,6 +316,7 @@ impl ClientShellConfig {
                 self.mouse_capture = ui.mouse_capture;
                 self.mouse_scroll_lines = ui.mouse_scroll_lines();
                 self.right_click_passthrough_modifiers = ui.right_click_passthrough_modifiers();
+                self.redraw_on_focus_gained = ui.redraw_on_focus_gained;
             }
         }
 
@@ -312,9 +325,9 @@ impl ClientShellConfig {
             self.theme_name = self.theme_runtime.manual_name.clone();
             self.palette = crate::app::client_palette_from_config(config);
         }
-        if !invalid_section("worktrees") {
-            self.worktree_directory =
-                crate::worktree::expand_tilde_absolute_path(&config.worktrees.directory);
+        if !invalid_section("experimental") {
+            self.switch_ascii_input_source_in_prefix =
+                config.experimental.switch_ascii_input_source_in_prefix;
         }
 
         diagnostics
@@ -423,7 +436,6 @@ mod tests {
         next.ui.status_indicators = crate::config::StatusIndicatorStyle::Symbols;
         next.ui.sidebar.agents.row_gap = 2;
         next.keys.prefix = "ctrl+a".to_owned();
-        next.worktrees.directory = "/var/tmp/herdr-reloaded-worktrees".to_owned();
 
         let diagnostics = shell.apply_live_config(&next, &[], &[]);
 
@@ -442,10 +454,6 @@ mod tests {
         assert_eq!(
             shell.keybinds.prefix,
             (KeyCode::Char('a'), KeyModifiers::CONTROL)
-        );
-        assert_eq!(
-            shell.worktree_directory,
-            std::path::PathBuf::from("/var/tmp/herdr-reloaded-worktrees")
         );
     }
 
@@ -478,24 +486,18 @@ mod tests {
         let mut initial = Config::default();
         initial.ui.sidebar_width = 29;
         initial.keys.prefix = "ctrl+x".to_owned();
-        initial.worktrees.directory = "/var/tmp/herdr-current-worktrees".to_owned();
         let mut shell = ClientShellConfig::from_config(&initial);
 
         let mut invalid = Config::default();
         invalid.ui.sidebar_width = 35;
         invalid.keys.prefix = "ctrl+a".to_owned();
-        invalid.worktrees.directory = "/var/tmp/herdr-invalid-worktrees".to_owned();
-        let invalid_sections = vec!["ui".to_owned(), "keys".to_owned(), "worktrees".to_owned()];
+        let invalid_sections = vec!["ui".to_owned(), "keys".to_owned()];
         shell.apply_live_config(&invalid, &[], &invalid_sections);
 
         assert_eq!(shell.sidebar_width, 29);
         assert_eq!(
             shell.keybinds.prefix,
             (KeyCode::Char('x'), KeyModifiers::CONTROL)
-        );
-        assert_eq!(
-            shell.worktree_directory,
-            std::path::PathBuf::from("/var/tmp/herdr-current-worktrees")
         );
     }
 }

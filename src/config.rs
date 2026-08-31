@@ -39,7 +39,7 @@ pub use self::{
 };
 
 pub(crate) use self::keybinds::parse_key_combo;
-pub(crate) use self::write::{update_file, write_edit, ConfigEdit};
+pub(crate) use self::write::{update_file_at, write_edit, ConfigEdit};
 pub(crate) use self::{
     io::upsert_top_level_bool,
     tab_bar::{
@@ -155,12 +155,6 @@ impl Config {
         parse_key_combo(raw).map(Some).ok_or_else(|| {
             format!("invalid keybinding: keys.remote_image_paste = {raw:?}; disabling binding")
         })
-    }
-
-    #[cfg(test)]
-    pub fn live_keybinds(&self) -> Result<LiveKeybindConfig, Vec<String>> {
-        self.live_keybinds_with_diagnostics()
-            .map(|(live, _diagnostics)| live)
     }
 
     pub(crate) fn live_keybinds_with_diagnostics(

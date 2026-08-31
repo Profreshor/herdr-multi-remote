@@ -313,6 +313,7 @@ fn command_invoke_request_round_trips_without_command_text() {
             workspace_id: Some("w1".into()),
             tab_id: Some("w1:t1".into()),
             pane_id: Some("w1:p1".into()),
+            selection: None,
         }),
     };
     let json = serde_json::to_value(&request).unwrap();
@@ -1309,6 +1310,32 @@ fn event_wait_parses_typed_match() {
             agent_status: AgentStatus::Done,
         }
     );
+}
+
+#[test]
+fn pane_link_activate_round_trips() {
+    let request = Request {
+        id: "req_pane_link".into(),
+        method: Method::PaneLinkActivate(PaneLinkActivateParams {
+            pane_id: "w1:p1".into(),
+            viewport_row: 3,
+            col: 7,
+            content_revision: Some(42),
+            offset_from_bottom: Some(5),
+        }),
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "pane.link.activate");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+
+    let response = ResponseResult::PaneLinkActivated {
+        url: Some("https://example.test".into()),
+        handled: false,
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    let restored: ResponseResult = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored, response);
 }
 
 #[test]

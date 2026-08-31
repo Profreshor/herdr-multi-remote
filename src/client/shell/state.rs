@@ -43,7 +43,9 @@ pub(crate) struct ClientShellConfig {
     pub(super) mouse_capture: bool,
     pub(super) mouse_scroll_lines: usize,
     pub(super) right_click_passthrough_modifiers: Option<crossterm::event::KeyModifiers>,
-    pub(super) worktree_directory: std::path::PathBuf,
+    pub(super) redraw_on_focus_gained: bool,
+    pub(super) switch_ascii_input_source_in_prefix: bool,
+    pub(super) local_config_path: std::path::PathBuf,
     pub(super) preferences_path: Option<std::path::PathBuf>,
     pub(super) preferences: preferences::ClientChromePreferences,
     pub(super) startup_config_diagnostic: Option<String>,
@@ -151,6 +153,8 @@ pub(super) struct ClientPaneMouseGesture {
     pub(super) hit: PaneHit,
     pub(super) button: crossterm::event::MouseButton,
     pub(super) stripped_modifiers: crossterm::event::KeyModifiers,
+    pub(super) last_event: crossterm::event::MouseEvent,
+    pub(super) last_position: crate::protocol::ClientMousePosition,
 }
 
 pub(super) struct ClientWorkspacePress {
@@ -222,6 +226,9 @@ pub(crate) enum ClientShellAction {
         request: Box<crate::api::schema::Request>,
     },
     ClipboardWrite(Vec<u8>),
+    Request(ClientMessage),
+    OpenSafeWebUrl(String),
+    ReplayMouse(Vec<crossterm::event::MouseEvent>),
     Keybind(crate::input::KeybindAction),
 }
 
@@ -231,6 +238,7 @@ pub(crate) struct ClientShellInput {
     pub repaint: bool,
     pub resize: bool,
     pub query_host_appearance: bool,
+    pub query_host_theme: bool,
     pub requests: Vec<ClientMessage>,
     pub actions: Vec<ClientShellAction>,
 }
@@ -592,7 +600,9 @@ pub(super) enum PendingEndpointKind {
     WorktreeRemove {
         forced: bool,
     },
-    SelectionCopy,
+    SelectionCopy {
+        fallback: Option<ClientMessage>,
+    },
     PaneScroll {
         pane_id: String,
         serial: u64,
@@ -602,6 +612,11 @@ pub(super) enum PendingEndpointKind {
         absolute_row: u32,
         col: u16,
         generation: u64,
+    },
+    PaneLinkActivate {
+        pane_id: String,
+        inner_rect: Rect,
+        fallback_events: Vec<crossterm::event::MouseEvent>,
     },
     CopyMotion {
         pane_id: String,
@@ -796,6 +811,8 @@ pub(crate) struct ClientShellState {
     pub(super) overlay: Option<ClientShellOverlay>,
     pub(super) previous_pane_id: Option<String>,
     pub(super) pane_mouse_gesture: Option<ClientPaneMouseGesture>,
+    pub(super) url_click_consumes_until_up: bool,
+    pub(super) replaying_url_click: bool,
     pub(super) selection: Option<crate::selection::Selection<String>>,
     pub(super) last_pane_click: Option<ClientPaneClick>,
     pub(super) selection_autoscroll: Option<ClientSelectionAutoscroll>,
@@ -824,6 +841,10 @@ pub(crate) struct ClientShellState {
     pub(super) pending_notifications: Vec<ClientPendingNotification>,
     pub(super) visible_notification: Option<ClientVisibleNotification>,
     pub(super) outer_focused: Option<bool>,
+    pub(super) ascii_input_source_active: bool,
+    pub(super) pending_input_source_changes: Vec<bool>,
+    pub(super) host_appearance: Option<crate::terminal_theme::HostAppearance>,
+    pub(super) host_appearance_explicit: bool,
     pub(super) local_config_diagnostic: Option<String>,
     pub(super) config_diagnostic: Option<String>,
     pub(super) endpoint_error: Option<String>,
@@ -863,7 +884,7 @@ pub(super) struct WorkspaceEntry {
 
 impl ClientShellState {
     pub(crate) fn new(mut config: ClientShellConfig) -> Self {
-        let preferences = config.preferences;
+        let preferences = config.preferences.clone();
         let local_config_diagnostic = config.startup_config_diagnostic.take();
         let overlay = config
             .startup_onboarding
@@ -909,7 +930,7 @@ impl ClientShellState {
             chrome_drag: None,
             workspace_press: None,
             tab_press: None,
-            collapsed_groups: HashSet::new(),
+            collapsed_groups: preferences.collapsed_groups.into_iter().collect(),
             workspace_scroll: 0,
             agent_scroll: 0,
             tab_scroll: 0,
@@ -925,6 +946,8 @@ impl ClientShellState {
             overlay,
             previous_pane_id: None,
             pane_mouse_gesture: None,
+            url_click_consumes_until_up: false,
+            replaying_url_click: false,
             selection: None,
             last_pane_click: None,
             selection_autoscroll: None,
@@ -953,6 +976,10 @@ impl ClientShellState {
             pending_notifications: Vec::new(),
             visible_notification: None,
             outer_focused: None,
+            ascii_input_source_active: false,
+            pending_input_source_changes: Vec::new(),
+            host_appearance: None,
+            host_appearance_explicit: false,
             config_diagnostic: local_config_diagnostic.clone(),
             local_config_diagnostic,
             endpoint_error: None,
@@ -1005,6 +1032,25 @@ impl ClientShellState {
             render::workspace_entries(snapshot, &HashSet::new())
         } else {
             render::workspace_entries(snapshot, &self.collapsed_groups)
+        }
+    }
+
+    pub(super) fn reveal_workspace(&mut self, workspace_id: &str) {
+        if self
+            .hits
+            .workspaces
+            .iter()
+            .any(|hit| hit.workspace_id == workspace_id)
+        {
+            return;
+        }
+        let target = self.snapshot.as_deref().and_then(|snapshot| {
+            self.navigation_workspace_entries(snapshot)
+                .iter()
+                .position(|entry| snapshot.workspaces[entry.index].workspace_id == workspace_id)
+        });
+        if let Some(target) = target {
+            self.workspace_scroll = target.min(self.hits.workspace_max_scroll);
         }
     }
 
@@ -1090,7 +1136,6 @@ impl ClientShellState {
             self.chrome_drag = None;
             self.workspace_press = None;
             self.tab_press = None;
-            self.collapsed_groups.clear();
             self.workspace_scroll = 0;
             self.agent_scroll = 0;
             self.tab_scroll = 0;
@@ -1117,6 +1162,8 @@ impl ClientShellState {
                 .then_some(ClientShellOverlay::Onboarding);
             self.previous_pane_id = None;
             self.pane_mouse_gesture = None;
+            self.url_click_consumes_until_up = false;
+            self.replaying_url_click = false;
             self.selection = None;
             self.last_pane_click = None;
             self.selection_autoscroll = None;
@@ -1313,6 +1360,7 @@ impl ClientShellState {
         }
         self.snapshot = Some(snapshot);
         self.resume_mobile_switcher_if_ready();
+        self.reconcile_input_source();
     }
 
     pub(crate) fn set_pane_surface(&mut self, mut surface: PaneSurfaceFrame) {
@@ -1341,6 +1389,10 @@ impl ClientShellState {
             .as_deref()
             .map(|popup| popup.terminal_id.clone());
         if previous_popup != next_popup {
+            if next_popup.is_some() && matches!(self.overlay, Some(ClientShellOverlay::Settings(_)))
+            {
+                self.cancel_settings_overlay();
+            }
             if let Some(terminal_id) = previous_popup.as_ref() {
                 self.input_leases
                     .remove_target(&ClientInputTarget::Popup(terminal_id.clone()));
@@ -1461,6 +1513,7 @@ impl ClientShellState {
             .set_scene(std::mem::take(&mut surface.graphics));
         self.pane_surface = Some(surface);
         self.resume_mobile_switcher_if_ready();
+        self.reconcile_input_source();
     }
 
     pub(crate) fn tick_popup_pending(&mut self, now: std::time::Instant) {
@@ -1471,6 +1524,17 @@ impl ClientShellState {
             self.popup_pending = false;
             self.popup_pending_deadline = None;
         }
+    }
+
+    pub(crate) fn show_copy_feedback(&mut self, now: std::time::Instant) -> bool {
+        if !self.config.clipboard_toast_enabled {
+            return false;
+        }
+        self.copy_feedback = Some(crate::app::state::CopyFeedback {
+            message: "copied to clipboard".to_owned(),
+        });
+        self.copy_feedback_deadline = Some(now + std::time::Duration::from_secs(2));
+        true
     }
 
     pub(crate) fn tick_copy_feedback(&mut self, now: std::time::Instant) -> bool {
@@ -1505,5 +1569,43 @@ impl ClientShellState {
         self.pane_surface = None;
         self.hits = ShellHitMap::default();
         self.host_mouse_pixels = None;
+    }
+
+    fn wants_ascii_input(&self) -> bool {
+        if let Some(overlay) = self.overlay.as_ref() {
+            return matches!(
+                overlay,
+                ClientShellOverlay::ConfirmClose(_)
+                    | ClientShellOverlay::Help(_)
+                    | ClientShellOverlay::Navigator(_)
+                    | ClientShellOverlay::WorktreeRemove(_)
+                    | ClientShellOverlay::ContextMenu(_)
+                    | ClientShellOverlay::GlobalMenu(_)
+            );
+        }
+        matches!(
+            self.mode,
+            ClientShellMode::Prefix
+                | ClientShellMode::Navigate
+                | ClientShellMode::Resize
+                | ClientShellMode::Copy
+        )
+    }
+
+    pub(crate) fn reconcile_input_source(&mut self) {
+        // Keep the platform restore token while another window has focus. Restoring
+        // through a global key injection is only safe after this client regains focus.
+        if self.outer_focused == Some(false) {
+            return;
+        }
+        let desired = self.config.switch_ascii_input_source_in_prefix && self.wants_ascii_input();
+        if desired != self.ascii_input_source_active {
+            self.ascii_input_source_active = desired;
+            self.pending_input_source_changes.push(desired);
+        }
+    }
+
+    pub(crate) fn take_input_source_changes(&mut self) -> Vec<bool> {
+        std::mem::take(&mut self.pending_input_source_changes)
     }
 }

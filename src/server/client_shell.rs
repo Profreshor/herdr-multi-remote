@@ -181,6 +181,7 @@ pub(super) fn snapshot(
         server_keybindings_toml: app.client_shell_keybindings_profile().map(str::to_owned),
         latest_release_notes_available: app.state.latest_release_notes_available,
         integration_updates_available: app.state.integration_updates_available(),
+        worktree_directory: app.state.worktree_directory.to_string_lossy().into_owned(),
         release_notes,
         focused_workspace_id: snapshot.focused_workspace_id,
         focused_tab_id: snapshot.focused_tab_id,
@@ -500,7 +501,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = crate::app::App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),

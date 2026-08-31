@@ -274,6 +274,11 @@ pub enum ResponseResult {
         context: PluginInvocationContext,
         log: PluginCommandLogInfo,
     },
+    PaneLinkActivated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        handled: bool,
+    },
     PluginLogList {
         logs: Vec<PluginCommandLogInfo>,
     },

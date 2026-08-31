@@ -390,7 +390,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -470,7 +470,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -554,7 +554,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -710,7 +710,6 @@ mod tests {
 
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(success.id, "req");
-        assert_eq!(app.state.request_remove_linked_worktree, None);
         assert_eq!(app.state.workspaces.len(), 1);
         assert_eq!(app.state.workspaces[0].display_name(), "parent");
     }
@@ -719,7 +718,13 @@ mod tests {
     fn api_workspace_close_event_includes_final_worktree_snapshot() {
         let event_hub = crate::api::EventHub::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        let mut app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
         app.state.workspaces = app_with_linked_worktree().state.workspaces;
         let workspace_id = app.state.workspaces[0].id.clone();
 
@@ -753,7 +758,13 @@ mod tests {
     fn workspace_metadata_tokens_patch_clear_and_emit_snapshot() {
         let event_hub = crate::api::EventHub::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        let mut app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
         app.state.workspaces = vec![Workspace::test_new("one")];
         let workspace_id = app.public_workspace_id(0);
 
@@ -805,7 +816,13 @@ mod tests {
     fn workspace_token_ttl_expires_through_runtime_and_emits_update() {
         let event_hub = crate::api::EventHub::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        let mut app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
         app.state.workspaces = vec![Workspace::test_new("one")];
         let workspace_id = app.public_workspace_id(0);
         let response = app.handle_workspace_report_metadata(
@@ -837,7 +854,13 @@ mod tests {
     fn api_workspace_move_reorders_workspaces() {
         let event_hub = crate::api::EventHub::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        let mut app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
         app.state.workspaces = vec![
             Workspace::test_new("one"),
             Workspace::test_new("two"),
@@ -879,7 +902,13 @@ mod tests {
     fn api_workspace_move_block_reorders_atomically() {
         let event_hub = crate::api::EventHub::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        let mut app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
         app.state.workspaces = vec![
             Workspace::test_new("child"),
             Workspace::test_new("normal"),
@@ -932,7 +961,13 @@ mod tests {
     fn api_workspace_move_noop_does_not_emit_event() {
         let event_hub = crate::api::EventHub::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        let mut app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
         app.state.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
         let moved_id = app.public_workspace_id(0);
 

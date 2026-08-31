@@ -396,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_generated_text_remains_untracked() {
+    fn forwarded_semantic_generated_text_has_no_release_lease() {
         let key = TerminalKey::new(KeyCode::Char('/'), KeyModifiers::SHIFT)
             .with_generated_text(Some("/".to_owned()))
             .with_repeat_count(3);
@@ -408,7 +408,7 @@ mod tests {
             leases.complete_press(lease_key, &key, Some(&context), Some(&context), Some(10)),
             RepeatPlan::Ignore
         ));
-        assert!(leases.is_empty());
+        assert_eq!(leases.remove_forwarded(&lease_key), None);
     }
 
     #[test]

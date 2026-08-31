@@ -43,26 +43,6 @@ pub enum RenderEncoding {
     TerminalAnsi,
 }
 
-/// Keybinding profile requested by an attached app client.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ClientKeybindings {
-    /// Use the server's own keybinding config.
-    Server,
-    /// Use this attached client's normalized local `[keys]` config.
-    Local { keys_toml: String },
-}
-
-/// Client behavior requested at connection time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ClientLaunchMode {
-    /// Full app client rendered by the server.
-    App,
-    /// Full app client eligible for audited local direct graphics.
-    AppDirectGraphics,
-    /// Direct terminal attach client.
-    TerminalAttach,
-}
-
 /// Size of the pane surface requested by a client-owned shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientSurfaceSize {
@@ -77,7 +57,7 @@ pub enum ClientKeyKind {
     Release,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ClientKeyCode {
     Backspace,
     Enter,
@@ -99,7 +79,7 @@ pub enum ClientKeyCode {
     Null,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ClientMouseButton {
     Left,
     Right,
@@ -132,6 +112,15 @@ pub enum ClientMousePosition {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientMouseGeometry {
+    pub cols: u16,
+    pub rows: u16,
+    pub width_px: u32,
+    pub height_px: u32,
+}
+
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientInputEvent {
     Key {
@@ -169,17 +158,21 @@ pub enum ClientPaneInputEvent {
         repeat_count: u16,
         shifted_codepoint: Option<u32>,
         generated_text: Option<String>,
+        tracks_release: bool,
+        physical_key_id: Option<u32>,
     },
     TextCommit(String),
     Mouse {
         kind: ClientMouseKind,
         position: ClientMousePosition,
+        geometry: Option<ClientMouseGeometry>,
         modifiers: u8,
         lines: u16,
     },
     Paste(String),
 }
 
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientKeySource {
     Synthesized,
@@ -310,6 +303,8 @@ impl ClientMouseKind {
 
 impl ClientPaneInputEvent {
     pub(crate) fn from_terminal_key(key: crate::input::TerminalKey) -> Option<Self> {
+        let tracks_release = key.generated_text.is_none() || key.has_physical_identity();
+        let physical_key_id = key.physical_key_id();
         Some(Self::Key {
             code: ClientKeyCode::from_crossterm(key.code)?,
             modifiers: key.modifiers.bits(),
@@ -317,6 +312,8 @@ impl ClientPaneInputEvent {
             repeat_count: key.repeat_count,
             shifted_codepoint: key.shifted_codepoint,
             generated_text: key.generated_text,
+            tracks_release,
+            physical_key_id,
         })
     }
 
@@ -329,6 +326,8 @@ impl ClientPaneInputEvent {
                 repeat_count,
                 shifted_codepoint,
                 generated_text,
+                tracks_release,
+                ..
             } => {
                 let mut key = crate::input::TerminalKey::new(
                     code.to_crossterm(),
@@ -336,7 +335,8 @@ impl ClientPaneInputEvent {
                 )
                 .with_kind(kind.to_crossterm())
                 .with_repeat_count(*repeat_count)
-                .with_generated_text(generated_text.clone());
+                .with_generated_text(generated_text.clone())
+                .with_physical_identity_hint(*tracks_release && generated_text.is_some());
                 if let Some(shifted_codepoint) = shifted_codepoint {
                     key = key.with_shifted_codepoint(*shifted_codepoint);
                 }
@@ -367,8 +367,8 @@ impl ClientPaneInputEvent {
     }
 }
 
+#[cfg(any(windows, test))]
 impl ClientInputEvent {
-    #[cfg(any(windows, test))]
     pub(crate) fn from_crossterm(event: crossterm::event::Event) -> Option<Self> {
         match event {
             crossterm::event::Event::Key(key) => Some(Self::Key {
@@ -441,24 +441,14 @@ impl ClientInputEvent {
 /// Messages sent from the client to the server over the client protocol socket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMessage {
-    /// Handshake: client announces its protocol version and terminal dimensions.
-    Hello {
-        /// Protocol version the client speaks.
+    /// Direct terminal handshake: announces protocol version and terminal dimensions.
+    TerminalHello {
         version: u32,
-        /// Terminal width in columns.
         cols: u16,
-        /// Terminal height in rows.
         rows: u16,
-        /// Width of a terminal cell in physical pixels, or 0 when client-side Kitty graphics are disabled.
         cell_width_px: u32,
-        /// Height of a terminal cell in physical pixels, or 0 when client-side Kitty graphics are disabled.
         cell_height_px: u32,
-        /// Render encoding requested by the client.
-        requested_encoding: RenderEncoding,
-        /// Keybinding profile requested by the client.
-        keybindings: ClientKeybindings,
-        /// Whether this connection will render the full app or attach directly to one terminal.
-        launch_mode: ClientLaunchMode,
+        pixel_mouse: bool,
     },
 
     /// Raw input bytes read from the client's stdin.
@@ -469,6 +459,8 @@ pub enum ClientMessage {
 
     /// Image bytes read from the client's local clipboard for remote paste bridging.
     ClipboardImage {
+        /// Stable terminal target selected by the client that read the clipboard.
+        target: ClientClipboardImageTarget,
         /// Image file extension without a leading dot.
         extension: String,
         /// Raw image bytes.
@@ -483,8 +475,10 @@ pub enum ClientMessage {
         rows: u16,
         /// Width of a terminal cell in physical pixels, or 0 when client-side Kitty graphics are disabled.
         cell_width_px: u32,
-        /// Height of a terminal cell in physical pixels, or 0 when client-side Kitty graphics are disabled.
+        /// Height of a terminal cell in physical pixels, or 0 when unavailable.
         cell_height_px: u32,
+        /// Whether this resize carries coherent exact geometry for SGR pixel mouse input.
+        pixel_mouse: bool,
     },
 
     /// Graceful disconnect request.
@@ -514,9 +508,6 @@ pub enum ClientMessage {
         modifiers: u8,
     },
 
-    /// Structured input events from platform clients that do not expose Unix-style raw bytes.
-    InputEvents { events: Vec<ClientInputEvent> },
-
     /// Switch this connection into read-only terminal observe mode.
     ObserveTerminal {
         /// Pane, terminal, or agent target to observe.
@@ -538,40 +529,30 @@ pub enum ClientMessage {
         success: bool,
     },
 
-    /// One confirmed SGR 1016 mouse report with read-time host geometry.
-    InputPixels {
-        data: Vec<u8>,
-        cols: u16,
-        rows: u16,
-        width_px: u32,
-        height_px: u32,
-    },
-
     /// The direct command was written and flushed; terminal response timing starts now.
     GraphicsTransmissionStarted { transfer_id: u64, image_id: u32 },
 
-    /// Experimental handshake for a client-owned shell around one pane surface.
+    /// Handshake for the client-owned shell around one pane surface.
     ClientShellHello {
         version: u32,
-        cols: u16,
-        rows: u16,
         cell_width_px: u32,
         cell_height_px: u32,
-        requested_encoding: RenderEncoding,
         surface_size: ClientSurfaceSize,
         pixel_mouse: bool,
         direct_graphics: bool,
         /// Whether the endpoint's keymap, rather than the client's, owns shell bindings.
         endpoint_keybindings: bool,
+        /// Whether this client wants shell mouse capture even without pane demand.
+        mouse_capture: bool,
     },
 
-    /// Resize the outer terminal and pane viewport of a client-owned shell.
+    /// Resize the pane viewport of a client-owned shell.
     ClientShellResize {
-        cols: u16,
-        rows: u16,
         cell_width_px: u32,
         cell_height_px: u32,
         surface_size: ClientSurfaceSize,
+        /// Whether this resize carries coherent exact geometry for SGR pixel mouse input.
+        pixel_mouse: bool,
     },
 
     /// Deliver client-classified semantic input directly to a stable pane target.
@@ -588,6 +569,80 @@ pub enum ClientMessage {
 
     /// Invoke one endpoint operation through this client shell's selected connection.
     ClientShellEndpointRequest { boot_id: String, request: String },
+
+    /// Deliver one structured mouse event to a directly attached terminal.
+    AttachMouse {
+        kind: ClientMouseKind,
+        position: ClientMousePosition,
+        geometry: Option<ClientMouseGeometry>,
+        modifiers: u8,
+        lines: u16,
+    },
+
+    /// Publish one host terminal color or appearance update observed by a client-owned shell.
+    ClientShellHostTheme { update: ClientHostThemeUpdate },
+
+    /// Publish whether the outer terminal containing a client shell has focus.
+    ClientShellFocus { focused: bool },
+
+    /// Update this client's shell mouse-capture preference after config reload.
+    ClientShellMouseCapture { enabled: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientHostColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl From<crate::terminal_theme::RgbColor> for ClientHostColor {
+    fn from(color: crate::terminal_theme::RgbColor) -> Self {
+        Self {
+            r: color.r,
+            g: color.g,
+            b: color.b,
+        }
+    }
+}
+
+impl From<ClientHostColor> for crate::terminal_theme::RgbColor {
+    fn from(color: ClientHostColor) -> Self {
+        Self {
+            r: color.r,
+            g: color.g,
+            b: color.b,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClientHostDefaultColorKind {
+    Foreground,
+    Background,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClientHostAppearance {
+    Dark,
+    Light,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClientHostThemeUpdate {
+    DefaultColor {
+        kind: ClientHostDefaultColorKind,
+        color: ClientHostColor,
+    },
+    PaletteColors(Vec<(u8, ClientHostColor)>),
+    Appearance(ClientHostAppearance),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClientClipboardImageTarget {
+    DirectTerminal,
+    Pane(String),
+    Popup(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -816,6 +871,8 @@ pub struct ClientShellSnapshot {
     pub latest_release_notes_available: bool,
     /// Whether endpoint-owned integration assets need an update.
     pub integration_updates_available: bool,
+    /// Endpoint-owned base directory used for new linked worktree checkouts.
+    pub worktree_directory: String,
     /// Cached endpoint-owned notes used by the client-rendered overlay.
     pub release_notes: Option<ClientShellReleaseNotes>,
     pub focused_workspace_id: Option<String>,
@@ -1191,9 +1248,6 @@ pub enum ServerMessage {
         error: Option<String>,
     },
 
-    /// A rendered frame to be displayed by a semantic-frame client.
-    Frame(FrameData),
-
     /// Terminal bytes to write directly for a terminal-ANSI client.
     Terminal(TerminalFrame),
 
@@ -1242,20 +1296,6 @@ pub enum ServerMessage {
         sgr_pixels: bool,
     },
 
-    /// Whether the focused terminal requests Kitty report-all keyboard input.
-    KittyKeyboardReportAll {
-        /// True only while the focused pane requests `REPORT_ALL_KEYS_AS_ESCAPE_CODES`.
-        enabled: bool,
-    },
-
-    /// Apply the prefix-mode ASCII input-source change on the foreground client.
-    /// `active = true` → switch to an ASCII-capable source (saving the current one);
-    /// `active = false` → restore the saved source.
-    PrefixInputSource {
-        /// Whether the ASCII input source should be active.
-        active: bool,
-    },
-
     /// Ring the foreground client's outer terminal for pane-originated BEL characters.
     TerminalBell {
         /// Number of BEL characters parsed from one PTY read.
@@ -1270,7 +1310,7 @@ pub enum ServerMessage {
         transfer_id: u64,
         leading: Vec<u8>,
         control: String,
-        /// ClientShell upload identity. `None` retains the released App path.
+        /// ClientShell upload identity. `None` targets a direct terminal client.
         surface_asset: Option<SurfaceGraphicsAssetKey>,
     },
 
@@ -1289,6 +1329,16 @@ pub enum ServerMessage {
 
     /// Immediate endpoint error that the client-rendered shell must show regardless of notification policy.
     ClientShellError { message: String },
+
+    /// Exact Kitty keyboard flags requested by a directly attached terminal.
+    /// Zero restores the host terminal's previous keyboard mode.
+    DirectTerminalKeyboardProtocol {
+        flags: u16,
+        modify_other_keys_level: u8,
+    },
+
+    /// Whether the focused pane or popup needs the shell host to report every key.
+    ClientShellKeyboardReportAll { enabled: bool },
 
     /// One ordered chunk of the final response to an endpoint operation.
     ClientShellEndpointResponseChunk {
@@ -1575,15 +1625,45 @@ mod tests {
 
     #[test]
     fn client_hello_roundtrip() {
-        let msg = ClientMessage::Hello {
+        let msg = ClientMessage::TerminalHello {
             version: PROTOCOL_VERSION,
             cols: 80,
             rows: 24,
             cell_width_px: 8,
             cell_height_px: 16,
-            requested_encoding: RenderEncoding::SemanticFrame,
-            keybindings: ClientKeybindings::Server,
-            launch_mode: ClientLaunchMode::App,
+            pixel_mouse: true,
+        };
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn client_shell_hello_roundtrip() {
+        let msg = ClientMessage::ClientShellHello {
+            version: PROTOCOL_VERSION,
+            cell_width_px: 8,
+            cell_height_px: 16,
+            surface_size: ClientSurfaceSize { cols: 80, rows: 29 },
+            pixel_mouse: true,
+            direct_graphics: false,
+            endpoint_keybindings: true,
+            mouse_capture: true,
+        };
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn client_shell_resize_roundtrip() {
+        let msg = ClientMessage::ClientShellResize {
+            cell_width_px: 8,
+            cell_height_px: 16,
+            surface_size: ClientSurfaceSize { cols: 74, rows: 29 },
+            pixel_mouse: true,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
@@ -1603,7 +1683,7 @@ mod tests {
     }
 
     #[test]
-    fn client_message_wire_tags_preserve_protocol_15_order() {
+    fn client_message_wire_tags_reflect_current_order() {
         fn tag(msg: &ClientMessage) -> u8 {
             *bincode::serde::encode_to_vec(msg, bincode::config::standard())
                 .unwrap()
@@ -1612,21 +1692,33 @@ mod tests {
         }
 
         assert_eq!(
-            tag(&ClientMessage::Hello {
+            tag(&ClientMessage::TerminalHello {
                 version: PROTOCOL_VERSION,
                 cols: 80,
                 rows: 24,
                 cell_width_px: 8,
                 cell_height_px: 16,
-                requested_encoding: RenderEncoding::SemanticFrame,
-                keybindings: ClientKeybindings::Server,
-                launch_mode: ClientLaunchMode::App,
+                pixel_mouse: false,
             }),
             0
+        );
+        assert_eq!(
+            tag(&ClientMessage::ClientShellHello {
+                version: PROTOCOL_VERSION,
+                cell_width_px: 8,
+                cell_height_px: 16,
+                surface_size: ClientSurfaceSize { cols: 80, rows: 29 },
+                pixel_mouse: false,
+                direct_graphics: false,
+                endpoint_keybindings: false,
+                mouse_capture: false,
+            }),
+            11
         );
         assert_eq!(tag(&ClientMessage::Input { data: Vec::new() }), 1);
         assert_eq!(
             tag(&ClientMessage::ClipboardImage {
+                target: ClientClipboardImageTarget::DirectTerminal,
                 extension: "png".to_owned(),
                 data: Vec::new(),
             }),
@@ -1638,6 +1730,7 @@ mod tests {
                 rows: 24,
                 cell_width_px: 8,
                 cell_height_px: 16,
+                pixel_mouse: false,
             }),
             3
         );
@@ -1660,84 +1753,40 @@ mod tests {
             }),
             6
         );
-        assert_eq!(tag(&ClientMessage::InputEvents { events: Vec::new() }), 7);
         assert_eq!(
             tag(&ClientMessage::ObserveTerminal {
                 target: "w1:p1".to_owned(),
             }),
-            8
+            7
         );
         assert_eq!(
             tag(&ClientMessage::ControlTerminal {
                 target: "w1:p1".to_owned(),
                 takeover: false,
             }),
-            9
+            8
         );
-    }
-
-    #[test]
-    fn client_input_events_roundtrip() {
-        let msg = ClientMessage::InputEvents {
-            events: vec![
-                ClientInputEvent::Key {
-                    code: ClientKeyCode::Char('N'),
-                    modifiers: crossterm::event::KeyModifiers::SHIFT.bits(),
-                    kind: ClientKeyKind::Press,
-
-                    repeat_count: 1,
-                    generated_text: None,
-                    source: crate::protocol::ClientKeySource::Synthesized,
-                },
-                ClientInputEvent::Key {
-                    code: ClientKeyCode::Backspace,
-                    modifiers: 0,
-                    kind: ClientKeyKind::Press,
-                    repeat_count: 3,
-                    generated_text: None,
-                    source: crate::protocol::ClientKeySource::Vt {
-                        bytes: b"\x1b[127;1u".to_vec(),
-                    },
-                },
-                ClientInputEvent::Key {
-                    code: ClientKeyCode::Esc,
-                    modifiers: 0,
-                    kind: ClientKeyKind::Release,
-                    repeat_count: 1,
-                    generated_text: None,
-                    source: crate::protocol::ClientKeySource::WindowsConsole {
-                        record: crate::input::WindowsKeyRecord {
-                            key_down: false,
-                            repeat_count: 1,
-                            virtual_key_code: 27,
-                            virtual_scan_code: 1,
-                            unicode: 27,
-                            control_key_state: 0,
-                        },
-                    },
-                },
-                ClientInputEvent::TextCommit("你🙂".to_owned()),
-                ClientInputEvent::Mouse {
-                    kind: ClientMouseKind::Down(ClientMouseButton::Left),
-                    column: 3,
-                    row: 4,
-                    modifiers: 0,
-                },
-            ],
-        };
-        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
-        // Freeze the protocol 20 input envelope before it is published.
         assert_eq!(
-            encoded,
-            vec![
-                7, 5, 0, 15, 78, 1, 0, 1, 0, 0, 0, 0, 0, 0, 3, 0, 1, 8, 27, 91, 49, 50, 55, 59, 49,
-                117, 0, 14, 0, 2, 1, 0, 2, 0, 1, 27, 1, 27, 0, 1, 7, 228, 189, 160, 240, 159, 153,
-                130, 2, 0, 0, 3, 4, 0,
-            ]
+            tag(&ClientMessage::AttachMouse {
+                kind: ClientMouseKind::Down(ClientMouseButton::Left),
+                position: ClientMousePosition::Cell { column: 10, row: 5 },
+                geometry: None,
+                modifiers: 0,
+                lines: 1,
+            }),
+            16
         );
-        let (decoded, _): (ClientMessage, _) =
-            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
-        assert_eq!(msg, decoded);
+        assert_eq!(
+            tag(&ClientMessage::ClientShellHostTheme {
+                update: ClientHostThemeUpdate::Appearance(ClientHostAppearance::Dark),
+            }),
+            17
+        );
+        assert_eq!(tag(&ClientMessage::ClientShellFocus { focused: true }), 18);
+        assert_eq!(
+            tag(&ClientMessage::ClientShellMouseCapture { enabled: true }),
+            19
+        );
     }
 
     #[test]
@@ -1751,6 +1800,8 @@ mod tests {
                 repeat_count: 1,
                 shifted_codepoint: Some('L' as u32),
                 generated_text: None,
+                tracks_release: true,
+                physical_key_id: None,
             }],
         };
         let encoded = bincode::serde::encode_to_vec(&message, bincode::config::standard())
@@ -1767,6 +1818,84 @@ mod tests {
         };
         assert_eq!(key.shifted_codepoint, Some('L' as u32));
         assert_eq!(key.kind, crossterm::event::KeyEventKind::Release);
+    }
+
+    #[test]
+    fn client_shell_key_roundtrip_preserves_physical_generated_text_encoding() {
+        let key = crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Char('/'),
+            crossterm::event::KeyModifiers::SHIFT,
+        )
+        .with_generated_text(Some("/".into()))
+        .with_windows_record(crate::input::WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x37,
+            virtual_scan_code: 0x08,
+            unicode: '/' as u16,
+            control_key_state: 0,
+        });
+        let event = ClientPaneInputEvent::from_terminal_key(key).expect("semantic pane key");
+        assert!(matches!(
+            event,
+            ClientPaneInputEvent::Key {
+                tracks_release: true,
+                ..
+            }
+        ));
+        let crate::raw_input::RawInputEvent::Key(roundtripped) = event.to_raw_input_event() else {
+            panic!("pane key should remain a key");
+        };
+
+        assert!(roundtripped.has_physical_identity());
+        let encoded = crate::input::encode_terminal_key(
+            roundtripped,
+            crate::input::KeyboardProtocol::Kitty { flags: 8 },
+        );
+        assert_ne!(encoded, b"/");
+        assert!(encoded.starts_with(b"\x1b["));
+    }
+
+    #[test]
+    fn client_shell_focus_roundtrip() {
+        let message = ClientMessage::ClientShellFocus { focused: false };
+        let encoded = bincode::serde::encode_to_vec(&message, bincode::config::standard())
+            .expect("encode client shell focus");
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+                .expect("decode client shell focus");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn client_shell_mouse_capture_roundtrip() {
+        let message = ClientMessage::ClientShellMouseCapture { enabled: false };
+        let encoded = bincode::serde::encode_to_vec(&message, bincode::config::standard())
+            .expect("encode client shell mouse capture");
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+                .expect("decode client shell mouse capture");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn client_shell_host_theme_roundtrip() {
+        let message = ClientMessage::ClientShellHostTheme {
+            update: ClientHostThemeUpdate::PaletteColors(vec![(
+                4,
+                ClientHostColor {
+                    r: 10,
+                    g: 20,
+                    b: 30,
+                },
+            )]),
+        };
+        let encoded = bincode::serde::encode_to_vec(&message, bincode::config::standard())
+            .expect("encode host theme update");
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+                .expect("decode host theme update");
+        assert_eq!(decoded, message);
     }
 
     #[test]
@@ -1795,83 +1924,10 @@ mod tests {
                 .expect("decode endpoint response");
         assert_eq!(decoded, response);
     }
-
-    #[test]
-    fn wire_release_cannot_restore_a_grouped_repeat_count() {
-        let event = ClientInputEvent::Key {
-            code: ClientKeyCode::Esc,
-            modifiers: 0,
-            kind: ClientKeyKind::Release,
-            repeat_count: 3,
-            generated_text: Some("ignored".to_owned()),
-            source: ClientKeySource::Synthesized,
-        };
-
-        match event.to_raw_input_event() {
-            crate::raw_input::RawInputEvent::Key(key) => {
-                assert_eq!(key.kind, crossterm::event::KeyEventKind::Release);
-                assert_eq!(key.repeat_count, 1);
-                assert_eq!(key.generated_text, None);
-            }
-            other => panic!("expected key event, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn client_input_events_convert_to_raw_keys() {
-        let record = crate::input::WindowsKeyRecord {
-            key_down: false,
-            repeat_count: 1,
-            virtual_key_code: 78,
-            virtual_scan_code: 49,
-            unicode: 78,
-            control_key_state: 16,
-        };
-        let shifted = ClientInputEvent::Key {
-            code: ClientKeyCode::Char('N'),
-            modifiers: crossterm::event::KeyModifiers::SHIFT.bits(),
-            kind: ClientKeyKind::Press,
-            repeat_count: 1,
-            generated_text: None,
-            source: ClientKeySource::WindowsConsole { record },
-        }
-        .to_raw_input_event();
-        match shifted {
-            crate::raw_input::RawInputEvent::Key(key) => {
-                assert_eq!(key.code, crossterm::event::KeyCode::Char('N'));
-                assert_eq!(key.modifiers, crossterm::event::KeyModifiers::SHIFT);
-                assert_eq!(key.kind, crossterm::event::KeyEventKind::Press);
-                assert_eq!(
-                    key.windows_record().map(|record| record.key_down),
-                    Some(false)
-                );
-            }
-            other => panic!("expected shifted key event, got {other:?}"),
-        }
-
-        let backspace = ClientInputEvent::Key {
-            code: ClientKeyCode::Backspace,
-            modifiers: 0,
-            kind: ClientKeyKind::Press,
-
-            repeat_count: 1,
-            generated_text: None,
-            source: crate::protocol::ClientKeySource::Synthesized,
-        }
-        .to_raw_input_event();
-        match backspace {
-            crate::raw_input::RawInputEvent::Key(key) => {
-                assert_eq!(key.code, crossterm::event::KeyCode::Backspace);
-                assert_eq!(key.modifiers, crossterm::event::KeyModifiers::empty());
-                assert_eq!(key.kind, crossterm::event::KeyEventKind::Press);
-            }
-            other => panic!("expected backspace key event, got {other:?}"),
-        }
-    }
-
     #[test]
     fn client_clipboard_image_roundtrip() {
         let msg = ClientMessage::ClipboardImage {
+            target: ClientClipboardImageTarget::Pane("w1:p1".into()),
             extension: "png".to_owned(),
             data: vec![0x89, b'P', b'N', b'G'],
         };
@@ -1905,6 +1961,7 @@ mod tests {
             rows: 24,
             cell_width_px: 8,
             cell_height_px: 16,
+            pixel_mouse: true,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
@@ -2065,17 +2122,28 @@ mod tests {
             hyperlinks: vec!["https://example.com".to_owned()],
             graphics: Vec::new(),
         };
-        let msg = ServerMessage::Frame(frame.clone());
+        let msg = ServerMessage::PaneSurface(PaneSurfaceFrame {
+            boot_id: "boot-1".into(),
+            projection_revision: 1,
+            frame: frame.clone(),
+            panes: Vec::new(),
+            splits: Vec::new(),
+            popup: None,
+            graphics: SurfaceGraphicsScene::default(),
+        });
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ServerMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(msg, decoded);
         match decoded {
-            ServerMessage::Frame(frame) => {
-                assert_eq!(frame.cells[2].hyperlink, Some(0));
-                assert_eq!(frame.hyperlinks, vec!["https://example.com".to_owned()]);
+            ServerMessage::PaneSurface(surface) => {
+                assert_eq!(surface.frame.cells[2].hyperlink, Some(0));
+                assert_eq!(
+                    surface.frame.hyperlinks,
+                    vec!["https://example.com".to_owned()]
+                );
             }
-            other => panic!("expected frame, got {other:?}"),
+            other => panic!("expected pane surface, got {other:?}"),
         }
     }
 
@@ -2097,6 +2165,7 @@ mod tests {
             server_keybindings_toml: Some("[keys]\nprefix = \"ctrl+a\"\n".into()),
             latest_release_notes_available: true,
             integration_updates_available: true,
+            worktree_directory: "/tmp/herdr-worktrees".into(),
             release_notes: Some(ClientShellReleaseNotes {
                 version: "0.8.3".into(),
                 body: "### New\n- Update ready".into(),
@@ -2280,8 +2349,20 @@ mod tests {
     }
 
     #[test]
-    fn server_kitty_keyboard_report_all_roundtrip() {
-        let msg = ServerMessage::KittyKeyboardReportAll { enabled: true };
+    fn client_shell_keyboard_report_all_roundtrip() {
+        let msg = ServerMessage::ClientShellKeyboardReportAll { enabled: true };
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ServerMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn direct_terminal_keyboard_mode_roundtrip() {
+        let msg = ServerMessage::DirectTerminalKeyboardProtocol {
+            flags: 15,
+            modify_other_keys_level: 1,
+        };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ServerMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
@@ -2313,29 +2394,6 @@ mod tests {
         let (decoded, _): (ServerMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(server, decoded);
-
-        let pixels = ClientMessage::InputPixels {
-            data: b"\x1b[<35;321;241M".to_vec(),
-            cols: 80,
-            rows: 24,
-            width_px: 800,
-            height_px: 480,
-        };
-        let encoded = bincode::serde::encode_to_vec(&pixels, bincode::config::standard()).unwrap();
-        let (decoded, _): (ClientMessage, _) =
-            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
-        assert_eq!(pixels, decoded);
-    }
-
-    #[test]
-    fn server_prefix_input_source_roundtrip() {
-        for active in [true, false] {
-            let msg = ServerMessage::PrefixInputSource { active };
-            let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
-            let (decoded, _): (ServerMessage, _) =
-                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
-            assert_eq!(msg, decoded);
-        }
     }
 
     #[test]
@@ -2351,15 +2409,13 @@ mod tests {
 
     #[test]
     fn framing_small_message_roundtrip() {
-        let msg = ClientMessage::Hello {
+        let msg = ClientMessage::TerminalHello {
             version: PROTOCOL_VERSION,
             cols: 80,
             rows: 24,
             cell_width_px: 8,
             cell_height_px: 16,
-            requested_encoding: RenderEncoding::SemanticFrame,
-            keybindings: ClientKeybindings::Server,
-            launch_mode: ClientLaunchMode::App,
+            pixel_mouse: false,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -2369,7 +2425,7 @@ mod tests {
 
     #[test]
     fn framing_large_payload_roundtrip() {
-        // Create a Frame message that is ≥128 KB.
+        // Create a pane-surface message that is ≥128 KB.
         // Use a large frame with verbose cell data to exceed 128 KB after bincode encoding.
         // 200×50 = 10000 cells. With varied symbols and styles, this should easily exceed 128 KB.
         let width: u16 = 200;
@@ -2402,7 +2458,15 @@ mod tests {
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
         };
-        let msg = ServerMessage::Frame(frame);
+        let msg = ServerMessage::PaneSurface(PaneSurfaceFrame {
+            boot_id: "boot-1".into(),
+            projection_revision: 1,
+            frame,
+            panes: Vec::new(),
+            splits: Vec::new(),
+            popup: None,
+            graphics: SurfaceGraphicsScene::default(),
+        });
 
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -2425,20 +2489,19 @@ mod tests {
 
         for i in 0..150u32 {
             let msg = match i % 5 {
-                0 => ClientMessage::Hello {
+                0 => ClientMessage::TerminalHello {
                     version: PROTOCOL_VERSION,
                     cols: (80 + (i % 40) as u16),
                     rows: (24 + (i % 20) as u16),
                     cell_width_px: 8,
                     cell_height_px: 16,
-                    requested_encoding: RenderEncoding::SemanticFrame,
-                    keybindings: ClientKeybindings::Server,
-                    launch_mode: ClientLaunchMode::App,
+                    pixel_mouse: i % 2 == 0,
                 },
                 1 => ClientMessage::Input {
                     data: vec![(i % 256) as u8; (i as usize % 50) + 1],
                 },
                 2 => ClientMessage::ClipboardImage {
+                    target: ClientClipboardImageTarget::DirectTerminal,
                     extension: "png".to_owned(),
                     data: vec![0x89, b'P', b'N', b'G', (i % 256) as u8],
                 },
@@ -2447,6 +2510,7 @@ mod tests {
                     rows: (30 + (i % 10) as u16),
                     cell_width_px: 8,
                     cell_height_px: 16,
+                    pixel_mouse: i % 2 == 0,
                 },
                 4 => ClientMessage::Detach,
                 _ => unreachable!(),
@@ -2861,15 +2925,13 @@ mod tests {
     #[test]
     fn read_message_accepts_exact_payload() {
         // A normally-framed message should decode without error.
-        let msg = ClientMessage::Hello {
+        let msg = ClientMessage::TerminalHello {
             version: PROTOCOL_VERSION,
             cols: 80,
             rows: 24,
             cell_width_px: 8,
             cell_height_px: 16,
-            requested_encoding: RenderEncoding::SemanticFrame,
-            keybindings: ClientKeybindings::Server,
-            launch_mode: ClientLaunchMode::App,
+            pixel_mouse: false,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -2897,20 +2959,19 @@ mod tests {
         let (mut a, mut b) = UnixStream::pair().expect("socketpair");
 
         let messages = vec![
-            ClientMessage::Hello {
+            ClientMessage::TerminalHello {
                 version: PROTOCOL_VERSION,
                 cols: 200,
                 rows: 60,
                 cell_width_px: 8,
                 cell_height_px: 16,
-                requested_encoding: RenderEncoding::SemanticFrame,
-                keybindings: ClientKeybindings::Server,
-                launch_mode: ClientLaunchMode::App,
+                pixel_mouse: true,
             },
             ClientMessage::Input {
                 data: b"hello world".to_vec(),
             },
             ClientMessage::ClipboardImage {
+                target: ClientClipboardImageTarget::DirectTerminal,
                 extension: "png".to_owned(),
                 data: vec![0x89, b'P', b'N', b'G'],
             },
@@ -2919,6 +2980,7 @@ mod tests {
                 rows: 30,
                 cell_width_px: 8,
                 cell_height_px: 16,
+                pixel_mouse: true,
             },
             ClientMessage::Detach,
         ];

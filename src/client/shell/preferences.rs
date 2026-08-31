@@ -7,7 +7,7 @@ static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(super) struct ClientChromePreferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) sidebar_width: Option<u16>,
@@ -17,6 +17,8 @@ pub(super) struct ClientChromePreferences {
     pub(super) sidebar_collapsed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) agent_panel_sort: Option<crate::config::AgentPanelSortConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) collapsed_groups: Vec<String>,
 }
 
 pub(super) fn path_for_local_endpoint(socket_path: &Path) -> PathBuf {

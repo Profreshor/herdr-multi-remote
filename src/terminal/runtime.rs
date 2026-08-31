@@ -245,11 +245,6 @@ impl TerminalRuntime {
         self.0.agent_detection_reset_notify_for_test()
     }
 
-    #[cfg(test)]
-    pub(crate) fn agent_detection_enabled_for_test(&self) -> bool {
-        self.0.agent_detection_enabled_for_test()
-    }
-
     pub fn set_full_lifecycle_authority_active(&self, active: bool) {
         self.0.set_full_lifecycle_authority_active(active);
     }
@@ -283,14 +278,6 @@ impl TerminalRuntime {
         self.0.scroll_metrics()
     }
 
-    pub(crate) fn search_text_matches(
-        &self,
-        query: &str,
-        case_sensitive: bool,
-    ) -> Vec<crate::pane::TerminalTextMatch> {
-        self.0.search_text_matches(query, case_sensitive)
-    }
-
     pub(crate) fn search_text_window(
         &self,
         query: &str,
@@ -305,17 +292,6 @@ impl TerminalRuntime {
     ) -> crate::pane::TerminalSearchWindow {
         self.0
             .search_text_window(query, case_sensitive, direction, cursor, previous, limit)
-    }
-
-    pub(crate) fn text_match_is_current(&self, text_match: crate::pane::TerminalTextMatch) -> bool {
-        self.0.text_match_is_current(text_match)
-    }
-
-    pub(crate) fn text_matches_are_current(
-        &self,
-        text_matches: &[crate::pane::TerminalTextMatch],
-    ) -> Vec<bool> {
-        self.0.text_matches_are_current(text_matches)
     }
 
     pub(crate) fn word_motion_target(
@@ -337,19 +313,6 @@ impl TerminalRuntime {
         direction: i8,
     ) -> Option<crate::pane::TerminalTextPoint> {
         self.0.paragraph_motion_target(row, direction)
-    }
-
-    /// Collects the complete terminal input-mode snapshot.
-    ///
-    /// This performs multiple terminal queries. Keep it out of render/layout
-    /// and pane-scaled loops; add a narrow accessor when one fact is needed.
-    #[cfg(test)]
-    pub fn input_state(&self) -> Option<crate::pane::InputState> {
-        self.0.input_state()
-    }
-
-    pub fn keyboard_report_all_requested(&self) -> bool {
-        self.0.keyboard_report_all_requested()
     }
 
     pub fn bracketed_paste_enabled(&self) -> bool {
@@ -448,14 +411,6 @@ impl TerminalRuntime {
         self.0.render(frame, area, show_cursor);
     }
 
-    pub(crate) fn collect_dirty_patch(
-        &self,
-        area_width: u16,
-        area_height: u16,
-    ) -> crate::pane::TerminalDirtyPatchOutcome {
-        self.0.collect_dirty_patch(area_width, area_height)
-    }
-
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
         self.0.visible_hyperlinks(area)
     }
@@ -472,6 +427,10 @@ impl TerminalRuntime {
 
     pub fn keyboard_protocol(&self) -> crate::input::KeyboardProtocol {
         self.0.keyboard_protocol()
+    }
+
+    pub fn modify_other_keys_level(&self) -> u8 {
+        self.0.modify_other_keys_level()
     }
 
     pub fn encode_terminal_key(&self, key: crate::input::TerminalKey) -> Vec<u8> {

@@ -3,6 +3,106 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 
 use crate::protocol::{AttachScrollDirection, AttachScrollSource, ClientPaneInputEvent};
 
+pub(super) fn downgrade_ineligible_pixel_mouse(
+    events: &mut [ClientPaneInputEvent],
+    pixel_mouse: bool,
+    runtime_size: (u16, u16),
+    runtime_pixels: Option<(u32, u32)>,
+) {
+    let (runtime_rows, runtime_cols) = runtime_size;
+    for event in events {
+        let ClientPaneInputEvent::Mouse {
+            position, geometry, ..
+        } = event
+        else {
+            continue;
+        };
+        let crate::protocol::ClientMousePosition::Pixels { x, y, column, row } = *position else {
+            continue;
+        };
+        let exact = pixel_mouse
+            && geometry.is_some_and(|geometry| {
+                (runtime_rows, runtime_cols) == (geometry.rows, geometry.cols)
+                    && runtime_pixels == Some((geometry.width_px, geometry.height_px))
+                    && column < geometry.cols
+                    && row < geometry.rows
+                    && x > 0
+                    && y > 0
+                    && x <= geometry.width_px
+                    && y <= geometry.height_px
+            });
+        if !exact {
+            *position = crate::protocol::ClientMousePosition::Cell { column, row };
+            *geometry = None;
+        }
+    }
+}
+
+pub(super) fn terminal_attach_mouse_position(
+    runtime: &crate::terminal::TerminalRuntime,
+    terminal_size: (u16, u16),
+    cell_size: crate::kitty_graphics::HostCellSize,
+    pixel_mouse: bool,
+    host_sgr_pixels_active: bool,
+    position: crate::protocol::ClientMousePosition,
+    geometry: Option<crate::protocol::ClientMouseGeometry>,
+) -> Option<crate::protocol::ClientMousePosition> {
+    let runtime_size = runtime.current_size();
+    let cell_fallback = |column, row| {
+        (column < runtime_size.1 && row < runtime_size.0)
+            .then_some(crate::protocol::ClientMousePosition::Cell { column, row })
+    };
+    let (x, y, column, row) = match position {
+        crate::protocol::ClientMousePosition::Cell { column, row } => {
+            return cell_fallback(column, row);
+        }
+        crate::protocol::ClientMousePosition::Pixels { x, y, column, row } => (x, y, column, row),
+    };
+    let Some(geometry) = geometry else {
+        return cell_fallback(column, row);
+    };
+    let host_geometry = crate::input::mouse::HostGeometry::new(
+        geometry.cols,
+        geometry.rows,
+        geometry.width_px,
+        geometry.height_px,
+    )?;
+    if host_geometry.cell(x, y) != Some((column, row)) {
+        return None;
+    }
+    let exact = (|| {
+        let average_width = (geometry.width_px / u32::from(geometry.cols)).max(1);
+        let average_height = (geometry.height_px / u32::from(geometry.rows)).max(1);
+        let (child_width_px, child_height_px) = runtime.pixel_size()?;
+        if !pixel_mouse
+            || !host_sgr_pixels_active
+            || !runtime.sgr_pixel_mouse_enabled()
+            || terminal_size != (geometry.cols, geometry.rows)
+            || runtime_size != (geometry.rows, geometry.cols)
+            || !cell_size.is_known()
+            || average_width != cell_size.width_px
+            || average_height != cell_size.height_px
+        {
+            return None;
+        }
+        let crate::input::mouse::Position::Pixels { x, y } = (crate::input::mouse::HostPixels {
+            x,
+            y,
+            geometry: host_geometry,
+        })
+        .pane_position(
+            ratatui::layout::Rect::new(0, 0, geometry.cols, geometry.rows),
+            child_width_px,
+            child_height_px,
+        )?
+        else {
+            return None;
+        };
+        Some(crate::protocol::ClientMousePosition::Pixels { x, y, column, row })
+    })();
+    exact.or_else(|| cell_fallback(column, row))
+}
+
 pub(super) fn apply_terminal_attach_scroll(
     runtime: &crate::terminal::TerminalRuntime,
     source: AttachScrollSource,
@@ -125,6 +225,7 @@ fn apply_client_terminal_input_events(
             position,
             modifiers,
             lines,
+            ..
         } = event
         {
             let kind = kind.to_crossterm();
@@ -242,4 +343,173 @@ fn apply_client_terminal_input_events(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn terminal_attach_stale_geometry_falls_back_to_the_canonical_cell() {
+        let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"");
+        let position = crate::protocol::ClientMousePosition::Pixels {
+            x: 121,
+            y: 81,
+            column: 12,
+            row: 4,
+        };
+
+        assert_eq!(
+            terminal_attach_mouse_position(
+                &runtime,
+                (20, 5),
+                crate::kitty_graphics::HostCellSize {
+                    width_px: 10,
+                    height_px: 20,
+                },
+                true,
+                false,
+                position,
+                Some(crate::protocol::ClientMouseGeometry {
+                    cols: 20,
+                    rows: 5,
+                    width_px: 200,
+                    height_px: 100,
+                }),
+            ),
+            Some(crate::protocol::ClientMousePosition::Cell { column: 12, row: 4 })
+        );
+        assert_eq!(
+            terminal_attach_mouse_position(
+                &runtime,
+                (20, 5),
+                crate::kitty_graphics::HostCellSize {
+                    width_px: 10,
+                    height_px: 20,
+                },
+                true,
+                false,
+                crate::protocol::ClientMousePosition::Pixels {
+                    x: 120,
+                    y: 80,
+                    column: 12,
+                    row: 4,
+                },
+                Some(crate::protocol::ClientMouseGeometry {
+                    cols: 20,
+                    rows: 5,
+                    width_px: 200,
+                    height_px: 100,
+                }),
+            ),
+            None
+        );
+        assert_eq!(
+            terminal_attach_mouse_position(
+                &runtime,
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                false,
+                false,
+                crate::protocol::ClientMousePosition::Cell { column: 12, row: 4 },
+                None,
+            ),
+            Some(crate::protocol::ClientMousePosition::Cell { column: 12, row: 4 })
+        );
+    }
+
+    #[test]
+    fn ineligible_shell_pixel_mouse_uses_its_canonical_cell_position() {
+        let mut events = vec![ClientPaneInputEvent::Mouse {
+            kind: crate::protocol::ClientMouseKind::Down(crate::protocol::ClientMouseButton::Left),
+            position: crate::protocol::ClientMousePosition::Pixels {
+                x: 121,
+                y: 81,
+                column: 12,
+                row: 4,
+            },
+            geometry: Some(crate::protocol::ClientMouseGeometry {
+                cols: 20,
+                rows: 5,
+                width_px: 200,
+                height_px: 100,
+            }),
+            modifiers: 0,
+            lines: 1,
+        }];
+
+        downgrade_ineligible_pixel_mouse(&mut events, false, (5, 20), Some((200, 100)));
+
+        assert!(matches!(
+            events.as_slice(),
+            [ClientPaneInputEvent::Mouse {
+                position: crate::protocol::ClientMousePosition::Cell { column: 12, row: 4 },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn eligible_shell_pixel_mouse_remains_exact() {
+        let position = crate::protocol::ClientMousePosition::Pixels {
+            x: 121,
+            y: 81,
+            column: 12,
+            row: 4,
+        };
+        let mut events = vec![ClientPaneInputEvent::Mouse {
+            kind: crate::protocol::ClientMouseKind::Moved,
+            position,
+            geometry: Some(crate::protocol::ClientMouseGeometry {
+                cols: 20,
+                rows: 5,
+                width_px: 200,
+                height_px: 100,
+            }),
+            modifiers: 0,
+            lines: 1,
+        }];
+
+        downgrade_ineligible_pixel_mouse(&mut events, true, (5, 20), Some((200, 100)));
+
+        assert!(matches!(
+            events.as_slice(),
+            [ClientPaneInputEvent::Mouse {
+                position: current,
+                ..
+            }] if *current == position
+        ));
+    }
+
+    #[test]
+    fn stale_shell_pixel_geometry_downgrades_to_its_canonical_cell() {
+        let mut events = vec![ClientPaneInputEvent::Mouse {
+            kind: crate::protocol::ClientMouseKind::Moved,
+            position: crate::protocol::ClientMousePosition::Pixels {
+                x: 121,
+                y: 81,
+                column: 12,
+                row: 4,
+            },
+            geometry: Some(crate::protocol::ClientMouseGeometry {
+                cols: 20,
+                rows: 5,
+                width_px: 200,
+                height_px: 100,
+            }),
+            modifiers: 0,
+            lines: 1,
+        }];
+
+        downgrade_ineligible_pixel_mouse(&mut events, true, (6, 20), Some((200, 120)));
+
+        assert!(matches!(
+            events.as_slice(),
+            [ClientPaneInputEvent::Mouse {
+                position: crate::protocol::ClientMousePosition::Cell { column: 12, row: 4 },
+                geometry: None,
+                ..
+            }]
+        ));
+    }
 }

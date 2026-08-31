@@ -1,6 +1,8 @@
 use super::*;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
+const SELECTION_AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(30);
+
 impl ClientShellState {
     fn set_sidebar_width_from_column(&mut self, column: u16, outcome: &mut ClientShellInput) {
         let (min, max) = crate::config::validated_sidebar_bounds(
@@ -249,7 +251,7 @@ impl ClientShellState {
             max_offset_from_bottom: metrics.max_offset_from_bottom,
         });
         self.selection_autoscroll_deadline =
-            Some(std::time::Instant::now() + crate::app::SELECTION_AUTOSCROLL_INTERVAL);
+            Some(std::time::Instant::now() + SELECTION_AUTOSCROLL_INTERVAL);
     }
 
     fn scroll_in_progress_selection(
@@ -368,7 +370,7 @@ impl ClientShellState {
         );
         self.push_pane_scroll_offset(autoscroll.pane_id.clone(), next_offset, &mut outcome);
         self.selection_autoscroll = Some(autoscroll);
-        self.selection_autoscroll_deadline = Some(now + crate::app::SELECTION_AUTOSCROLL_INTERVAL);
+        self.selection_autoscroll_deadline = Some(now + SELECTION_AUTOSCROLL_INTERVAL);
         outcome.repaint = true;
         outcome
     }
@@ -726,6 +728,44 @@ impl ClientShellState {
             }
             return;
         }
+        if self.url_click_consumes_until_up {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => return,
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.url_click_consumes_until_up = false;
+                    return;
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.url_click_consumes_until_up = false;
+                }
+                _ => {}
+            }
+        }
+        if !self.replaying_url_click
+            && matches!(
+                mouse.kind,
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+            )
+        {
+            if let Some(fallback_events) =
+                self.pending_requests
+                    .values_mut()
+                    .find_map(|pending| match &mut pending.kind {
+                        PendingEndpointKind::PaneLinkActivate {
+                            fallback_events, ..
+                        } if !fallback_events
+                            .iter()
+                            .any(|event| event.kind == MouseEventKind::Up(MouseButton::Left)) =>
+                        {
+                            Some(fallback_events)
+                        }
+                        _ => None,
+                    })
+            {
+                fallback_events.push(mouse);
+                return;
+            }
+        }
         if let Some(gesture) = self.pane_mouse_gesture.as_ref() {
             let gesture_event = matches!(
                 mouse.kind,
@@ -749,6 +789,11 @@ impl ClientShellState {
                         .cloned()
                 }
                 .unwrap_or_else(|| gesture.hit.clone());
+                let position = self.pane_mouse_position(&hit, mouse);
+                if let Some(gesture) = self.pane_mouse_gesture.as_mut() {
+                    gesture.last_event = mouse;
+                    gesture.last_position = position;
+                }
                 self.push_pane_mouse_event(&hit, mouse, modifiers, outcome);
                 if mouse.kind == MouseEventKind::Up(button) {
                     self.pane_mouse_gesture = None;
@@ -772,9 +817,11 @@ impl ClientShellState {
                         self.push_pane_mouse_event(&hit, mouse, mouse.modifiers, outcome);
                         if hit.mouse_reporting {
                             self.pane_mouse_gesture = Some(ClientPaneMouseGesture {
+                                last_position: self.pane_mouse_position(&hit, mouse),
                                 hit,
                                 button,
                                 stripped_modifiers: crossterm::event::KeyModifiers::empty(),
+                                last_event: mouse,
                             });
                         }
                     }
@@ -794,6 +841,57 @@ impl ClientShellState {
         }
         if self.popup_terminal_id.is_some() {
             return;
+        }
+        if !self.replaying_url_click
+            && self.overlay.is_none()
+            && self.mode == ClientShellMode::Terminal
+            && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            && mouse
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+        {
+            if let Some(hit) = self
+                .hits
+                .panes
+                .iter()
+                .find(|hit| super::contains(hit.inner_rect, point))
+                .cloned()
+            {
+                let viewport_row = mouse.row.saturating_sub(hit.inner_rect.y);
+                let col = mouse.column.saturating_sub(hit.inner_rect.x);
+                let content_revision = self
+                    .pane_surface
+                    .as_ref()
+                    .and_then(|surface| {
+                        surface
+                            .panes
+                            .iter()
+                            .find(|pane| pane.pane_id == hit.pane_id)
+                    })
+                    .map(|pane| pane.content_revision);
+                self.last_pane_click = None;
+                let pane_id = hit.pane_id.clone();
+                self.push_endpoint_method_with_kind(
+                    crate::api::schema::Method::PaneLinkActivate(
+                        crate::api::schema::PaneLinkActivateParams {
+                            pane_id: pane_id.clone(),
+                            viewport_row,
+                            col,
+                            content_revision,
+                            offset_from_bottom: hit
+                                .scroll
+                                .map(|metrics| metrics.offset_from_bottom as u64),
+                        },
+                    ),
+                    PendingEndpointKind::PaneLinkActivate {
+                        pane_id,
+                        inner_rect: hit.inner_rect,
+                        fallback_events: vec![mouse],
+                    },
+                    outcome,
+                );
+                return;
+            }
         }
         if self.overlay.is_none()
             && self.mode == ClientShellMode::Terminal
@@ -1625,9 +1723,11 @@ impl ClientShellState {
                             outcome,
                         );
                         self.pane_mouse_gesture = Some(ClientPaneMouseGesture {
+                            last_position: self.pane_mouse_position(&hit, mouse),
                             hit,
                             button: MouseButton::Right,
                             stripped_modifiers,
+                            last_event: mouse,
                         });
                         return;
                     }
@@ -1899,6 +1999,7 @@ impl ClientShellState {
                                 self.collapsed_groups.insert(key.clone());
                             }
                             outcome.repaint = true;
+                            self.persist_chrome_preferences(outcome);
                             return;
                         }
                     }
@@ -2035,9 +2136,11 @@ impl ClientShellState {
                     if hit.mouse_reporting && super::contains(hit.inner_rect, point) {
                         self.push_pane_mouse_event(&hit, mouse, mouse.modifiers, outcome);
                         self.pane_mouse_gesture = Some(ClientPaneMouseGesture {
+                            last_position: self.pane_mouse_position(&hit, mouse),
                             hit: hit.clone(),
                             button: MouseButton::Left,
                             stripped_modifiers: crossterm::event::KeyModifiers::empty(),
+                            last_event: mouse,
                         });
                     } else if super::contains(hit.inner_rect, point) {
                         let click = ClientPaneClick {
@@ -2087,9 +2190,11 @@ impl ClientShellState {
                 {
                     self.push_pane_mouse_event(&hit, mouse, mouse.modifiers, outcome);
                     self.pane_mouse_gesture = Some(ClientPaneMouseGesture {
+                        last_position: self.pane_mouse_position(&hit, mouse),
                         hit,
                         button: MouseButton::Middle,
                         stripped_modifiers: crossterm::event::KeyModifiers::empty(),
+                        last_event: mouse,
                     });
                 }
             }
@@ -2132,21 +2237,12 @@ impl ClientShellState {
         }
     }
 
-    fn push_pane_mouse_event(
-        &self,
-        hit: &PaneHit,
-        mouse: MouseEvent,
-        modifiers: crossterm::event::KeyModifiers,
-        outcome: &mut ClientShellInput,
-    ) {
-        let Some(kind) = crate::protocol::ClientMouseKind::from_crossterm(mouse.kind) else {
-            return;
-        };
+    fn pane_mouse_position(&self, hit: &PaneHit, mouse: MouseEvent) -> ClientMousePosition {
         let cell = ClientMousePosition::Cell {
             column: mouse.column.saturating_sub(hit.inner_rect.x),
             row: mouse.row.saturating_sub(hit.inner_rect.y),
         };
-        let position = if hit.sgr_pixel_mouse && hit.pixel_width > 0 && hit.pixel_height > 0 {
+        if hit.sgr_pixel_mouse && hit.pixel_width > 0 && hit.pixel_height > 0 {
             self.host_mouse_pixels
                 .and_then(|pixels| {
                     pixels
@@ -2166,7 +2262,28 @@ impl ClientShellState {
                 .unwrap_or(cell)
         } else {
             cell
+        }
+    }
+
+    pub(super) fn push_pane_mouse_event(
+        &self,
+        hit: &PaneHit,
+        mouse: MouseEvent,
+        modifiers: crossterm::event::KeyModifiers,
+        outcome: &mut ClientShellInput,
+    ) {
+        let Some(kind) = crate::protocol::ClientMouseKind::from_crossterm(mouse.kind) else {
+            return;
         };
+        let position = self.pane_mouse_position(hit, mouse);
+        let geometry = matches!(position, ClientMousePosition::Pixels { .. }).then_some(
+            crate::protocol::ClientMouseGeometry {
+                cols: hit.inner_rect.width,
+                rows: hit.inner_rect.height,
+                width_px: hit.pixel_width,
+                height_px: hit.pixel_height,
+            },
+        );
         let target = if hit.popup {
             ClientInputTarget::Popup(hit.pane_id.clone())
         } else {
@@ -2177,6 +2294,7 @@ impl ClientShellState {
             ClientPaneInputEvent::Mouse {
                 kind,
                 position,
+                geometry,
                 modifiers: modifiers.bits(),
                 lines: self.config.mouse_scroll_lines.min(u16::MAX as usize) as u16,
             },

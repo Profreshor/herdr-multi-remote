@@ -10,4 +10,7 @@ pub struct CommandInvokeParams {
     pub tab_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_id: Option<String>,
+    /// Client-owned selection coordinates, validated against the pane's content revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<super::PaneSelectionReadParams>,
 }

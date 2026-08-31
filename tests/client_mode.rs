@@ -2,7 +2,7 @@
 
 #![cfg(unix)]
 
-mod support;
+pub mod support;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -13,12 +13,13 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use serde::Deserialize;
 use serde_json::Value;
 use support::{
-    cleanup_test_base, client_handshake, encode_varint_u32, frame_message, read_server_message,
-    register_runtime_dir, register_spawned_herdr_pid, unregister_spawned_herdr_pid,
+    cleanup_test_base, client_shell_handshake, read_server_message, register_runtime_dir,
+    register_spawned_herdr_pid, unregister_spawned_herdr_pid, wait_for_client_shell_bootstrap,
     wait_for_message_variant, wait_for_socket, wait_until, CURRENT_PROTOCOL,
+    SERVER_MESSAGE_PANE_SURFACE, SERVER_MESSAGE_SEMANTIC_NOTIFICATION,
+    SERVER_MESSAGE_SERVER_SHUTDOWN,
 };
 
 fn unique_test_dir() -> PathBuf {
@@ -247,100 +248,12 @@ fn app_dir_name() -> &'static str {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-struct FrameWire {
-    cells: Vec<CellWire>,
-    width: u16,
-    height: u16,
-    cursor: Option<CursorWire>,
-    hyperlinks: Vec<String>,
-    graphics: Vec<u8>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-struct CellWire {
-    symbol: String,
-    fg: u32,
-    bg: u32,
-    modifier: u16,
-    skip: bool,
-    hyperlink: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CursorWire {
-    x: u16,
-    y: u16,
-    visible: bool,
-    shape: u8,
-}
-
-fn decode_frame_payload(payload: &[u8]) -> std::io::Result<FrameWire> {
-    bincode::serde::decode_from_slice(payload, bincode::config::standard())
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))
-        .and_then(|(frame, consumed): (FrameWire, usize)| {
-            if consumed != payload.len() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "frame payload had trailing bytes: consumed={}, len={}",
-                        consumed,
-                        payload.len()
-                    ),
-                ));
-            }
-            Ok(frame)
-        })
-}
-
-fn read_next_frame_payload(stream: &mut UnixStream, timeout: Duration) -> Result<Vec<u8>, String> {
-    stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .map_err(|e| e.to_string())?;
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        match read_server_message(stream) {
-            Ok((1, payload)) => return Ok(payload),
-            Ok(_) => continue,
-            Err(_) => continue,
-        }
-    }
-    Err("timed out waiting for Frame message".into())
-}
-
-fn frame_text(frame: &FrameWire) -> String {
-    if frame.cells.is_empty() {
-        return String::new();
-    }
-
-    let width = frame.width.max(1) as usize;
-    let mut text = String::new();
-    for row in frame.cells.chunks(width) {
-        for cell in row {
-            let _ = (cell.fg, cell.bg, cell.modifier, cell.skip);
-            text.push_str(&cell.symbol);
-        }
-        text.push('\n');
-    }
-    let _ = (frame.height, frame.graphics.len());
-    if let Some(cursor) = frame.cursor.as_ref() {
-        let _ = (cursor.x, cursor.y, cursor.visible, cursor.shape);
-    }
-
-    text
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[test]
-fn client_connects_and_receives_frame() {
-    // Client connects to server and handshake completes.
-    // Client receives Frame messages.
-    // Server sends rendered frames to connected clients.
+fn client_connects_and_receives_pane_surface() {
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -352,22 +265,13 @@ fn client_connects_and_receives_frame() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(10));
 
-    // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
-    let (version, error) =
-        client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake should succeed");
-    assert_eq!(
-        version, CURRENT_PROTOCOL,
-        "server should report current protocol version"
-    );
-    assert!(
-        error.is_none(),
-        "handshake should not have error: {:?}",
-        error
-    );
-
-    read_next_frame_payload(&mut stream, Duration::from_secs(10))
-        .expect("should receive a frame from server");
+    let (version, error) = client_shell_handshake(&mut stream, CURRENT_PROTOCOL, 54, 23)
+        .expect("handshake should succeed");
+    assert_eq!(version, CURRENT_PROTOCOL);
+    assert!(error.is_none(), "{error:?}");
+    wait_for_client_shell_bootstrap(&mut stream, Duration::from_secs(10))
+        .expect("should receive the shell snapshot and pane surface");
 
     cleanup_spawned_herdr(spawned, base);
 }
@@ -541,41 +445,26 @@ fn client_sees_headless_startup_config_diagnostic() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(10));
 
-    let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
-    let (version, error) =
-        client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, CURRENT_PROTOCOL);
-    assert!(error.is_none(), "{:?}", error);
-
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut found_diagnostic = false;
-    let mut last_frame_text = String::new();
-    while Instant::now() < deadline {
-        match read_server_message(&mut stream) {
-            Ok((1, payload)) => {
-                let frame = decode_frame_payload(&payload).expect("decode frame");
-                last_frame_text = frame_text(&frame);
-                if last_frame_text.contains("config.toml")
-                    && last_frame_text.contains("herdr config check")
-                {
-                    found_diagnostic = true;
-                    break;
-                }
-            }
-            Ok(_) => {}
-            Err(_) => break,
-        }
-    }
-
+    let client = spawn_client_shell_process(&config_home, &runtime_dir, &api_socket);
+    let output = spawn_pty_drain(
+        client
+            ._master
+            .as_ref()
+            .expect("client shell master")
+            .try_clone_reader()
+            .expect("clone client shell reader"),
+    );
     assert!(
-        found_diagnostic,
-        "attached client should see startup config parse diagnostic; last frame:\n{last_frame_text}"
+        wait_until(Duration::from_secs(8), Duration::from_millis(20), || {
+            let output = read_output(&output);
+            output.contains("config.toml") && output.contains("herdr config check")
+        }),
+        "client shell should render startup config diagnostic; output: {:?}",
+        read_output(&output)
     );
 
-    cleanup_spawned_herdr(spawned, base);
+    drop(spawned);
+    cleanup_spawned_herdr(client, base);
 }
 
 #[test]
@@ -1383,14 +1272,7 @@ fn client_exits_cleanly_when_terminal_hangs_up() {
 }
 
 #[test]
-fn client_receives_frame_after_pane_output() {
-    // End-to-end test: server renders, client receives Frame.
-    // This test verifies the full flow:
-    // 1. Start server
-    // 2. Connect client, handshake
-    // 3. Send input to pane (echo command)
-    // 4. Wait for a new frame from the server
-    // 5. Verify the frame contains the pane output
+fn client_receives_pane_surface_after_pane_output() {
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -1402,33 +1284,52 @@ fn client_receives_frame_after_pane_output() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(10));
 
-    // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
-    let (version, error) =
-        client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake should succeed");
+    let (version, error) = client_shell_handshake(&mut stream, CURRENT_PROTOCOL, 54, 23)
+        .expect("handshake should succeed");
     assert_eq!(version, CURRENT_PROTOCOL);
-    assert!(error.is_none(), "{:?}", error);
+    assert!(error.is_none(), "{error:?}");
+    wait_for_client_shell_bootstrap(&mut stream, Duration::from_secs(10))
+        .expect("initial client shell bootstrap");
 
-    read_next_frame_payload(&mut stream, Duration::from_secs(10))
-        .expect("should receive initial frame");
+    let created = send_json_request(
+        &api_socket,
+        &serde_json::json!({
+            "id": "create-output-workspace",
+            "method": "workspace.create",
+            "params": {"label": "output", "focus": true}
+        })
+        .to_string(),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .expect("root pane id");
+    assert!(wait_for_message_variant(
+        &mut stream,
+        Duration::from_secs(5),
+        SERVER_MESSAGE_PANE_SURFACE,
+    )
+    .expect("wait for created workspace surface"));
 
-    // Send input to trigger a state change and re-render.
-    let input_data = b"echo test-output\n".to_vec();
-    let input_payload = {
-        let mut buf = encode_varint_u32(1); // Input variant
-        buf.extend_from_slice(&encode_varint_u32(input_data.len() as u32));
-        buf.extend_from_slice(&input_data);
-        buf
-    };
-    let framed = frame_message(&input_payload);
-    stream.write_all(&framed).expect("send input");
-    stream.flush().expect("flush");
-
-    // Read subsequent frames — the server should have re-rendered after
-    // the input was processed.
-    let received_frame = wait_for_message_variant(&mut stream, Duration::from_secs(2), 1)
-        .expect("wait for post-output frame");
-    assert!(received_frame, "should receive a Frame after pane output");
+    let sent = send_json_request(
+        &api_socket,
+        &serde_json::json!({
+            "id": "send-output",
+            "method": "pane.send_text",
+            "params": {"pane_id": pane_id, "text": "printf 'test-output\\n'\\n"}
+        })
+        .to_string(),
+    );
+    assert!(sent.get("error").is_none(), "{sent}");
+    assert!(
+        wait_for_message_variant(
+            &mut stream,
+            Duration::from_secs(5),
+            SERVER_MESSAGE_PANE_SURFACE,
+        )
+        .expect("wait for post-output pane surface"),
+        "should receive a pane surface after pane output"
+    );
 
     cleanup_spawned_herdr(spawned, base);
 }
@@ -1535,18 +1436,13 @@ fn graceful_shutdown_sends_server_shutdown_to_client() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(10));
 
-    // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
-    let (version, error) =
-        client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake should succeed");
+    let (version, error) = client_shell_handshake(&mut stream, CURRENT_PROTOCOL, 54, 23)
+        .expect("handshake should succeed");
     assert_eq!(version, CURRENT_PROTOCOL);
-    assert!(error.is_none(), "{:?}", error);
-
-    // Drain initial frame(s).
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    while read_server_message(&mut stream).is_ok() {}
+    assert!(error.is_none(), "{error:?}");
+    wait_for_client_shell_bootstrap(&mut stream, Duration::from_secs(5))
+        .expect("client shell bootstrap");
 
     // Send SIGINT to the server process to trigger graceful shutdown.
     if let Some(pid) = spawned.child.process_id() {
@@ -1555,7 +1451,7 @@ fn graceful_shutdown_sends_server_shutdown_to_client() {
         }
     }
 
-    // The client should receive a ServerShutdown message (variant 4)
+    // The client should receive a ServerShutdown message
     // before the connection is closed, not just an abrupt EOF.
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1564,8 +1460,8 @@ fn graceful_shutdown_sends_server_shutdown_to_client() {
     match result {
         Ok((variant, _payload)) => {
             assert_eq!(
-                variant, 4,
-                "expected ServerShutdown (variant 4), got variant {variant}"
+                variant, SERVER_MESSAGE_SERVER_SHUTDOWN,
+                "expected ServerShutdown, got variant {variant}"
             );
         }
         Err(e) => {
@@ -1594,9 +1490,9 @@ fn client_receives_notify_on_agent_state_change() {
     let client_socket = runtime_dir.join("herdr-client.sock");
 
     // Enable toast and sound in config so the server produces notifications.
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home.join(app_dir_name()).join("config.toml"),
         "onboarding = false\n[ui.toast]\nenabled = true\n[ui.sound]\nenabled = true\n",
     )
     .unwrap();
@@ -1634,18 +1530,13 @@ fn client_receives_notify_on_agent_state_change() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(10));
 
-    // Connect as a client and perform handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect");
-    let (version, error) =
-        client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake should succeed");
+    let (version, error) = client_shell_handshake(&mut stream, CURRENT_PROTOCOL, 54, 23)
+        .expect("handshake should succeed");
     assert_eq!(version, CURRENT_PROTOCOL);
-    assert!(error.is_none(), "{:?}", error);
-
-    // Drain initial frame(s).
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    while read_server_message(&mut stream).is_ok() {}
+    assert!(error.is_none(), "{error:?}");
+    wait_for_client_shell_bootstrap(&mut stream, Duration::from_secs(5))
+        .expect("client shell bootstrap");
 
     // Create a workspace via the API.
     let mut ws_stream = UnixStream::connect(&api_socket).expect("connect to API");
@@ -1689,8 +1580,7 @@ fn client_receives_notify_on_agent_state_change() {
     let mut report_response = String::new();
     report_reader.read_line(&mut report_response).unwrap();
 
-    // Read messages from the client stream and look for Notify (variant 5).
-    // Notify = ServerMessage variant index 5.
+    // Read messages from the client stream and look for the semantic notification.
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -1699,12 +1589,11 @@ fn client_receives_notify_on_agent_state_change() {
     while Instant::now() < deadline {
         match read_server_message(&mut stream) {
             Ok((variant, _payload)) => {
-                if variant == 5 {
-                    // ServerMessage::Notify — found it!
+                if variant == SERVER_MESSAGE_SEMANTIC_NOTIFICATION {
                     found_notify = true;
                     break;
                 }
-                // Continue reading — Frame messages (variant 1) will come first.
+                // Snapshot and pane-surface messages may arrive first.
             }
             Err(_) => {
                 break;
@@ -1714,7 +1603,7 @@ fn client_receives_notify_on_agent_state_change() {
 
     assert!(
         found_notify,
-        "client should receive a ServerMessage::Notify after pane.report_agent"
+        "client should receive a semantic notification after pane.report_agent"
     );
 
     // Now report Idle from Working — this should trigger a Done sound
@@ -1776,7 +1665,7 @@ fn client_receives_notify_on_agent_state_change() {
     let mut idle_response = String::new();
     idle_reader.read_line(&mut idle_response).unwrap();
 
-    // Read messages and look for Done sound notify.
+    // Read messages and look for the done semantic notification.
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -1785,16 +1674,14 @@ fn client_receives_notify_on_agent_state_change() {
     while Instant::now() < deadline {
         match read_server_message(&mut stream) {
             Ok((variant, _payload)) => {
-                if variant == 5 {
-                    // Found a Notify message — that's good enough.
-                    // The test already verified the Blocked→Notify path above.
+                if variant == SERVER_MESSAGE_SEMANTIC_NOTIFICATION {
                     found_done_notify = true;
                     break;
                 }
-                // Continue reading — Frame messages will come first.
+                // Snapshot and pane-surface messages may arrive first.
             }
             Err(e) => {
-                eprintln!("read error while looking for Done Notify: {e}");
+                eprintln!("read error while looking for done notification: {e}");
                 break;
             }
         }
@@ -1802,7 +1689,7 @@ fn client_receives_notify_on_agent_state_change() {
 
     assert!(
         found_done_notify,
-        "client should receive a Sound Notify with 'agent done' when background pane transitions Working→Idle"
+        "client should receive a semantic notification when a background pane transitions Working→Idle"
     );
 
     cleanup_spawned_herdr(spawned, base);

@@ -3,12 +3,69 @@ use crate::protocol::ClientPaneInputEvent;
 use crate::raw_input::RawInputEvent;
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
+const LOCAL_INPUT_SOURCE: u8 = 0;
+
 fn is_retained_selection_copy_key(key: &crate::input::TerminalKey) -> bool {
     matches!(key.code, KeyCode::Char('c' | 'C'))
         && matches!(key.modifiers, KeyModifiers::CONTROL | KeyModifiers::SUPER)
 }
 
+pub(super) fn is_modal_paste_shortcut_for_platform(
+    key: &crate::input::TerminalKey,
+    macos: bool,
+) -> bool {
+    matches!(key.code, KeyCode::Char('v' | 'V'))
+        && (key.modifiers.contains(KeyModifiers::CONTROL)
+            || macos && key.modifiers.contains(KeyModifiers::SUPER))
+}
+
+fn is_modal_paste_shortcut(key: &crate::input::TerminalKey) -> bool {
+    is_modal_paste_shortcut_for_platform(key, cfg!(target_os = "macos"))
+}
+
+fn host_theme_update(event: &RawInputEvent) -> Option<crate::protocol::ClientHostThemeUpdate> {
+    use crate::protocol::{
+        ClientHostAppearance, ClientHostDefaultColorKind, ClientHostThemeUpdate,
+    };
+
+    match event {
+        RawInputEvent::HostDefaultColor { kind, color } => {
+            Some(ClientHostThemeUpdate::DefaultColor {
+                kind: match kind {
+                    crate::terminal_theme::DefaultColorKind::Foreground => {
+                        ClientHostDefaultColorKind::Foreground
+                    }
+                    crate::terminal_theme::DefaultColorKind::Background => {
+                        ClientHostDefaultColorKind::Background
+                    }
+                },
+                color: (*color).into(),
+            })
+        }
+        RawInputEvent::HostPaletteColors { colors } => Some(ClientHostThemeUpdate::PaletteColors(
+            colors
+                .iter()
+                .map(|(index, color)| (*index, (*color).into()))
+                .collect(),
+        )),
+        RawInputEvent::HostColorSchemeChanged(appearance) => {
+            Some(ClientHostThemeUpdate::Appearance(match appearance {
+                crate::terminal_theme::HostAppearance::Dark => ClientHostAppearance::Dark,
+                crate::terminal_theme::HostAppearance::Light => ClientHostAppearance::Light,
+            }))
+        }
+        _ => None,
+    }
+}
+
 impl ClientShellState {
+    pub(crate) fn host_keyboard_report_all_requested(&self) -> bool {
+        matches!(
+            self.mode,
+            ClientShellMode::Prefix | ClientShellMode::Navigate
+        )
+    }
+
     #[cfg(any(unix, test))]
     pub(crate) fn handle_input_bytes(&mut self, data: &[u8]) -> ClientShellInput {
         self.handle_raw_events(crate::raw_input::parse_raw_input_bytes_sync(data))
@@ -67,12 +124,28 @@ impl ClientShellState {
         false
     }
 
+    pub(crate) fn replay_mouse_events(
+        &mut self,
+        events: Vec<crossterm::event::MouseEvent>,
+    ) -> ClientShellInput {
+        self.replaying_url_click = true;
+        let outcome =
+            self.handle_raw_events(events.into_iter().map(RawInputEvent::Mouse).collect());
+        self.replaying_url_click = false;
+        outcome
+    }
+
     pub(super) fn handle_raw_events(&mut self, events: Vec<RawInputEvent>) -> ClientShellInput {
         let mut outcome = ClientShellInput::default();
         if !events.is_empty() && self.endpoint_error.take().is_some() {
             outcome.repaint = true;
         }
         for event in events {
+            if let Some(update) = host_theme_update(&event) {
+                outcome
+                    .requests
+                    .push(ClientMessage::ClientShellHostTheme { update });
+            }
             match event {
                 RawInputEvent::Key(key) => self.handle_key(key, &mut outcome),
                 RawInputEvent::Text(text) => {
@@ -85,9 +158,11 @@ impl ClientShellState {
                                 | ClientShellOverlay::ReleaseNotes(_)
                         )
                     ) {
+                        self.reconcile_input_source();
                         continue;
                     }
                     if self.prepare_committed_text(&text, &mut outcome) {
+                        self.reconcile_input_source();
                         continue;
                     }
                     if let Some(target) = self.popup_input_target() {
@@ -116,9 +191,11 @@ impl ClientShellState {
                                 | ClientShellOverlay::ReleaseNotes(_)
                         )
                     ) {
+                        self.reconcile_input_source();
                         continue;
                     }
                     if self.prepare_committed_text(&text, &mut outcome) {
+                        self.reconcile_input_source();
                         continue;
                     }
                     if let Some(target) = self.popup_input_target() {
@@ -142,9 +219,36 @@ impl ClientShellState {
                 RawInputEvent::OuterFocusGained => {
                     self.outer_focused = Some(true);
                     outcome.query_host_appearance = true;
+                    outcome.repaint |= self.config.redraw_on_focus_gained;
+                    outcome
+                        .requests
+                        .push(ClientMessage::ClientShellFocus { focused: true });
                 }
-                RawInputEvent::OuterFocusLost => self.outer_focused = Some(false),
+                RawInputEvent::OuterFocusLost => {
+                    self.outer_focused = Some(false);
+                    self.release_input_leases(&mut outcome);
+                    outcome
+                        .requests
+                        .push(ClientMessage::ClientShellFocus { focused: false });
+                }
                 RawInputEvent::HostColorSchemeChanged(appearance) => {
+                    self.host_appearance = Some(appearance);
+                    self.host_appearance_explicit = true;
+                    outcome.query_host_theme = true;
+                    if self.config.theme_runtime.auto_switch {
+                        self.config.palette = crate::app::client_palette_for_appearance(
+                            &self.config.theme_runtime,
+                            appearance,
+                        );
+                        outcome.repaint = true;
+                    }
+                }
+                RawInputEvent::HostDefaultColor {
+                    kind: crate::terminal_theme::DefaultColorKind::Background,
+                    color,
+                } if !self.host_appearance_explicit => {
+                    let appearance = color.inferred_appearance();
+                    self.host_appearance = Some(appearance);
                     if self.config.theme_runtime.auto_switch {
                         self.config.palette = crate::app::client_palette_for_appearance(
                             &self.config.theme_runtime,
@@ -158,6 +262,7 @@ impl ClientShellState {
                 | RawInputEvent::HostCellSizeReport { .. }
                 | RawInputEvent::Unsupported => {}
             }
+            self.reconcile_input_source();
         }
         outcome.repaint |= self.resume_mobile_switcher_if_ready();
         outcome
@@ -172,7 +277,6 @@ impl ClientShellState {
             self.copy_input_queue.push_back(key);
             return;
         }
-        const LOCAL_INPUT_SOURCE: u8 = 0;
         let lease_key = crate::input::InputLeaseKey::new(LOCAL_INPUT_SOURCE, &key);
         let key = self.input_leases.normalize_press(&lease_key, key);
         match key.kind {
@@ -201,12 +305,61 @@ impl ClientShellState {
             }
             KeyEventKind::Release => {
                 if let Some(lease) = self.input_leases.remove_forwarded(&lease_key) {
-                    self.push_pane_key(lease.target, key, outcome);
+                    let release = lease
+                        .key
+                        .with_modifiers(key.modifiers)
+                        .with_kind(KeyEventKind::Release);
+                    self.push_pane_key(lease.target, release, outcome);
                 } else {
                     let _ = self.input_leases.remove(&lease_key);
                 }
             }
         }
+    }
+
+    fn release_input_leases(&mut self, outcome: &mut ClientShellInput) {
+        for lease in self.input_leases.remove_source(LOCAL_INPUT_SOURCE) {
+            self.push_pane_key(
+                lease.target,
+                lease.key.with_kind(KeyEventKind::Release),
+                outcome,
+            );
+        }
+        if let Some(gesture) = self.pane_mouse_gesture.take() {
+            let modifiers = gesture
+                .last_event
+                .modifiers
+                .difference(gesture.stripped_modifiers);
+            let geometry = matches!(
+                gesture.last_position,
+                crate::protocol::ClientMousePosition::Pixels { .. }
+            )
+            .then_some(crate::protocol::ClientMouseGeometry {
+                cols: gesture.hit.inner_rect.width,
+                rows: gesture.hit.inner_rect.height,
+                width_px: gesture.hit.pixel_width,
+                height_px: gesture.hit.pixel_height,
+            });
+            let target = if gesture.hit.popup {
+                ClientInputTarget::Popup(gesture.hit.pane_id)
+            } else {
+                ClientInputTarget::Pane(gesture.hit.pane_id)
+            };
+            super::push_target_event(
+                target,
+                ClientPaneInputEvent::Mouse {
+                    kind: crate::protocol::ClientMouseKind::Up(
+                        crate::protocol::ClientMouseButton::from_crossterm(gesture.button),
+                    ),
+                    position: gesture.last_position,
+                    geometry,
+                    modifiers: modifiers.bits(),
+                    lines: self.config.mouse_scroll_lines.min(u16::MAX as usize) as u16,
+                },
+                outcome,
+            );
+        }
+        self.copy_input_queue.clear();
     }
 
     fn execute_repeat_plan(
@@ -252,11 +405,69 @@ impl ClientShellState {
         }
     }
 
+    pub(super) fn modal_paste_target_active(&self) -> bool {
+        if self.popup_pending || self.popup_input_target().is_some() {
+            return false;
+        }
+        if self
+            .copy_mode
+            .as_ref()
+            .is_some_and(|copy_mode| copy_mode.search_prompt.is_some())
+        {
+            return self.overlay.is_none();
+        }
+        matches!(
+            self.overlay.as_ref(),
+            Some(ClientShellOverlay::Rename(_))
+                | Some(ClientShellOverlay::WorktreeCreate(
+                    ClientWorktreeCreateOverlay {
+                        creating: false,
+                        ..
+                    }
+                ))
+                | Some(ClientShellOverlay::WorktreeOpen(
+                    ClientWorktreeOpenOverlay {
+                        search_focused: true,
+                        opening: false,
+                        ..
+                    }
+                ))
+                | Some(ClientShellOverlay::Navigator(ClientNavigatorOverlay {
+                    search_focused: true,
+                    ..
+                }))
+                | Some(ClientShellOverlay::Help(ClientHelpOverlay {
+                    search_focused: true,
+                    ..
+                }))
+        )
+    }
+
+    pub(super) fn handle_modal_paste_shortcut_with(
+        &mut self,
+        key: &crate::input::TerminalKey,
+        outcome: &mut ClientShellInput,
+        read_clipboard_text: impl FnOnce() -> Option<String>,
+    ) -> bool {
+        if !is_modal_paste_shortcut(key) || !self.modal_paste_target_active() {
+            return false;
+        }
+        if let Some(text) = read_clipboard_text() {
+            let inserted = self.insert_copy_search_text(&text) || self.insert_overlay_text(&text);
+            outcome.repaint |= inserted;
+        }
+        true
+    }
+
     fn route_key_press(
         &mut self,
         key: &crate::input::TerminalKey,
         outcome: &mut ClientShellInput,
     ) -> Option<ClientInputTarget> {
+        if self.handle_modal_paste_shortcut_with(key, outcome, crate::platform::read_clipboard_text)
+        {
+            return None;
+        }
         if matches!(
             self.overlay,
             Some(
@@ -293,7 +504,7 @@ impl ClientShellState {
                 .as_ref()
                 .is_some_and(crate::selection::Selection::is_visible)
         {
-            self.request_selection_copy(outcome);
+            self.request_selection_copy_with_fallback(outcome, Some(key.clone()));
             self.selection = None;
             self.stop_selection_autoscroll();
             self.selection_highlight_clear_deadline = None;
@@ -649,12 +860,14 @@ impl ClientShellState {
         } else {
             (current as isize + delta).rem_euclid(entries.len() as isize) as usize
         };
-        self.navigate_workspace_id = Some(
-            snapshot.workspaces[entries[next].index]
-                .workspace_id
-                .clone(),
-        );
+        let workspace_id = snapshot.workspaces[entries[next].index]
+            .workspace_id
+            .clone();
+        self.navigate_workspace_id = Some(workspace_id.clone());
         self.reveal_mobile_workspace = mobile;
+        if !mobile {
+            self.reveal_workspace(&workspace_id);
+        }
     }
 
     fn cycle_pane(&mut self, reverse: bool, outcome: &mut ClientShellInput) {
@@ -739,6 +952,38 @@ impl ClientShellState {
         self.snapshot
             .as_deref()
             .and_then(|snapshot| snapshot.focused_pane_id.clone())
+    }
+
+    pub(crate) fn clipboard_image_target(
+        &self,
+    ) -> Option<crate::protocol::ClientClipboardImageTarget> {
+        if matches!(
+            self.overlay,
+            Some(
+                ClientShellOverlay::Onboarding
+                    | ClientShellOverlay::ProductAnnouncement(_)
+                    | ClientShellOverlay::ReleaseNotes(_)
+            )
+        ) || self
+            .copy_mode
+            .as_ref()
+            .is_some_and(|copy_mode| copy_mode.search_prompt.is_some())
+        {
+            return None;
+        }
+        if let Some(terminal_id) = self.popup_input_target().and_then(|target| match target {
+            ClientInputTarget::Popup(terminal_id) => Some(terminal_id),
+            ClientInputTarget::Pane(_) => None,
+        }) {
+            return Some(crate::protocol::ClientClipboardImageTarget::Popup(
+                terminal_id,
+            ));
+        }
+        if self.popup_pending || self.overlay.is_some() || self.mode != ClientShellMode::Terminal {
+            return None;
+        }
+        self.focused_pane_id()
+            .map(crate::protocol::ClientClipboardImageTarget::Pane)
     }
 
     fn popup_input_target(&self) -> Option<ClientInputTarget> {

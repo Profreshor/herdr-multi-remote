@@ -163,38 +163,40 @@ pub(crate) fn separator(previous: &ResolvedToken, current: &ResolvedToken) -> &'
 mod tests {
     use super::*;
     use crate::config::{AgentSidebarToken, SpaceSidebarToken};
-    use crate::detect::AgentState;
 
-    fn entry() -> super::super::AgentPanelEntry {
-        super::super::AgentPanelEntry {
-            ws_idx: 0,
-            tab_idx: 0,
-            pane_id: crate::layout::PaneId::from_raw(1),
-            primary_label: "repo".into(),
-            primary_tab_label: None,
-            pane_label: None,
+    struct Entry {
+        workspace: String,
+        tab: Option<String>,
+        pane: Option<String>,
+        agent_label: Option<String>,
+        terminal_title: Option<String>,
+        terminal_title_stripped: Option<String>,
+        canonical_agent: Option<crate::detect::Agent>,
+        tokens: std::collections::HashMap<String, String>,
+    }
+
+    fn entry() -> Entry {
+        Entry {
+            workspace: "repo".into(),
+            tab: None,
+            pane: None,
+            agent_label: Some("pi".into()),
             terminal_title: None,
             terminal_title_stripped: None,
-            agent_label: Some("pi".into()),
-            agent_kind_label: Some("pi".into()),
-            agent: Some(crate::detect::Agent::Pi),
-            state: AgentState::Working,
-            seen: true,
-            last_agent_state_change_seq: None,
-            state_labels: std::collections::HashMap::new(),
+            canonical_agent: Some(crate::detect::Agent::Pi),
             tokens: std::collections::HashMap::new(),
         }
     }
 
-    fn context(entry: &super::super::AgentPanelEntry) -> AgentTokenContext<'_> {
+    fn context(entry: &Entry) -> AgentTokenContext<'_> {
         AgentTokenContext {
-            workspace: &entry.primary_label,
-            tab: entry.primary_tab_label.as_deref(),
-            pane: entry.pane_label.as_deref(),
+            workspace: &entry.workspace,
+            tab: entry.tab.as_deref(),
+            pane: entry.pane.as_deref(),
             agent_label: entry.agent_label.as_deref(),
             terminal_title: entry.terminal_title.as_deref(),
             terminal_title_stripped: entry.terminal_title_stripped.as_deref(),
-            canonical_agent: entry.agent,
+            canonical_agent: entry.canonical_agent,
             tokens: &entry.tokens,
         }
     }
@@ -298,7 +300,7 @@ mod tests {
             ))]]
         );
 
-        pi.agent = None;
+        pi.canonical_agent = None;
         assert_eq!(
             agent_rows(&config, context(&pi), "working"),
             vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Workspace(

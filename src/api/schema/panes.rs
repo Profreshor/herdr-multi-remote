@@ -48,6 +48,17 @@ pub struct PaneInputSetParams {
     pub right_click: PaneRightClickTarget,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneLinkActivateParams {
+    pub pane_id: String,
+    pub viewport_row: u16,
+    pub col: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_from_bottom: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneDirection {
