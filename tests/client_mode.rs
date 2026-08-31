@@ -18,8 +18,8 @@ use support::{
     cleanup_test_base, client_shell_handshake, read_server_message, register_runtime_dir,
     register_spawned_herdr_pid, unregister_spawned_herdr_pid, wait_for_client_shell_bootstrap,
     wait_for_message_variant, wait_for_socket, wait_until, CURRENT_PROTOCOL,
-    SERVER_MESSAGE_PANE_SURFACE, SERVER_MESSAGE_SEMANTIC_NOTIFICATION,
-    SERVER_MESSAGE_SERVER_SHUTDOWN,
+    SERVER_MESSAGE_PANE_SURFACE, SERVER_MESSAGE_PANE_SURFACE_PATCH,
+    SERVER_MESSAGE_SEMANTIC_NOTIFICATION, SERVER_MESSAGE_SERVER_SHUTDOWN,
 };
 
 fn unique_test_dir() -> PathBuf {
@@ -1325,10 +1325,10 @@ fn client_receives_pane_surface_after_pane_output() {
         wait_for_message_variant(
             &mut stream,
             Duration::from_secs(5),
-            SERVER_MESSAGE_PANE_SURFACE,
+            SERVER_MESSAGE_PANE_SURFACE_PATCH,
         )
-        .expect("wait for post-output pane surface"),
-        "should receive a pane surface after pane output"
+        .expect("wait for post-output pane surface patch"),
+        "should receive an incremental pane surface patch after pane output"
     );
 
     cleanup_spawned_herdr(spawned, base);

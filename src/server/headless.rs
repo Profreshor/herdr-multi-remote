@@ -77,6 +77,7 @@ mod lifecycle;
 mod notifications;
 mod pane_graphics;
 mod render;
+mod retained_surface;
 
 pub use bootstrap::run_server;
 use lifecycle::wait_for_live_handoff_response_write;
@@ -577,6 +578,11 @@ impl HeadlessServer {
                     && !self.pty_sources_visible_to_any_render_target(&render_request.pty_sources);
                 if hidden_only {
                     crate::render_prof::event("render.skipped.hidden_sources");
+                } else if !needs_full_render
+                    && !needs_graphics_render
+                    && self.render_retained_pane_surface_and_stream(&render_request.pty_sources)
+                {
+                    crate::render_prof::event("retained_surface.invoke");
                 } else {
                     crate::render_prof::event("full_render.invoke");
                     self.render_and_stream();

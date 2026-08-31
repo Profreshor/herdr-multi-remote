@@ -734,7 +734,7 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
     }
 
     server.render_and_stream();
-    match read_server_message(render_rx.recv().expect("pane surface")) {
+    let initial_surface = match read_server_message(render_rx.recv().expect("pane surface")) {
         ServerMessage::PaneSurface(surface) => {
             assert_eq!((surface.frame.width, surface.frame.height), (80, 23));
             let text = frame_text(&surface.frame);
@@ -752,9 +752,71 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
                 surface.panes[0].pixel_height,
                 u32::from(surface.panes[0].inner_rect.height) * 20
             );
+            surface
         }
         other => panic!("expected pane surface, got {other:?}"),
+    };
+
+    server
+        .app
+        .state
+        .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+        .expect("pane runtime")
+        .test_process_pty_bytes(b"\rPATCHED");
+    let sources = std::collections::HashSet::from([pane_id]);
+    assert!(server.render_retained_pane_surface_and_stream(&sources));
+    match read_server_message(render_rx.recv().expect("pane surface patch")) {
+        ServerMessage::PaneSurfacePatch(patch) => {
+            assert_eq!(
+                patch.base_surface_revision,
+                initial_surface.surface_revision
+            );
+            assert_eq!(patch.surface_revision, initial_surface.surface_revision + 1);
+            assert_eq!(patch.panes.len(), 1);
+            assert!(!patch.rows.is_empty());
+            assert!(patch
+                .rows
+                .iter()
+                .flat_map(|row| &row.cells)
+                .any(|cell| cell.symbol == "P"));
+        }
+        other => panic!("expected pane surface patch, got {other:?}"),
     }
+    server
+        .app
+        .state
+        .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+        .expect("pane runtime")
+        .test_process_pty_bytes(b"\x1b[?1003l\x1b[?1006l\x1b[?1016l");
+    assert!(server.render_retained_pane_surface_and_stream(&sources));
+    match read_server_message(render_rx.recv().expect("metadata-only pane surface patch")) {
+        ServerMessage::PaneSurfacePatch(patch) => {
+            assert_eq!(patch.panes.len(), 1);
+            assert!(!patch.panes[0].mouse_reporting);
+            assert!(!patch.panes[0].sgr_pixel_mouse);
+        }
+        other => panic!("expected metadata-only pane surface patch, got {other:?}"),
+    }
+    let retained = server.clients[&7]
+        .render_state
+        .last_pane_surface()
+        .expect("committed retained surface")
+        .clone();
+    server
+        .clients
+        .get_mut(&7)
+        .unwrap()
+        .render_state
+        .request_repaint();
+    server.render_and_stream();
+    let full = match read_server_message(render_rx.recv().expect("full comparison surface")) {
+        ServerMessage::PaneSurface(surface) => surface,
+        other => panic!("expected full comparison surface, got {other:?}"),
+    };
+    assert!(full.surface_revision > retained.surface_revision);
+    assert_eq!(retained.frame, full.frame);
+    assert_eq!(retained.panes, full.panes);
+    assert_eq!(retained.splits, full.splits);
     shutdown_test_runtimes(&mut server);
 }
 

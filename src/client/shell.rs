@@ -18,9 +18,13 @@ mod render;
 mod scroll;
 mod settings;
 mod state;
+mod surface_patch;
 mod worktrees;
 
-pub(super) use state::*;
+pub(crate) use state::*;
+#[cfg(test)]
+pub(super) use surface_patch::apply_composed_surface_patch;
+pub(super) use surface_patch::{ClientComposedSurfacePatch, ClientPaneSurfacePatchOutcome};
 
 use crossterm::event::KeyCode;
 #[cfg(test)]

@@ -14,6 +14,7 @@ use tracing::{debug, error};
 use unicode_width::UnicodeWidthStr;
 
 use crate::layout::PaneId;
+use crate::protocol::CellData;
 
 #[cfg(windows)]
 mod windows_recent_fallback;
@@ -100,6 +101,18 @@ pub struct TerminalCursorState {
     pub visible: bool,
     /// DECSCUSR parameter (0–6). 0 means terminal default.
     pub shape: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalDirtyPatch {
+    pub rows: Vec<(u16, Vec<CellData>)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TerminalDirtyPatchOutcome {
+    Clean,
+    Patch(TerminalDirtyPatch),
+    Fallback,
 }
 
 fn decscusr_cursor_shape(style: crate::ghostty::CursorVisualStyle, blinking: bool) -> u8 {
@@ -492,6 +505,14 @@ impl PaneTerminal {
 
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
         self.ghostty.render(frame, area, show_cursor);
+    }
+
+    pub fn collect_dirty_patch(
+        &self,
+        area_width: u16,
+        area_height: u16,
+    ) -> TerminalDirtyPatchOutcome {
+        self.ghostty.collect_dirty_patch(area_width, area_height)
     }
 
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
@@ -2248,6 +2269,18 @@ impl GhosttyPaneTerminal {
             }
         }
     }
+
+    pub fn collect_dirty_patch(
+        &self,
+        area_width: u16,
+        area_height: u16,
+    ) -> TerminalDirtyPatchOutcome {
+        self.core
+            .lock()
+            .ok()
+            .map(|mut core| ghostty_collect_dirty_patch(&mut core, area_width, area_height))
+            .unwrap_or(TerminalDirtyPatchOutcome::Fallback)
+    }
 }
 
 fn encoded_key_preserves_event_kind(
@@ -2348,6 +2381,166 @@ fn ghostty_clear_render_dirty(render_state: &mut crate::ghostty::RenderState, ar
         y += 1;
     }
     let _ = render_state.set_dirty(crate::ghostty::Dirty::Clean);
+}
+
+fn ghostty_collect_dirty_patch(
+    core: &mut GhosttyPaneCore,
+    area_width: u16,
+    area_height: u16,
+) -> TerminalDirtyPatchOutcome {
+    let prof_started = crate::render_prof::timer();
+    macro_rules! finish {
+        ($outcome:expr) => {{
+            let outcome = $outcome;
+            if let Some(started) = prof_started {
+                crate::render_prof::duration("dirty_collect.total", started.elapsed());
+                match &outcome {
+                    TerminalDirtyPatchOutcome::Clean => {
+                        crate::render_prof::event("dirty_collect.clean");
+                    }
+                    TerminalDirtyPatchOutcome::Fallback => {
+                        crate::render_prof::event("dirty_collect.fallback");
+                    }
+                    TerminalDirtyPatchOutcome::Patch(patch) => {
+                        crate::render_prof::event("dirty_collect.patch");
+                        crate::render_prof::counter("dirty_collect.rows", patch.rows.len() as u64);
+                        let cells = patch.rows.iter().map(|(_, cells)| cells.len() as u64).sum();
+                        crate::render_prof::counter("dirty_collect.cells", cells);
+                    }
+                }
+            }
+            return outcome;
+        }};
+    }
+    macro_rules! fallback {
+        ($reason:literal) => {{
+            crate::render_prof::event(concat!("dirty_fallback.", $reason));
+            finish!(TerminalDirtyPatchOutcome::Fallback);
+        }};
+    }
+
+    let host_theme = core.host_terminal_theme;
+    let initial_default_foreground = core.initial_default_foreground;
+    let initial_default_background = core.initial_default_background;
+    let GhosttyPaneCore {
+        terminal,
+        render_state,
+        ..
+    } = core;
+    if render_state.update(terminal).is_err() {
+        fallback!("render_state_update_error");
+    }
+    match render_state.dirty() {
+        Ok(crate::ghostty::Dirty::Clean) => finish!(TerminalDirtyPatchOutcome::Clean),
+        Ok(crate::ghostty::Dirty::Partial) => {}
+        Ok(crate::ghostty::Dirty::Full) => fallback!("dirty_full"),
+        Err(_) => fallback!("dirty_read_error"),
+    }
+
+    let colors = render_state.colors().ok();
+    let default_bg = colors
+        .and_then(|c| ghostty_default_bg(c.background, host_theme, initial_default_background));
+    let default_fg = colors
+        .and_then(|c| ghostty_default_fg(c.foreground, host_theme, initial_default_foreground));
+    let resolved_fg = colors.map(|c| ghostty_color(c.foreground));
+    let resolved_bg = colors.map(|c| ghostty_color(c.background));
+    let palette_overrides = colors
+        .zip(terminal.default_palette().ok())
+        .and_then(|(colors, default)| PaletteOverrides::new(&colors.palette, &default));
+    let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
+
+    let Ok(mut row_iterator) = crate::ghostty::RowIterator::new() else {
+        fallback!("row_iterator_new_error");
+    };
+    let Ok(mut row_cells) = crate::ghostty::RowCells::new() else {
+        fallback!("row_cells_new_error");
+    };
+    let Ok(mut rows) = render_state.populate_row_iterator(&mut row_iterator) else {
+        fallback!("populate_rows_error");
+    };
+    let mut grapheme_bytes = Vec::new();
+    let mut symbol_scratch = String::new();
+    let mut patch_rows = Vec::new();
+    let mut y = 0u16;
+    while y < area_height && rows.next() {
+        let Ok(dirty) = rows.dirty() else {
+            fallback!("row_dirty_read_error");
+        };
+        if dirty {
+            match rows.selection() {
+                Ok(None) => {}
+                Ok(Some(_)) => fallback!("row_selection_present"),
+                Err(_) => fallback!("row_selection_error"),
+            }
+            let Ok(mut cells) = rows.populate_cells(&mut row_cells) else {
+                fallback!("populate_cells_error");
+            };
+            let mut patch_cells = Vec::with_capacity(usize::from(area_width));
+            let mut x = 0u16;
+            while x < area_width && cells.next() {
+                let Ok(basic) = cells.basic_data() else {
+                    fallback!("basic_data_error");
+                };
+                if basic.has_hyperlink {
+                    fallback!("hyperlink_present");
+                }
+                let style = ghostty_cell_style(
+                    &cells,
+                    &basic,
+                    default_fg,
+                    default_bg,
+                    resolved_fg,
+                    resolved_bg,
+                    palette_overrides.as_ref(),
+                );
+                let symbol = match ghostty_buffer_symbol_into(
+                    &cells,
+                    basic.wide,
+                    hide_kitty_placeholders,
+                    &mut grapheme_bytes,
+                    &mut symbol_scratch,
+                ) {
+                    Ok(symbol) => symbol.to_owned(),
+                    Err(_) => ghostty_blank_symbol_for_width(basic.wide).to_owned(),
+                };
+                patch_cells.push(cell_data_from_style(symbol, style));
+                x += 1;
+            }
+            while x < area_width {
+                patch_cells.push(blank_cell_data(default_fg, default_bg));
+                x += 1;
+            }
+            patch_rows.push((y, patch_cells));
+        }
+        y += 1;
+    }
+
+    let dirty_ys: std::collections::HashSet<u16> = patch_rows.iter().map(|(row, _)| *row).collect();
+    if !dirty_ys.is_empty() {
+        let Ok(mut clear_row_iterator) = crate::ghostty::RowIterator::new() else {
+            fallback!("clear_row_iterator_new_error");
+        };
+        let Ok(mut clear_rows) = render_state.populate_row_iterator(&mut clear_row_iterator) else {
+            fallback!("clear_populate_rows_error");
+        };
+        let mut clear_y = 0u16;
+        while clear_y < area_height && clear_rows.next() {
+            if dirty_ys.contains(&clear_y) && clear_rows.clear_dirty().is_err() {
+                fallback!("clear_dirty_error");
+            }
+            clear_y += 1;
+        }
+    }
+    if render_state
+        .set_dirty(crate::ghostty::Dirty::Clean)
+        .is_err()
+    {
+        fallback!("set_clean_error");
+    }
+
+    finish!(TerminalDirtyPatchOutcome::Patch(TerminalDirtyPatch {
+        rows: patch_rows
+    }));
 }
 
 fn ghostty_visible_hyperlinks(
@@ -2789,6 +2982,24 @@ fn ghostty_reset_cell(
     }
     if let Some(fg) = default_fg {
         cell.set_fg(fg);
+    }
+}
+
+fn blank_cell_data(default_fg: Option<Color>, default_bg: Option<Color>) -> CellData {
+    cell_data_from_style(
+        " ".to_string(),
+        ghostty_default_style(default_fg, default_bg),
+    )
+}
+
+fn cell_data_from_style(symbol: String, style: Style) -> CellData {
+    CellData {
+        symbol,
+        fg: crate::protocol::color_to_u32(style.fg.unwrap_or(Color::Reset)),
+        bg: crate::protocol::color_to_u32(style.bg.unwrap_or(Color::Reset)),
+        modifier: crate::protocol::modifier_to_u16(style.add_modifier),
+        skip: false,
+        hyperlink: None,
     }
 }
 

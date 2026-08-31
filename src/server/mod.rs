@@ -14,6 +14,8 @@ pub mod headless;
 pub(crate) mod keybindings;
 pub(crate) mod notifications;
 pub(crate) mod pane_input;
+#[cfg(test)]
+mod render_scale_benchmark;
 pub(crate) mod render_stream;
 pub mod socket_paths;
 pub(crate) mod terminal_attach;

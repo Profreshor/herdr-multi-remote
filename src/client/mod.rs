@@ -27,6 +27,8 @@ mod terminal_geometry;
 mod terminal_sessions;
 mod terminal_setup;
 
+#[cfg(test)]
+pub(crate) use shell::{ClientShellConfig, ClientShellState};
 pub use terminal_sessions::{run_terminal_session_control, run_terminal_session_observe};
 
 #[cfg(not(windows))]
@@ -210,6 +212,49 @@ impl ClientState {
         let mut stdout = io::stdout();
         let _ = write_encoded_frame_with_graphics(&mut stdout, &[], graphics);
         let _ = stdout.flush();
+    }
+
+    fn present_surface_patch(
+        &mut self,
+        patch: shell::ClientComposedSurfacePatch,
+    ) -> io::Result<bool> {
+        if self.repaint_pending {
+            crate::render_prof::event("client_surface_patch.fallback.repaint");
+            return Ok(false);
+        }
+        let rows = if self.draw_host_cursor {
+            let Some(rows) = self
+                .blit_encoder
+                .patch_rows_with_drawn_cursor(&patch.rows, patch.cursor.as_ref())
+            else {
+                crate::render_prof::event("client_surface_patch.fallback.drawn_cursor");
+                return Ok(false);
+            };
+            rows
+        } else {
+            patch.rows
+        };
+        let encode_started = crate::render_prof::timer();
+        let Some(encoded) =
+            self.blit_encoder
+                .encode_patch(&rows, patch.cursor.clone(), self.draw_host_cursor)
+        else {
+            crate::render_prof::event("client_surface_patch.fallback.encode");
+            return Ok(false);
+        };
+        crate::render_prof::duration_since("client_surface_patch.encode", encode_started);
+        let write_started = crate::render_prof::timer();
+        let mut stdout = io::stdout();
+        stdout.write_all(&encoded.bytes)?;
+        stdout.flush()?;
+        crate::render_prof::duration_since("client_surface_patch.write", write_started);
+        let committed = self.blit_encoder.commit_patch(&rows, patch.cursor, encoded);
+        crate::render_prof::event(if committed {
+            "client_surface_patch.success"
+        } else {
+            "client_surface_patch.fallback.commit"
+        });
+        Ok(committed)
     }
 
     fn present_frame(&mut self, frame_data: FrameData) {
@@ -1198,6 +1243,40 @@ async fn run_client_loop(
                     if let Some(frame) = composed {
                         state.present_frame(frame);
                     }
+                }
+                ServerMessage::PaneSurfacePatch(patch) => {
+                    let patch_started = crate::render_prof::timer();
+                    let apply_started = crate::render_prof::timer();
+                    let outcome = state
+                        .shell
+                        .as_mut()
+                        .map(|shell| shell.apply_pane_surface_patch(patch));
+                    crate::render_prof::duration_since("client_surface_patch.apply", apply_started);
+                    let compose_fallback = match outcome {
+                        Some(shell::ClientPaneSurfacePatchOutcome::Applied(Some(patch))) => {
+                            match state.present_surface_patch(patch) {
+                                Ok(presented) => !presented,
+                                Err(error) => {
+                                    warn!(%error, "failed to present retained pane surface patch");
+                                    state.request_repaint();
+                                    false
+                                }
+                            }
+                        }
+                        Some(shell::ClientPaneSurfacePatchOutcome::Applied(None)) => true,
+                        Some(shell::ClientPaneSurfacePatchOutcome::Rejected) | None => false,
+                    };
+                    apply_client_shell_input_source_changes(&mut state, &mut prefix_input_source);
+                    if compose_fallback {
+                        let composed = state.shell.as_mut().and_then(|shell| {
+                            shell.compose(state.reported_size.0, state.reported_size.1)
+                        });
+                        if let Some(frame) = composed {
+                            state.present_frame(frame);
+                        }
+                    }
+                    crate::render_prof::duration_since("client_surface_patch.total", patch_started);
+                    crate::render_prof::flush_if_due();
                 }
                 ServerMessage::Terminal(frame) => {
                     if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {

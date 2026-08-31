@@ -1153,6 +1153,8 @@ pub struct PaneSurfaceFrame {
     pub boot_id: String,
     /// Projection revision whose focused IDs and topology produced this surface.
     pub projection_revision: u64,
+    /// Monotonic revision for full surfaces and incremental patches on one connection.
+    pub surface_revision: u64,
     pub frame: FrameData,
     pub panes: Vec<PaneSurfacePane>,
     pub splits: Vec<PaneSurfaceSplit>,
@@ -1164,6 +1166,29 @@ pub struct PaneSurfaceFrame {
 pub enum ClientShellPopupSize {
     Cells(u16),
     Percent(u8),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSurfacePatchRow {
+    /// Origin-relative surface column where this complete pane row starts.
+    pub x: u16,
+    /// Origin-relative surface row.
+    pub y: u16,
+    pub cells: Vec<CellData>,
+}
+
+/// Incremental terminal-cell update against one committed complete pane surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSurfacePatch {
+    pub boot_id: String,
+    pub projection_revision: u64,
+    pub base_surface_revision: u64,
+    pub surface_revision: u64,
+    pub rows: Vec<PaneSurfacePatchRow>,
+    /// Updated metadata for panes whose terminal content changed.
+    pub panes: Vec<PaneSurfacePane>,
+    /// Final cursor relative to the pane surface.
+    pub cursor: Option<CursorState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1347,6 +1372,9 @@ pub enum ServerMessage {
         final_chunk: bool,
         data: Vec<u8>,
     },
+
+    /// Incremental terminal-cell update for a previously committed pane surface.
+    PaneSurfacePatch(PaneSurfacePatch),
 }
 
 // ---------------------------------------------------------------------------
@@ -2125,6 +2153,7 @@ mod tests {
         let msg = ServerMessage::PaneSurface(PaneSurfaceFrame {
             boot_id: "boot-1".into(),
             projection_revision: 1,
+            surface_revision: 1,
             frame: frame.clone(),
             panes: Vec::new(),
             splits: Vec::new(),
@@ -2145,6 +2174,39 @@ mod tests {
             }
             other => panic!("expected pane surface, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pane_surface_patch_roundtrip() {
+        let msg = ServerMessage::PaneSurfacePatch(PaneSurfacePatch {
+            boot_id: "boot-1".into(),
+            projection_revision: 3,
+            base_surface_revision: 7,
+            surface_revision: 8,
+            rows: vec![PaneSurfacePatchRow {
+                x: 2,
+                y: 4,
+                cells: vec![CellData {
+                    symbol: "x".into(),
+                    fg: 1,
+                    bg: 2,
+                    modifier: 3,
+                    skip: false,
+                    hyperlink: None,
+                }],
+            }],
+            panes: Vec::new(),
+            cursor: Some(CursorState {
+                x: 2,
+                y: 4,
+                visible: true,
+                shape: 2,
+            }),
+        });
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ServerMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(decoded, msg);
     }
 
     #[test]
@@ -2461,6 +2523,7 @@ mod tests {
         let msg = ServerMessage::PaneSurface(PaneSurfaceFrame {
             boot_id: "boot-1".into(),
             projection_revision: 1,
+            surface_revision: 1,
             frame,
             panes: Vec::new(),
             splits: Vec::new(),

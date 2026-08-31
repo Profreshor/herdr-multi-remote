@@ -1371,7 +1371,9 @@ impl ClientShellState {
             || surface.projection_revision < snapshot.revision
             || self.pane_surface.as_ref().is_some_and(|current| {
                 current.boot_id == surface.boot_id
-                    && surface.projection_revision < current.projection_revision
+                    && (surface.projection_revision < current.projection_revision
+                        || (surface.projection_revision == current.projection_revision
+                            && surface.surface_revision < current.surface_revision))
             })
         {
             return;

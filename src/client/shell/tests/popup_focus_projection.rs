@@ -1034,3 +1034,193 @@ fn pending_scroll_target_does_not_relabel_an_older_surface() {
     );
     assert_eq!(state.pane_scroll_targets.get("pane_1"), Some(&10));
 }
+
+#[test]
+fn retained_surface_patch_updates_only_pane_cells_without_recomposing_chrome() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    let pane_surface = surface();
+    let mut updated_pane = pane_surface.panes[0].clone();
+    updated_pane.content_revision = 2;
+    state.set_pane_surface(pane_surface);
+    let composed = state.compose(100, 30).expect("initial composed frame");
+    let layout = state.layout(100, 30);
+    let patch = crate::protocol::PaneSurfacePatch {
+        boot_id: "boot-1".into(),
+        projection_revision: 1,
+        base_surface_revision: 1,
+        surface_revision: 2,
+        rows: vec![crate::protocol::PaneSurfacePatchRow {
+            x: 0,
+            y: 0,
+            cells: vec![
+                crate::protocol::CellData {
+                    symbol: "N".into(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                };
+                4
+            ],
+        }],
+        panes: vec![updated_pane],
+        cursor: None,
+    };
+
+    let ClientPaneSurfacePatchOutcome::Applied(Some(patch)) = state.apply_pane_surface_patch(patch)
+    else {
+        panic!("expected fast retained patch");
+    };
+    let patched = apply_composed_surface_patch(&composed, patch).expect("apply composed patch");
+    let pane_index = usize::from(layout.pane_surface.y) * usize::from(patched.width)
+        + usize::from(layout.pane_surface.x);
+    assert_eq!(patched.cells[pane_index].symbol, "N");
+    assert_eq!(
+        patched.cells[0], composed.cells[0],
+        "sidebar chrome changed"
+    );
+    assert_eq!(state.pane_surface.as_ref().unwrap().surface_revision, 2);
+
+    let mut forced_full = surface();
+    forced_full.surface_revision = 3;
+    forced_full.frame.cells[0].symbol = "F".into();
+    state.set_pane_surface(forced_full);
+    assert_eq!(state.pane_surface.as_ref().unwrap().surface_revision, 3);
+    assert_eq!(
+        state.pane_surface.as_ref().unwrap().frame.cells[0].symbol,
+        "F"
+    );
+}
+
+#[test]
+fn retained_surface_patch_recomposes_client_owned_mode_and_diagnostic_rows() {
+    for diagnostic in [false, true] {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        let pane_surface = surface();
+        let mut updated_pane = pane_surface.panes[0].clone();
+        updated_pane.content_revision = 2;
+        state.set_pane_surface(pane_surface);
+        state.compose(100, 30).expect("initial composed frame");
+        if diagnostic {
+            state.config_diagnostic = Some("invalid config".into());
+        } else {
+            state.mode = ClientShellMode::Prefix;
+        }
+        let patch = crate::protocol::PaneSurfacePatch {
+            boot_id: "boot-1".into(),
+            projection_revision: 1,
+            base_surface_revision: 1,
+            surface_revision: 2,
+            rows: Vec::new(),
+            panes: vec![updated_pane],
+            cursor: None,
+        };
+
+        assert!(matches!(
+            state.apply_pane_surface_patch(patch),
+            ClientPaneSurfacePatchOutcome::Applied(None)
+        ));
+    }
+}
+
+#[test]
+fn retained_surface_patch_updates_scrollbar_cells_and_pane_hit_metadata() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    let mut pane_surface = surface();
+    pane_surface.frame = FrameData::from_ratatui_buffer_with_hyperlinks(
+        &Buffer::with_lines(["LIVE ", "PANE "]),
+        None,
+        &[],
+    );
+    pane_surface.panes[0].rect.width = 5;
+    state.set_pane_surface(pane_surface.clone());
+    let composed = state.compose(100, 30).expect("initial composed frame");
+    let layout = state.layout(100, 30);
+    let mut updated_pane = pane_surface.panes[0].clone();
+    updated_pane.scrollbar_rect = Some(SurfaceRect {
+        x: 4,
+        y: 0,
+        width: 1,
+        height: 2,
+    });
+    updated_pane.scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
+        offset_from_bottom: 2,
+        max_offset_from_bottom: 8,
+        viewport_rows: 2,
+    });
+    updated_pane.mouse_reporting = true;
+    updated_pane.sgr_pixel_mouse = true;
+    let patch = crate::protocol::PaneSurfacePatch {
+        boot_id: "boot-1".into(),
+        projection_revision: 1,
+        base_surface_revision: 1,
+        surface_revision: 2,
+        rows: vec![crate::protocol::PaneSurfacePatchRow {
+            x: 4,
+            y: 0,
+            cells: vec![crate::protocol::CellData {
+                symbol: "▐".into(),
+                fg: 0,
+                bg: 0,
+                modifier: 0,
+                skip: false,
+                hyperlink: None,
+            }],
+        }],
+        panes: vec![updated_pane],
+        cursor: None,
+    };
+
+    let ClientPaneSurfacePatchOutcome::Applied(Some(patch)) = state.apply_pane_surface_patch(patch)
+    else {
+        panic!("expected fast retained patch");
+    };
+    let patched = apply_composed_surface_patch(&composed, patch).expect("apply composed patch");
+    let scrollbar_index = usize::from(layout.pane_surface.y) * usize::from(patched.width)
+        + usize::from(layout.pane_surface.x + 4);
+    assert_eq!(patched.cells[scrollbar_index].symbol, "▐");
+    let hit = state
+        .hits
+        .panes
+        .iter()
+        .find(|hit| hit.pane_id == "pane_1")
+        .expect("pane hit");
+    assert_eq!(
+        hit.scrollbar_rect,
+        Some(Rect::new(
+            layout.pane_surface.x + 4,
+            layout.pane_surface.y,
+            1,
+            2,
+        ))
+    );
+    assert_eq!(
+        hit.scroll.map(|scroll| scroll.max_offset_from_bottom),
+        Some(8)
+    );
+    assert!(hit.mouse_reporting);
+    assert!(hit.sgr_pixel_mouse);
+}
+
+#[test]
+fn retained_surface_patch_rejects_stale_base_without_mutating_surface() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    let before = state.pane_surface.clone();
+    let outcome = state.apply_pane_surface_patch(crate::protocol::PaneSurfacePatch {
+        boot_id: "boot-1".into(),
+        projection_revision: 1,
+        base_surface_revision: 0,
+        surface_revision: 2,
+        rows: Vec::new(),
+        panes: Vec::new(),
+        cursor: None,
+    });
+    assert!(matches!(outcome, ClientPaneSurfacePatchOutcome::Rejected));
+    assert_eq!(state.pane_surface, before);
+}

@@ -92,6 +92,7 @@ fn surface() -> PaneSurfaceFrame {
     PaneSurfaceFrame {
         boot_id: "boot-1".into(),
         projection_revision: 1,
+        surface_revision: 1,
         frame: FrameData::from_ratatui_buffer_with_hyperlinks(
             &surface_buffer,
             Some(crate::protocol::CursorState {
