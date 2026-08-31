@@ -1798,6 +1798,36 @@ mod tests {
     }
 
     #[test]
+    fn retained_patch_width_transition_matches_full_diff_with_following_cell() {
+        let previous = make_frame(
+            3,
+            1,
+            vec![
+                make_cell("界", 0, 0, 0),
+                make_cell("z", 0, 0, 0),
+                make_cell("q", 0, 0, 0),
+            ],
+        );
+        let mut encoder = BlitEncoder::new();
+        let initial = encoder.encode(&previous, false);
+        encoder.commit(previous.clone(), initial);
+
+        let rows = vec![PaneSurfacePatchRow {
+            x: 0,
+            y: 0,
+            cells: vec![make_cell("x", 0, 0, 0), make_cell("z", 0, 0, 0)],
+        }];
+        let mut expected = previous;
+        expected.cells[0..2].clone_from_slice(&rows[0].cells);
+
+        let full_diff = encoder.encode(&expected, false);
+        let patch = encoder
+            .encode_patch(&rows, None, false)
+            .expect("valid retained patch");
+        assert_eq!(patch.bytes, full_diff.bytes);
+    }
+
+    #[test]
     fn retained_patch_rejects_overlapping_rows() {
         let frame = make_frame(
             3,

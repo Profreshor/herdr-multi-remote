@@ -134,11 +134,15 @@ impl ClientShellState {
         }
         for row in &patch.rows {
             if !row_fits_frame(row, &current.frame)
+                || row.cells.is_empty()
                 || !patch.panes.iter().any(|pane| {
-                    let terminal_row = row.x == pane.inner_rect.x
+                    let terminal_row = row.x >= pane.inner_rect.x
                         && row.y >= pane.inner_rect.y
                         && row.y < pane.inner_rect.y.saturating_add(pane.inner_rect.height)
-                        && row.cells.len() == usize::from(pane.inner_rect.width);
+                        && row
+                            .x
+                            .saturating_add(row.cells.len().min(u16::MAX as usize) as u16)
+                            <= pane.inner_rect.x.saturating_add(pane.inner_rect.width);
                     let scrollbar_rect = pane.scrollbar_rect.or_else(|| {
                         current
                             .panes

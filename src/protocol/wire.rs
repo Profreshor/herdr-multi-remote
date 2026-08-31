@@ -1171,7 +1171,7 @@ pub enum ClientShellPopupSize {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSurfacePatchRow {
-    /// Origin-relative surface column where this complete pane row starts.
+    /// Origin-relative surface column where this changed cell span starts.
     pub x: u16,
     /// Origin-relative surface row.
     pub y: u16,

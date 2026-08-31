@@ -961,7 +961,11 @@ async fn different_size_shells_receive_geometry_specific_patches_from_one_dirty_
             <= small_initial.frame.width
             && row.y < small_initial.frame.height
     }));
-    assert_ne!(large_patch.rows, small_patch.rows);
+    assert_eq!(large_patch.rows, small_patch.rows);
+    assert_ne!(
+        large_patch.panes[0].inner_rect,
+        small_patch.panes[0].inner_rect
+    );
     assert!(frame_text(
         &server.clients[&7]
             .render_state
@@ -1393,7 +1397,7 @@ async fn client_shell_hidden_pane_rejects_presses_but_accepts_releases() {
     );
     assert!(input_rx.try_recv().is_err());
     assert!(
-        server.handle_server_event(ServerEvent::ClientShellPaneInput {
+        !server.handle_server_event(ServerEvent::ClientShellPaneInput {
             client_id: 11,
             pane_id,
             events: vec![key(crate::protocol::ClientKeyKind::Release)],
@@ -1488,7 +1492,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
     );
 
     assert!(
-        server.handle_server_event(ServerEvent::ClientShellPopupInput {
+        !server.handle_server_event(ServerEvent::ClientShellPopupInput {
             client_id: 12,
             terminal_id: popup_terminal_id.to_string(),
             events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
@@ -1535,6 +1539,139 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
         panic!("expected pane surface after popup close");
     };
     assert!(surface.popup.is_none());
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn client_shell_release_under_popup_renders_when_it_resets_scrollback() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("popup-release-scroll");
+    let pane_id = workspace.tabs[0].root_pane;
+    let (runtime, mut input_rx) =
+        crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+            80,
+            2,
+            10_000,
+            b"one\r\ntwo\r\nthree\r\n\x1b[>3u",
+            4,
+        );
+    runtime.scroll_up(1);
+    assert!(runtime
+        .scroll_metrics()
+        .is_some_and(|metrics| metrics.offset_from_bottom > 0));
+    workspace.insert_test_runtime(pane_id, runtime);
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    let popup_runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"");
+    server.app.install_test_popup_runtime(popup_runtime);
+    server.clients.insert(
+        11,
+        ClientConnection::new_with_mode(
+            ClientConnectionMode::ClientShell,
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            1,
+            RenderEncoding::SemanticFrame,
+            None,
+        ),
+    );
+    server.foreground_client_id = Some(11);
+
+    let render_impact =
+        server.handle_server_event_with_render_impact(ServerEvent::ClientShellPaneInput {
+            client_id: 11,
+            pane_id: public_pane_id,
+            events: vec![crate::protocol::ClientPaneInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('x'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Release,
+                repeat_count: 1,
+                shifted_codepoint: None,
+                generated_text: None,
+                tracks_release: true,
+                physical_key_id: Some(0x2d),
+            }],
+        });
+
+    assert_eq!(render_impact, RenderImpact::Full);
+    assert!(!input_rx.recv().await.expect("encoded release").is_empty());
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn client_shell_text_input_renders_only_when_resetting_scrollback() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("scrolled-input");
+    let pane_id = workspace.tabs[0].root_pane;
+    let (runtime, mut input_rx) =
+        crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+            80,
+            2,
+            10_000,
+            b"one\r\ntwo\r\nthree\r\n",
+            4,
+        );
+    runtime.scroll_up(1);
+    assert!(runtime
+        .scroll_metrics()
+        .is_some_and(|metrics| metrics.offset_from_bottom > 0));
+    workspace.insert_test_runtime(pane_id, runtime);
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    server.clients.insert(
+        11,
+        ClientConnection::new_with_mode(
+            ClientConnectionMode::ClientShell,
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            1,
+            RenderEncoding::SemanticFrame,
+            None,
+        ),
+    );
+    server.foreground_client_id = Some(11);
+
+    let render_impact =
+        server.handle_server_event_with_render_impact(ServerEvent::ClientShellPaneInput {
+            client_id: 11,
+            pane_id: public_pane_id.clone(),
+            events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
+                "x".to_owned(),
+            )],
+        });
+
+    assert_eq!(render_impact, RenderImpact::Full);
+    assert_eq!(
+        input_rx.try_recv().expect("text must reach the PTY"),
+        Bytes::from_static(b"x")
+    );
+    assert_eq!(
+        server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .and_then(|runtime| runtime.scroll_metrics())
+            .map(|metrics| metrics.offset_from_bottom),
+        Some(0)
+    );
+
+    let render_impact =
+        server.handle_server_event_with_render_impact(ServerEvent::ClientShellPaneInput {
+            client_id: 11,
+            pane_id: public_pane_id,
+            events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
+                "y".to_owned(),
+            )],
+        });
+    assert_eq!(render_impact, RenderImpact::None);
+    assert_eq!(
+        input_rx.try_recv().expect("second text must reach the PTY"),
+        Bytes::from_static(b"y")
+    );
     shutdown_test_runtimes(&mut server);
 }
 
@@ -3434,7 +3571,7 @@ async fn client_shell_release_cleanup_does_not_promote_and_survives_disconnect()
     assert!(server.promote_client_to_foreground(2));
 
     assert!(
-        server.handle_server_event(ServerEvent::ClientShellPaneInput {
+        !server.handle_server_event(ServerEvent::ClientShellPaneInput {
             client_id: 1,
             pane_id: pane_id.clone(),
             events: vec![key(crate::protocol::ClientKeyKind::Release)],

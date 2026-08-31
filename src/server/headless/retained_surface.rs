@@ -52,7 +52,7 @@ fn apply_rows(
     if !rect_fits_frame(area, frame) {
         return None;
     }
-    let mut rows = Vec::with_capacity(patch.rows.len());
+    let mut rows = Vec::new();
     for (local_y, cells) in &patch.rows {
         if *local_y >= area.height {
             continue;
@@ -62,13 +62,35 @@ fn apply_rows(
             return None;
         }
         let y = area.y + *local_y;
-        let row = protocol::PaneSurfacePatchRow {
-            x: area.x,
-            y,
-            cells: cells[..width].to_vec(),
-        };
-        apply_patch_row(frame, &row)?;
-        rows.push(row);
+        let frame_start = usize::from(y) * usize::from(frame.width) + usize::from(area.x);
+        let frame_end = frame_start.checked_add(width)?;
+        let existing = frame.cells.get(frame_start..frame_end)?;
+        let desired = &cells[..width];
+        let mut offset = 0;
+        while offset < width {
+            if existing[offset] == desired[offset] {
+                offset += 1;
+                continue;
+            }
+            let start = offset;
+            offset += 1;
+            while offset < width && existing[offset] != desired[offset] {
+                offset += 1;
+            }
+            // Include the following cell so a wide-to-narrow (or
+            // narrow-to-wide) transition repaints content covered by the old
+            // grapheme width even when that logical neighbor is unchanged.
+            let end = offset.saturating_add(1).min(width);
+            rows.push(protocol::PaneSurfacePatchRow {
+                x: area.x.checked_add(u16::try_from(start).ok()?)?,
+                y,
+                cells: desired[start..end].to_vec(),
+            });
+            offset = end;
+        }
+    }
+    for row in &rows {
+        apply_patch_row(frame, row)?;
     }
     Some(rows)
 }
@@ -468,5 +490,124 @@ impl HeadlessServer {
             success!("sent");
         }
         success!("recovery_queued");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell(symbol: &str) -> protocol::CellData {
+        protocol::CellData {
+            symbol: symbol.to_owned(),
+            fg: 0,
+            bg: 0,
+            modifier: 0,
+            skip: false,
+            hyperlink: None,
+        }
+    }
+
+    #[test]
+    fn retained_rows_send_only_changed_cell_spans() {
+        let mut frame = FrameData {
+            width: 6,
+            height: 2,
+            cells: vec![cell(" "); 12],
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        let patch = crate::pane::TerminalDirtyPatch {
+            rows: vec![(0, vec![cell(" "), cell("x"), cell("y"), cell(" ")])],
+        };
+
+        let rows = apply_rows(
+            &mut frame,
+            protocol::SurfaceRect {
+                x: 1,
+                y: 1,
+                width: 4,
+                height: 1,
+            },
+            &patch,
+        )
+        .expect("valid patch");
+
+        assert_eq!(
+            rows,
+            vec![protocol::PaneSurfacePatchRow {
+                x: 2,
+                y: 1,
+                cells: vec![cell("x"), cell("y"), cell(" ")],
+            }]
+        );
+        assert_eq!(frame.cells[8], cell("x"));
+        assert_eq!(frame.cells[9], cell("y"));
+    }
+
+    #[test]
+    fn retained_rows_include_the_cell_after_a_width_transition() {
+        let mut frame = FrameData {
+            width: 3,
+            height: 1,
+            cells: vec![cell("界"), cell("z"), cell("q")],
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        let patch = crate::pane::TerminalDirtyPatch {
+            rows: vec![(0, vec![cell("x"), cell("z"), cell("q")])],
+        };
+
+        let rows = apply_rows(
+            &mut frame,
+            protocol::SurfaceRect {
+                x: 0,
+                y: 0,
+                width: 3,
+                height: 1,
+            },
+            &patch,
+        )
+        .expect("valid patch");
+
+        assert_eq!(
+            rows,
+            vec![protocol::PaneSurfacePatchRow {
+                x: 0,
+                y: 0,
+                cells: vec![cell("x"), cell("z")],
+            }]
+        );
+    }
+
+    #[test]
+    fn retained_rows_omit_unchanged_full_dirty_rows() {
+        let mut frame = FrameData {
+            width: 4,
+            height: 2,
+            cells: vec![cell(" "); 8],
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        let patch = crate::pane::TerminalDirtyPatch {
+            rows: vec![(0, vec![cell(" "); 4]), (1, vec![cell(" "); 4])],
+        };
+
+        let rows = apply_rows(
+            &mut frame,
+            protocol::SurfaceRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 2,
+            },
+            &patch,
+        )
+        .expect("valid patch");
+
+        assert!(rows.is_empty());
     }
 }
