@@ -26,6 +26,7 @@ mod shell;
 mod terminal_geometry;
 mod terminal_sessions;
 mod terminal_setup;
+mod timer;
 
 #[cfg(test)]
 pub(crate) use shell::{ClientShellConfig, ClientShellState};
@@ -833,6 +834,7 @@ async fn run_client_loop(
     let mut prefix_input_source = crate::platform::RealPrefixInputSource::default();
 
     // Main event loop.
+    let mut client_timer = timer::ClientLoopTimer::new();
     while !should_quit.load(Ordering::Acquire) {
         let timer_delay = state
             .shell
@@ -840,9 +842,11 @@ async fn run_client_loop(
             .map_or(Duration::from_millis(100), |shell| {
                 shell.timer_delay(std::time::Instant::now())
             });
+        let timer_deadline = client_timer.deadline(std::time::Instant::now(), timer_delay);
         let event = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(timer_deadline.into()) => ClientLoopEvent::Timer,
             ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
-            _ = tokio::time::sleep(timer_delay) => ClientLoopEvent::Timer,
         };
         let now = std::time::Instant::now();
         if let Some(shell) = state.shell.as_mut() {
@@ -1687,6 +1691,7 @@ async fn run_client_loop(
                 )));
             }
             ClientLoopEvent::Timer => {
+                client_timer.fired();
                 #[cfg(unix)]
                 if let Ok(mut matcher) = state.direct_graphics_response.lock() {
                     matcher.expire();
