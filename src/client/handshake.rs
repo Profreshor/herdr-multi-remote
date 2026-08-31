@@ -13,7 +13,9 @@ use crate::protocol::{
     self, ClientMessage, RenderEncoding, ServerMessage, MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
 
-use super::{shell, terminal_setup::is_ssh_session, ClientError};
+#[cfg(unix)]
+use super::terminal_setup::is_ssh_session;
+use super::{shell, ClientError};
 
 /// Time to wait for the server's Welcome reply during the handshake.
 ///

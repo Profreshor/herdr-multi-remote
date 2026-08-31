@@ -508,6 +508,7 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         );
+        app.state.integration_recommendations.clear();
         app.state.update_available = Some("0.8.3".into());
         app.state.update_install_command = "herdr update".into();
         app.state.latest_release_notes_available = true;
