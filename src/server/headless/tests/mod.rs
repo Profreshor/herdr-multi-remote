@@ -679,6 +679,33 @@ async fn client_shell_endpoint_request_uses_the_selected_connection() {
     shutdown_test_runtimes(&mut server);
 }
 
+#[test]
+fn terminal_client_endpoint_request_error_removes_client() {
+    let mut server = test_headless_server();
+    let (writer, _control_rx, _render_rx) = test_client_writer();
+    let client_id = 42;
+    assert!(!server.handle_server_event(ServerEvent::ClientConnected {
+        client_id,
+        cols: 80,
+        rows: 24,
+        cell_width_px: 0,
+        cell_height_px: 0,
+        pixel_mouse: false,
+        writer,
+    }));
+
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellEndpointRequestError {
+            client_id,
+            boot_id: "boot".into(),
+            request_id: "request".into(),
+            code: "unsupported_method",
+            message: "unsupported".into(),
+        })
+    );
+    assert!(!server.clients.contains_key(&client_id));
+}
+
 #[tokio::test]
 async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
     let mut server = test_headless_server();

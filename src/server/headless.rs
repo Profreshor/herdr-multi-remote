@@ -2386,6 +2386,13 @@ impl HeadlessServer {
                 code,
                 message,
             } => {
+                let Some(client) = self.clients.get(&client_id) else {
+                    return false;
+                };
+                if !matches!(client.mode, ClientConnectionMode::ClientShell) {
+                    self.remove_client_and_resize_if_needed(client_id);
+                    return true;
+                }
                 let message = crate::server::client_commands::error_message(
                     boot_id, request_id, code, message,
                 );
