@@ -15,7 +15,7 @@ pub(crate) use self::onboarding::{
     ONBOARDING_HELP_SUFFIX, ONBOARDING_NEXT, ONBOARDING_PREFIX_LABEL, ONBOARDING_PREFIX_SUFFIX,
     ONBOARDING_SUBTITLE, ONBOARDING_TITLE,
 };
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use self::panes::popup_pane_rects;
 use self::panes::resize_popup_pane;
 pub(crate) use self::panes::{

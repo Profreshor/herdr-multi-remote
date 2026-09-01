@@ -782,6 +782,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&bytes).contains("\u{1b}[12;33H"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn trusted_direct_asset_is_placed_without_inline_reupload() {
         let mut state = ClientState::default();
@@ -822,6 +823,7 @@ mod tests {
         assert!(!bytes.contains("a=t,t=d"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn direct_asset_trusted_after_scene_arrival_is_immediately_placeable() {
         let mut state = ClientState::default();
@@ -854,6 +856,7 @@ mod tests {
         assert!(!bytes.contains("a=t,t=d"), "{bytes}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn retained_direct_asset_survives_hidden_scene_and_replays_without_upload() {
         let mut state = ClientState::default();
@@ -964,6 +967,7 @@ mod tests {
         assert!(bytes.contains("\u{1b}[11;21H"), "{bytes}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn retired_pending_direct_asset_is_deleted_even_before_cache_adoption() {
         let mut state = ClientState::default();
@@ -974,6 +978,7 @@ mod tests {
         assert!(cleanup.contains("a=d,d=I,i=4242"), "{cleanup}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn unclaimed_direct_asset_is_deleted_by_the_next_authoritative_scene() {
         let mut state = ClientState::default();

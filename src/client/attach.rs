@@ -295,7 +295,7 @@ pub(super) fn write_attach_semantic_action(
     write_to_server(stream, &message)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::protocol::{AttachScrollDirection, AttachScrollSource};

@@ -88,7 +88,7 @@ impl RawInputFramer {
         Self::events_from_chunks(self.byte_framer.push(data))
     }
 
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, all(test, not(target_os = "macos"))))]
     pub(crate) fn has_pending_input(&self) -> bool {
         self.byte_framer.has_pending_input()
     }
