@@ -387,11 +387,18 @@ impl HeadlessServer {
                     client.shell_projection_revision =
                         client.shell_projection_revision.saturating_add(1);
                     candidate.revision = client.shell_projection_revision;
-                    let message = ServerMessage::ClientShellSnapshot(Box::new(candidate.clone()));
+                    let message = match crate::protocol::endpoint::snapshot_message(&candidate) {
+                        Ok(message) => message,
+                        Err(err) => {
+                            warn!(client_id, err = %err, "failed to encode endpoint snapshot");
+                            broken_clients.push(client_id);
+                            continue;
+                        }
+                    };
                     let framed = match Self::frame_server_message(&message) {
                         Ok(framed) => framed,
                         Err(err) => {
-                            warn!(client_id, err = %err, "failed to frame client shell replacement");
+                            warn!(client_id, err = %err, "failed to frame endpoint snapshot");
                             broken_clients.push(client_id);
                             continue;
                         }

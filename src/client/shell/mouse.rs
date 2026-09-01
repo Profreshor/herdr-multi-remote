@@ -78,14 +78,20 @@ impl ClientShellState {
         self.pane_scroll_targets
             .insert(pane_id.clone(), offset_from_bottom);
         self.pane_scroll_in_flight.insert(pane_id.clone(), serial);
-        self.push_endpoint_method_with_kind(
+        if !self.push_endpoint_method_with_kind(
             crate::api::schema::Method::PaneScroll(crate::api::schema::PaneScrollParams {
                 pane_id: pane_id.clone(),
                 offset_from_bottom: offset_from_bottom as u64,
             }),
-            PendingEndpointKind::PaneScroll { pane_id, serial },
+            PendingEndpointKind::PaneScroll {
+                pane_id: pane_id.clone(),
+                serial,
+            },
             outcome,
-        );
+        ) {
+            self.pane_scroll_targets.remove(&pane_id);
+            self.pane_scroll_in_flight.remove(&pane_id);
+        }
     }
 
     pub(super) fn complete_pane_scroll(

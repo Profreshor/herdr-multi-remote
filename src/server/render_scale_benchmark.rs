@@ -16,6 +16,7 @@ const ROWS: u16 = 40;
 const SAMPLE_COUNT: usize = 40;
 const WARMUP_COUNT: usize = 5;
 const CARDINALITIES: [usize; 3] = [1, 15, 50];
+const CLIENT_CARDINALITIES: [usize; 2] = [1, 4];
 
 #[derive(Clone, Copy)]
 struct StageStats {
@@ -210,9 +211,52 @@ fn print_profiles(label: &str, build: fn(usize) -> Vec<Workspace>) {
     print_stage("combined pipeline", &rows, |stats| stats.total);
 }
 
+fn profile_snapshot_encoding(
+    build: fn(usize) -> Vec<Workspace>,
+    count: usize,
+    client_count: usize,
+) -> StageStats {
+    let pipeline = RenderPipeline::new(build(count));
+    let run = || {
+        let started = Instant::now();
+        let template = super::client_shell::snapshot(&pipeline.app, "bench-boot", 1, None);
+        for client_index in 0..client_count {
+            let mut snapshot = template.clone();
+            snapshot.revision = client_index as u64 + 1;
+            let message = crate::protocol::endpoint::snapshot_message(&snapshot)
+                .expect("benchmark snapshot should serialize");
+            black_box(
+                bincode::serde::encode_to_vec(message, bincode::config::standard())
+                    .expect("benchmark snapshot message should frame"),
+            );
+        }
+        started.elapsed()
+    };
+    for _ in 0..WARMUP_COUNT {
+        black_box(run());
+    }
+    summarize((0..SAMPLE_COUNT).map(|_| run()).collect())
+}
+
+fn print_snapshot_encoding_profiles(label: &str, build: fn(usize) -> Vec<Workspace>) {
+    println!("{label} snapshot projection + JSON framing");
+    println!("       panes  clients  median_us  p95_us  max_us");
+    for count in CARDINALITIES {
+        for client_count in CLIENT_CARDINALITIES {
+            let stats = profile_snapshot_encoding(build, count, client_count);
+            println!(
+                "  {count:>10}  {client_count:>7}  {:>9}  {:>6}  {:>6}",
+                stats.median_us, stats.p95_us, stats.max_us
+            );
+        }
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "manual client-rendered pipeline scaling profile"]
 async fn render_scale_profile() {
     print_profiles("background workspaces (one pane each)", workspaces);
+    print_snapshot_encoding_profiles("background workspaces", workspaces);
     print_profiles("active panes (one workspace)", active_panes);
+    print_snapshot_encoding_profiles("active panes", active_panes);
 }

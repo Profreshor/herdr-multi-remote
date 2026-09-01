@@ -227,11 +227,13 @@ impl ClientShellState {
                 if action == crate::protocol::ClientShellCommandAction::Popup {
                     self.popup_pending = true;
                     self.popup_pending_deadline = None;
-                    self.push_endpoint_method_with_kind(
+                    if !self.push_endpoint_method_with_kind(
                         crate::api::schema::Method::CommandInvoke(params),
                         PendingEndpointKind::PopupCommand,
                         outcome,
-                    );
+                    ) {
+                        self.popup_pending = false;
+                    }
                 } else {
                     self.push_endpoint_method(
                         crate::api::schema::Method::CommandInvoke(params),
@@ -323,7 +325,7 @@ impl ClientShellState {
         self.word_selection_generation = self.word_selection_generation.saturating_add(1);
         let generation = self.word_selection_generation;
         self.pending_word_selection = Some(generation);
-        self.push_endpoint_method_with_kind(
+        if !self.push_endpoint_method_with_kind(
             crate::api::schema::Method::PaneSelectionRead(
                 crate::api::schema::PaneSelectionReadParams {
                     pane_id: hit.pane_id.clone(),
@@ -345,7 +347,9 @@ impl ClientShellState {
                 generation,
             },
             outcome,
-        );
+        ) {
+            self.pending_word_selection = None;
+        }
     }
 
     pub(super) fn push_endpoint_method(
@@ -361,10 +365,18 @@ impl ClientShellState {
         method: crate::api::schema::Method,
         kind: PendingEndpointKind,
         outcome: &mut ClientShellInput,
-    ) {
+    ) -> bool {
         let Some(snapshot) = self.snapshot.as_deref() else {
-            return;
+            return false;
         };
+        if !self.supports_endpoint_method(&method) {
+            self.endpoint_error = Some(format!(
+                "This action is unavailable on this machine (missing {}).",
+                crate::api::api_method_name(&method)
+            ));
+            outcome.repaint = true;
+            return false;
+        }
         let confirmation_workspace_id = match &method {
             crate::api::schema::Method::TabClose(target) => snapshot
                 .tabs
@@ -396,6 +408,7 @@ impl ClientShellState {
                 method,
             }),
         });
+        true
     }
 
     pub(crate) fn receive_endpoint_error(&mut self, message: String) -> bool {

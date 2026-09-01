@@ -836,6 +836,10 @@ pub(crate) struct ClientShellState {
     pub(super) popup_pending: bool,
     pub(super) popup_pending_deadline: Option<std::time::Instant>,
     pub(super) next_request_id: u64,
+    /// Methods advertised by this endpoint. `None` is used only by local tests
+    /// and legacy construction paths; negotiated endpoint connections always
+    /// install an explicit set.
+    pub(super) endpoint_methods: Option<HashSet<String>>,
     pub(super) pending_requests: HashMap<String, PendingEndpointRequest>,
     pub(super) pending_integration_installs: usize,
     pub(super) pending_notifications: Vec<ClientPendingNotification>,
@@ -971,6 +975,7 @@ impl ClientShellState {
             popup_pending: false,
             popup_pending_deadline: None,
             next_request_id: 1,
+            endpoint_methods: None,
             pending_requests: HashMap::new(),
             pending_integration_installs: 0,
             pending_notifications: Vec::new(),
@@ -985,6 +990,16 @@ impl ClientShellState {
             endpoint_error: None,
             dismissed_product_announcement: None,
         }
+    }
+
+    pub(crate) fn set_endpoint_methods(&mut self, methods: Option<Vec<String>>) {
+        self.endpoint_methods = methods.map(|methods| methods.into_iter().collect());
+    }
+
+    pub(super) fn supports_endpoint_method(&self, method: &crate::api::schema::Method) -> bool {
+        self.endpoint_methods
+            .as_ref()
+            .is_none_or(|methods| methods.contains(crate::api::api_method_name(method)))
     }
 
     fn focused_tab_count(&self) -> usize {
@@ -1072,7 +1087,10 @@ impl ClientShellState {
         }
     }
 
-    pub(crate) fn set_snapshot(&mut self, snapshot: Box<ClientShellSnapshot>) {
+    pub(crate) fn set_snapshot(&mut self, mut snapshot: Box<ClientShellSnapshot>) {
+        snapshot
+            .commands
+            .retain(|command| command.action != crate::protocol::ClientShellCommandAction::Unknown);
         if self.snapshot.as_ref().is_some_and(|current| {
             current.boot_id == snapshot.boot_id && snapshot.revision < current.revision
         }) {

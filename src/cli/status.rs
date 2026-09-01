@@ -98,6 +98,10 @@ fn print_full_status(json: bool) -> std::io::Result<i32> {
         crate::config::Config::load().config.update.channel.as_str()
     );
     println!("  protocol: {}", crate::protocol::PROTOCOL_VERSION);
+    println!(
+        "  endpoint_protocol_generation: {}",
+        crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION
+    );
     println!();
     println!("server:");
     print_server_status_body(&server, "  ");
@@ -130,6 +134,10 @@ fn print_client_status(json: bool) -> std::io::Result<()> {
         crate::config::Config::load().config.update.channel.as_str()
     );
     println!("protocol: {}", crate::protocol::PROTOCOL_VERSION);
+    println!(
+        "endpoint_protocol_generation: {}",
+        crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION
+    );
     println!("binary: {}", current_exe_label());
     Ok(())
 }
@@ -137,12 +145,21 @@ fn print_client_status(json: bool) -> std::io::Result<()> {
 fn print_server_status_body(server: &ServerRuntimeStatus, indent: &str) {
     match server {
         ServerRuntimeStatus::Running {
-            version, protocol, ..
+            version,
+            protocol,
+            capabilities,
         } => {
             println!("{indent}status: running");
             println!("{indent}version: {}", option_label(version.as_deref()));
-            println!("{indent}protocol: {}", protocol_label(*protocol));
-            println!("{indent}compatible: {}", compatibility_label(*protocol));
+            println!(
+                "{indent}endpoint_compatible: {}",
+                endpoint_compatibility_label(capabilities.as_ref())
+            );
+            println!("{indent}private_protocol: {}", protocol_label(*protocol));
+            println!(
+                "{indent}private_protocol_compatible: {}",
+                compatibility_label(*protocol)
+            );
             println!("{indent}socket: {}", api::socket_path().display());
         }
         ServerRuntimeStatus::NotRunning => {
@@ -191,6 +208,20 @@ fn compatibility_label(protocol: Option<u32>) -> &'static str {
     }
 }
 
+fn endpoint_compatibility_label(
+    capabilities: Option<&crate::api::schema::ServerCapabilities>,
+) -> &'static str {
+    match capabilities.and_then(|value| value.endpoint_protocol_generation) {
+        Some(generation)
+            if generation == crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION =>
+        {
+            "yes"
+        }
+        Some(_) => "no",
+        None => "unknown",
+    }
+}
+
 fn restart_needed_label(server: &ServerRuntimeStatus) -> &'static str {
     match server {
         ServerRuntimeStatus::Running { version, .. } => match version.as_deref() {
@@ -214,6 +245,7 @@ struct ClientStatusJson {
     version: String,
     channel: &'static str,
     protocol: u32,
+    endpoint_protocol_generation: u32,
     binary: String,
     session: Option<String>,
 }
@@ -226,6 +258,7 @@ struct ServerStatusJson {
     protocol: Option<u32>,
     capabilities: Option<ServerCapabilitiesJson>,
     compatible: Option<bool>,
+    endpoint_compatible: Option<bool>,
     socket: String,
     session: Option<String>,
     restart_needed: Option<bool>,
@@ -235,6 +268,7 @@ struct ServerStatusJson {
 struct ServerCapabilitiesJson {
     live_handoff: bool,
     detached_server_daemon: bool,
+    endpoint_protocol_generation: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -247,6 +281,7 @@ fn client_status_json() -> ClientStatusJson {
         version: crate::build_info::version(),
         channel: crate::config::Config::load().config.update.channel.as_str(),
         protocol: crate::protocol::PROTOCOL_VERSION,
+        endpoint_protocol_generation: crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
         binary: current_exe_label(),
         session: crate::session::active_name(),
     }
@@ -268,8 +303,14 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                 .map(|capabilities| ServerCapabilitiesJson {
                     live_handoff: capabilities.live_handoff,
                     detached_server_daemon: capabilities.detached_server_daemon,
+                    endpoint_protocol_generation: capabilities.endpoint_protocol_generation,
                 }),
             compatible: protocol.map(|value| value == crate::protocol::PROTOCOL_VERSION),
+            endpoint_compatible: capabilities.as_ref().and_then(|capabilities| {
+                capabilities.endpoint_protocol_generation.map(|generation| {
+                    generation == crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION
+                })
+            }),
             socket: api::socket_path().display().to_string(),
             session: crate::session::active_name(),
             restart_needed: restart_needed_bool(server),
@@ -281,6 +322,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             protocol: None,
             capabilities: None,
             compatible: None,
+            endpoint_compatible: None,
             socket: api::socket_path().display().to_string(),
             session: crate::session::active_name(),
             restart_needed: Some(false),

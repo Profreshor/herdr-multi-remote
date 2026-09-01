@@ -455,6 +455,41 @@ fn onboarding_completion_persists_and_opens_endpoint_integrations() {
 }
 
 #[test]
+fn unavailable_integration_list_does_not_wedge_settings() {
+    let mut config =
+        ClientShellConfig::from_config(&Config::default()).with_startup_onboarding(true);
+    config.local_config_path = std::env::temp_dir().join(format!(
+        "herdr-client-onboarding-unavailable-{}-{}.toml",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let mut state = ClientShellState::new(config);
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state.set_endpoint_methods(Some(Vec::new()));
+
+    let outcome = state.handle_input_bytes(b"\r");
+
+    assert!(outcome.actions.is_empty());
+    assert!(matches!(
+        state.overlay,
+        Some(ClientShellOverlay::Settings(ClientSettingsOverlay {
+            section: ClientSettingsSection::Integrations,
+            loading_integrations: false,
+            ..
+        }))
+    ));
+    assert!(state
+        .endpoint_error
+        .as_deref()
+        .is_some_and(|error| error.contains("missing integration.list")));
+    let _ = std::fs::remove_file(&state.config.local_config_path);
+}
+
+#[test]
 fn startup_config_diagnostics_are_client_rendered_and_persist_until_replaced() {
     let config = ClientShellConfig::from_config(&Config::default())
         .with_startup_config_diagnostic(Some("local config warning".into()));

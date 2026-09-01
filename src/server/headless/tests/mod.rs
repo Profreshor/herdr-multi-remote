@@ -3,6 +3,14 @@ use super::*;
 #[path = "pane_graphics.rs"]
 mod pane_graphics_tests;
 
+fn client_shell_snapshot(message: ServerMessage) -> Box<crate::protocol::ClientShellSnapshot> {
+    let ServerMessage::EndpointControl { kind, data } = message else {
+        panic!("expected client shell snapshot");
+    };
+    assert_eq!(kind, crate::protocol::endpoint::ENDPOINT_SNAPSHOT_KIND);
+    Box::new(serde_json::from_str(&data).expect("decode client shell snapshot"))
+}
+
 fn test_headless_server() -> HeadlessServer {
     test_headless_server_with_event_hub(api::EventHub::default())
 }
@@ -713,25 +721,23 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
             writer,
         })
     );
-    match read_server_message(control_rx.recv().expect("shell snapshot")) {
-        ServerMessage::ClientShellSnapshot(snapshot) => {
-            assert_eq!(snapshot.workspaces.len(), 1);
-            assert_eq!(snapshot.workspaces[0].label, "shell-only-label");
-            assert_eq!(
-                snapshot.config_diagnostic.as_deref(),
-                Some("endpoint config warning")
-            );
-            assert_eq!(
-                snapshot.product_announcement.as_ref().map(|announcement| (
-                    announcement.version.as_str(),
-                    announcement.id.as_str(),
-                    announcement.preview,
-                )),
-                Some(("0.8.2", "client-shell", true))
-            );
-        }
-        other => panic!("expected client shell snapshot, got {other:?}"),
-    }
+    let snapshot = client_shell_snapshot(read_server_message(
+        control_rx.recv().expect("shell snapshot"),
+    ));
+    assert_eq!(snapshot.workspaces.len(), 1);
+    assert_eq!(snapshot.workspaces[0].label, "shell-only-label");
+    assert_eq!(
+        snapshot.config_diagnostic.as_deref(),
+        Some("endpoint config warning")
+    );
+    assert_eq!(
+        snapshot.product_announcement.as_ref().map(|announcement| (
+            announcement.version.as_str(),
+            announcement.id.as_str(),
+            announcement.preview,
+        )),
+        Some(("0.8.2", "client-shell", true))
+    );
 
     server.render_and_stream();
     let initial_surface = match read_server_message(render_rx.recv().expect("pane surface")) {
@@ -1132,11 +1138,9 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
             writer: local_writer,
         })
     );
-    let ServerMessage::ClientShellSnapshot(local_snapshot) =
-        read_server_message(local_control.recv().expect("local shell snapshot"))
-    else {
-        panic!("expected local shell snapshot");
-    };
+    let local_snapshot = client_shell_snapshot(read_server_message(
+        local_control.recv().expect("local shell snapshot"),
+    ));
     assert_eq!(
         local_snapshot.config_diagnostic.as_deref(),
         Some("theme warning")
@@ -1157,11 +1161,9 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
             writer: endpoint_writer,
         })
     );
-    let ServerMessage::ClientShellSnapshot(endpoint_snapshot) =
-        read_server_message(endpoint_control.recv().expect("endpoint shell snapshot"))
-    else {
-        panic!("expected endpoint shell snapshot");
-    };
+    let endpoint_snapshot = client_shell_snapshot(read_server_message(
+        endpoint_control.recv().expect("endpoint shell snapshot"),
+    ));
     assert_eq!(
         endpoint_snapshot.config_diagnostic.as_deref(),
         Some("server keybinding warning\ntheme warning")
@@ -1199,10 +1201,10 @@ async fn client_shell_replaces_projection_and_focuses_stable_ids() {
             writer,
         })
     );
-    let initial_revision = match read_server_message(control_rx.recv().expect("initial snapshot")) {
-        ServerMessage::ClientShellSnapshot(snapshot) => snapshot.revision,
-        other => panic!("expected initial shell snapshot, got {other:?}"),
-    };
+    let initial_revision = client_shell_snapshot(read_server_message(
+        control_rx.recv().expect("initial snapshot"),
+    ))
+    .revision;
 
     let _ = server.app.handle_api_request(crate::api::schema::Request {
         id: "test.client.shell.workspace.focus".into(),
@@ -1213,10 +1215,9 @@ async fn client_shell_replaces_projection_and_focuses_stable_ids() {
     assert_eq!(server.app.state.active, Some(1));
     server.render_and_stream();
 
-    let replacement = match read_server_message(control_rx.recv().expect("replacement snapshot")) {
-        ServerMessage::ClientShellSnapshot(snapshot) => snapshot,
-        other => panic!("expected replacement shell snapshot, got {other:?}"),
-    };
+    let replacement = client_shell_snapshot(read_server_message(
+        control_rx.recv().expect("replacement snapshot"),
+    ));
     assert!(replacement.revision > initial_revision);
     assert_eq!(
         replacement.focused_workspace_id.as_deref(),
@@ -1441,9 +1442,8 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
             writer,
         })
     );
-    assert!(matches!(
-        read_server_message(control_rx.recv().expect("shell snapshot")),
-        ServerMessage::ClientShellSnapshot(_)
+    let _snapshot = client_shell_snapshot(read_server_message(
+        control_rx.recv().expect("shell snapshot"),
     ));
 
     server.render_and_stream();

@@ -1934,12 +1934,17 @@ impl HeadlessServer {
                     connection.shell_projection_revision,
                     config_diagnostic,
                 );
-                connection.shell_snapshot = Some(snapshot.clone());
+                let snapshot_message = match crate::protocol::endpoint::snapshot_message(&snapshot)
+                {
+                    Ok(message) => message,
+                    Err(err) => {
+                        warn!(client_id, err = %err, "failed to encode endpoint snapshot");
+                        return false;
+                    }
+                };
+                connection.shell_snapshot = Some(snapshot);
                 self.clients.insert(client_id, connection);
-                self.send_to_client(
-                    client_id,
-                    ServerMessage::ClientShellSnapshot(Box::new(snapshot)),
-                );
+                self.send_to_client(client_id, snapshot_message);
                 self.foreground_client_id = Some(client_id);
                 if first_app_client {
                     self.app.mark_git_status_refresh_due(Instant::now());
@@ -2373,6 +2378,19 @@ impl HeadlessServer {
                     warn!(client_id, terminal_id, err = %err, "targeted client popup input failed");
                 }
                 foreground_changed || runtime.scroll_metrics() != scroll_before
+            }
+            ServerEvent::ClientShellEndpointRequestError {
+                client_id,
+                boot_id,
+                request_id,
+                code,
+                message,
+            } => {
+                let message = crate::server::client_commands::error_message(
+                    boot_id, request_id, code, message,
+                );
+                self.send_to_client(client_id, message);
+                false
             }
             ServerEvent::ClientShellEndpointRequest {
                 client_id,

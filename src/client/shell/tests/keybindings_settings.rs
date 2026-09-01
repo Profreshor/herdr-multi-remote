@@ -437,6 +437,28 @@ fn plugin_command_carries_client_owned_selection_coordinates() {
 }
 
 #[test]
+fn unavailable_endpoint_method_is_disabled_without_disconnect() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_endpoint_methods(Some(vec!["pane.focus".into()]));
+    let mut outcome = ClientShellInput::default();
+
+    state.push_endpoint_method(
+        crate::api::schema::Method::WorkspaceFocus(crate::api::schema::WorkspaceTarget {
+            workspace_id: "missing".into(),
+        }),
+        &mut outcome,
+    );
+
+    assert!(outcome.actions.is_empty());
+    assert!(outcome.repaint);
+    assert_eq!(
+        state.endpoint_error.as_deref(),
+        Some("This action is unavailable on this machine (missing workspace.focus).")
+    );
+}
+
+#[test]
 fn generic_endpoint_failures_and_control_errors_are_visible() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot()));
