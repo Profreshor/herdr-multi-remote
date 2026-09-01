@@ -1761,10 +1761,20 @@ async fn run_client_loop(
                     .detached_process_children
                     .retain_mut(|child| child.try_wait().ok().flatten().is_none());
                 if state.shell.is_some() {
+                    let expired_endpoint = endpoint_commands.expire(now);
                     let (effects, outcome, frame) = {
                         let shell = state.shell.as_mut().expect("checked shell mode");
-                        let (effects, notification_repaint) = shell.tick_notifications(now);
                         let mut outcome = shell.tick_selection_autoscroll(now);
+                        if let Some(expired) = expired_endpoint {
+                            let (repaint, actions) = shell.handle_endpoint_result(
+                                &expired.boot_id,
+                                &expired.request_id,
+                                expired.result,
+                            );
+                            outcome.repaint |= repaint;
+                            outcome.actions.extend(actions);
+                        }
+                        let (effects, notification_repaint) = shell.tick_notifications(now);
                         outcome.repaint |= notification_repaint | shell.tick_copy_feedback(now);
                         let frame = outcome
                             .repaint

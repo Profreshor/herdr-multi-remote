@@ -4580,7 +4580,7 @@ fn update_notification_is_semantic_for_system_delivery() {
             assert_eq!(notification.title, "Herdr v9.9.9 available");
             assert_eq!(
                 notification.body.as_deref(),
-                Some("detach, run `herdr update`, then follow its restart guidance")
+                Some("detach, run `herdr update`, then run Herdr again to reconnect")
             );
         }
         other => panic!("expected semantic update notification, got {other:?}"),

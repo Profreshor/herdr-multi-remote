@@ -108,6 +108,10 @@ fn print_full_status(json: bool) -> std::io::Result<i32> {
     println!();
     println!("update:");
     println!("  restart_needed: {}", restart_needed_label(&server));
+    println!(
+        "  server_binary_stale: {}",
+        server_binary_stale_label(&server)
+    );
 
     Ok(0)
 }
@@ -223,13 +227,18 @@ fn endpoint_compatibility_label(
 }
 
 fn restart_needed_label(server: &ServerRuntimeStatus) -> &'static str {
-    match server {
-        ServerRuntimeStatus::Running { version, .. } => match version.as_deref() {
-            Some(version) if version == crate::build_info::version() => "no",
-            Some(_) => "yes",
-            None => "unknown",
-        },
-        ServerRuntimeStatus::NotRunning => "no",
+    match restart_needed_bool(server) {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    }
+}
+
+fn server_binary_stale_label(server: &ServerRuntimeStatus) -> &'static str {
+    match server_binary_stale_bool(server) {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
     }
 }
 
@@ -262,6 +271,7 @@ struct ServerStatusJson {
     socket: String,
     session: Option<String>,
     restart_needed: Option<bool>,
+    server_binary_stale: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -274,6 +284,7 @@ struct ServerCapabilitiesJson {
 #[derive(Serialize)]
 struct UpdateStatusJson {
     restart_needed: Option<bool>,
+    server_binary_stale: Option<bool>,
 }
 
 fn client_status_json() -> ClientStatusJson {
@@ -314,6 +325,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             socket: api::socket_path().display().to_string(),
             session: crate::session::active_name(),
             restart_needed: restart_needed_bool(server),
+            server_binary_stale: server_binary_stale_bool(server),
         },
         ServerRuntimeStatus::NotRunning => ServerStatusJson {
             status: "not_running",
@@ -326,6 +338,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             socket: api::socket_path().display().to_string(),
             session: crate::session::active_name(),
             restart_needed: Some(false),
+            server_binary_stale: Some(false),
         },
     }
 }
@@ -333,16 +346,27 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
 fn update_status_json(server: &ServerRuntimeStatus) -> UpdateStatusJson {
     UpdateStatusJson {
         restart_needed: restart_needed_bool(server),
+        server_binary_stale: server_binary_stale_bool(server),
     }
 }
 
 fn restart_needed_bool(server: &ServerRuntimeStatus) -> Option<bool> {
     match server {
-        ServerRuntimeStatus::Running { version, .. } => match version.as_deref() {
-            Some(version) if version == crate::build_info::version() => Some(false),
-            Some(_) => Some(true),
-            None => None,
-        },
+        ServerRuntimeStatus::Running { capabilities, .. } => Some(
+            capabilities
+                .as_ref()
+                .and_then(|value| value.endpoint_protocol_generation)
+                != Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
+        ),
+        ServerRuntimeStatus::NotRunning => Some(false),
+    }
+}
+
+fn server_binary_stale_bool(server: &ServerRuntimeStatus) -> Option<bool> {
+    match server {
+        ServerRuntimeStatus::Running { version, .. } => version
+            .as_deref()
+            .map(|version| version != crate::build_info::version()),
         ServerRuntimeStatus::NotRunning => Some(false),
     }
 }
@@ -363,4 +387,43 @@ fn print_status_help() {
     eprintln!("  herdr status [--json]         show local client and running server status");
     eprintln!("  herdr status server [--json]  show running server status");
     eprintln!("  herdr status client [--json]  show local client binary status");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn running_server(
+        version: Option<&str>,
+        endpoint_generation: Option<u32>,
+    ) -> ServerRuntimeStatus {
+        ServerRuntimeStatus::Running {
+            version: version.map(str::to_owned),
+            protocol: Some(crate::protocol::PROTOCOL_VERSION),
+            capabilities: Some(crate::api::schema::ServerCapabilities {
+                live_handoff: true,
+                detached_server_daemon: true,
+                endpoint_protocol_generation: endpoint_generation,
+            }),
+        }
+    }
+
+    #[test]
+    fn stale_compatible_server_does_not_require_restart() {
+        let server = running_server(
+            Some("0.0.0-old"),
+            Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
+        );
+
+        assert_eq!(restart_needed_bool(&server), Some(false));
+        assert_eq!(server_binary_stale_bool(&server), Some(true));
+    }
+
+    #[test]
+    fn server_without_endpoint_baseline_requires_restart() {
+        let server = running_server(Some(crate::build_info::version().as_str()), None);
+
+        assert_eq!(restart_needed_bool(&server), Some(true));
+        assert_eq!(server_binary_stale_bool(&server), Some(false));
+    }
 }

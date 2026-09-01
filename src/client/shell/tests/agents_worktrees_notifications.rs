@@ -1007,9 +1007,9 @@ fn unavailable_worktree_create_does_not_wedge_the_overlay() {
         Some(ClientShellOverlay::WorktreeCreate(create)) if !create.creating
     ));
     assert!(state
-        .endpoint_error
-        .as_deref()
-        .is_some_and(|error| error.contains("missing worktree.create")));
+        .visible_endpoint_notice
+        .as_ref()
+        .is_some_and(|notice| notice.key.code == "worktree.create"));
 }
 
 #[test]

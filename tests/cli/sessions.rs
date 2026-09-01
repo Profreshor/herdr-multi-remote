@@ -410,6 +410,10 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {full_stdout}"
     );
     assert!(
+        full_stdout.contains("  server_binary_stale: no"),
+        "stdout: {full_stdout}"
+    );
+    assert!(
         full_stdout.contains(&socket_path.display().to_string()),
         "stdout: {full_stdout}"
     );
@@ -463,7 +467,9 @@ fn status_commands_report_client_and_server_versions() {
         socket_path.display().to_string()
     );
     assert_eq!(full_json["server"]["restart_needed"], false);
+    assert_eq!(full_json["server"]["server_binary_stale"], false);
     assert_eq!(full_json["update"]["restart_needed"], false);
+    assert_eq!(full_json["update"]["server_binary_stale"], false);
 
     let server_json = run_cli_json(&socket_path, &["status", "server", "--json"]);
     assert_eq!(server_json["status"], "running");
@@ -497,6 +503,10 @@ fn status_reports_not_running_when_server_socket_is_missing() {
     assert!(stdout.contains("  status: not running"), "stdout: {stdout}");
     assert!(stdout.contains("  restart_needed: no"), "stdout: {stdout}");
     assert!(
+        stdout.contains("  server_binary_stale: no"),
+        "stdout: {stdout}"
+    );
+    assert!(
         stdout.contains(&socket_path.display().to_string()),
         "stdout: {stdout}"
     );
@@ -509,7 +519,9 @@ fn status_reports_not_running_when_server_socket_is_missing() {
         socket_path.display().to_string()
     );
     assert_eq!(status_json["server"]["restart_needed"], false);
+    assert_eq!(status_json["server"]["server_binary_stale"], false);
     assert_eq!(status_json["update"]["restart_needed"], false);
+    assert_eq!(status_json["update"]["server_binary_stale"], false);
 
     cleanup_test_base(&base);
 }

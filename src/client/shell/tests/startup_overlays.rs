@@ -483,9 +483,9 @@ fn unavailable_integration_list_does_not_wedge_settings() {
         }))
     ));
     assert!(state
-        .endpoint_error
-        .as_deref()
-        .is_some_and(|error| error.contains("missing integration.list")));
+        .visible_endpoint_notice
+        .as_ref()
+        .is_some_and(|notice| notice.key.code == "integration.list"));
     let _ = std::fs::remove_file(&state.config.local_config_path);
 }
 
@@ -593,6 +593,7 @@ fn endpoint_reload_result_does_not_override_snapshot_diagnostic_authority() {
         "reload-1".into(),
         PendingEndpointRequest {
             boot_id: "boot-1".into(),
+            method_name: "server.reload_config".into(),
             confirmation_workspace_id: None,
             kind: PendingEndpointKind::ReloadConfig,
         },

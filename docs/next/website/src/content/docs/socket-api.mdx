@@ -938,8 +938,9 @@ The client-rendered Herdr UI uses a stable endpoint generation for local and SSH
 servers. Client and server builds do not need to match. During connection setup,
 they agree on the core snapshot, screen, input, and blob codecs, and the server advertises
 the API methods it supports. A missing method disables only that action on that
-machine; it does not disconnect the UI. Servers from before endpoint generation
-1 need one final update.
+server and shows a client-local notice; it does not disconnect the UI. Rejected
+or timed-out actions are also reported without ending the connection. Servers
+from before endpoint generation 1 need one final update.
 
 The numbered binary protocol remains for same-install and internal operations,
 including direct terminal attach and live handoff. Check `ping` or `herdr status`

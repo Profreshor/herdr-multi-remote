@@ -523,11 +523,8 @@ impl ClientShellState {
                 PendingEndpointKind::PrepareWorktreeCreate { .. }
                 | PendingEndpointKind::PrepareWorktreeOpen { .. }
                 | PendingEndpointKind::PrepareWorktreeRemove { .. },
-                Err(error),
-            ) => {
-                self.endpoint_error = Some(error.message);
-                true
-            }
+                Err(_),
+            ) => true,
             (_, Ok(_)) => {
                 self.endpoint_error =
                     Some("endpoint returned an unexpected worktree result".to_owned());
@@ -547,11 +544,8 @@ impl ClientShellState {
                 | PendingEndpointKind::PaneLinkActivate { .. }
                 | PendingEndpointKind::CopyMotion { .. }
                 | PendingEndpointKind::CopySearch { .. },
-                Err(error),
-            ) => {
-                self.endpoint_error = Some(error.message);
-                true
-            }
+                Err(_),
+            ) => true,
         }
     }
 }

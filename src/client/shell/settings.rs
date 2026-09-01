@@ -307,7 +307,7 @@ impl ClientShellState {
                                 "endpoint returned an unexpected integration list result".into(),
                             );
                         }
-                        Err(error) => self.endpoint_error = Some(error.message),
+                        Err(_) => {}
                     }
                 }
                 (true, Vec::new())
