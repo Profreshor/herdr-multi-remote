@@ -915,7 +915,10 @@ impl AppState {
     pub(crate) fn integration_updates_available(&self) -> bool {
         self.integration_recommendations
             .iter()
-            .any(crate::integration::IntegrationRecommendation::needs_install)
+            .any(|recommendation| {
+                recommendation.state == crate::integration::IntegrationStatusKind::Outdated
+                    && recommendation.needs_install()
+            })
     }
 
     pub(crate) fn app_surface_pane_ids(&self) -> std::collections::HashSet<PaneId> {

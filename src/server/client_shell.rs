@@ -535,6 +535,33 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_badges_only_outdated_integrations() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.integration_recommendations =
+            vec![crate::integration::IntegrationRecommendation {
+                target: crate::api::schema::IntegrationTarget::Claude,
+                label: "claude",
+                command: "claude",
+                available: true,
+                path: std::path::PathBuf::from("claude-hook"),
+                state: crate::integration::IntegrationStatusKind::NotInstalled,
+            }];
+
+        assert!(!snapshot(&app, "boot", 1, None).integration_updates_available);
+
+        app.state.integration_recommendations[0].state =
+            crate::integration::IntegrationStatusKind::Outdated;
+        assert!(snapshot(&app, "boot", 2, None).integration_updates_available);
+    }
+
+    #[test]
     fn split_hits_follow_released_border_and_gap_geometry() {
         let horizontal = crate::layout::SplitBorder {
             pos: 20,
