@@ -18,6 +18,36 @@ fn resize_signal_reports_even_when_polled_size_is_unchanged() {
 }
 
 #[test]
+fn unavailable_terminal_grid_is_not_fabricated() {
+    let reported_cell_size = AtomicU64::new(0);
+    let err = current_terminal_geometry_with(false, false, &reported_cell_size, None, None, || {
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "terminal is gone",
+        ))
+    })
+    .expect_err("an unavailable terminal must not produce fallback geometry");
+
+    assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+}
+
+#[test]
+fn missing_pixel_geometry_keeps_a_valid_terminal_grid() {
+    let reported_cell_size = AtomicU64::new(0);
+    let geometry = current_terminal_geometry_with(
+        true,
+        true,
+        &reported_cell_size,
+        Some((9, 18)),
+        None,
+        || Ok((80, 24)),
+    )
+    .expect("grid geometry remains valid without pixel dimensions");
+
+    assert_eq!(geometry, (80, 24, 9, 18, false));
+}
+
+#[test]
 fn direct_graphics_profile_is_narrow_and_transport_safe() {
     for (program, term, kitty, expected) in [
         ("ghostty", "", false, true),

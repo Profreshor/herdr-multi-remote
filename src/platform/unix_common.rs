@@ -1,5 +1,9 @@
 use std::path::{Path, PathBuf};
 
+pub(super) fn read_terminal_grid_size() -> std::io::Result<(u16, u16)> {
+    crossterm::terminal::window_size().map(|size| (size.columns, size.rows))
+}
+
 fn set_sigpipe_disposition(handler: libc::sighandler_t) {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
     action.sa_sigaction = handler;

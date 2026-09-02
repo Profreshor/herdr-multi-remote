@@ -15,6 +15,10 @@ use std::{
 
 mod clipboard_image;
 
+pub(super) fn read_terminal_grid_size() -> std::io::Result<(u16, u16)> {
+    crossterm::terminal::size()
+}
+
 pub(crate) fn replace_file(
     source: &std::path::Path,
     destination: &std::path::Path,

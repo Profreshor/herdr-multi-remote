@@ -58,26 +58,46 @@ fn unpack_cell_size(packed: u64) -> Option<(u32, u32)> {
     (width_px > 0 && height_px > 0).then_some((width_px, height_px))
 }
 
+type TerminalGeometry = (u16, u16, u32, u32, bool);
+
+pub(super) fn current_terminal_geometry_with(
+    pixel_geometry_enabled: bool,
+    pixel_geometry_fallback: bool,
+    reported_cell_size: &AtomicU64,
+    last_cell_size: Option<(u32, u32)>,
+    exact_geometry: Option<(u16, u16, u32, u32)>,
+    terminal_grid_size: impl FnOnce() -> io::Result<(u16, u16)>,
+) -> io::Result<TerminalGeometry> {
+    if !pixel_geometry_enabled {
+        let (cols, rows) = terminal_grid_size()?;
+        return Ok((cols, rows, 0, 0, false));
+    }
+    if let Some((cols, rows, cell_width_px, cell_height_px)) = exact_geometry {
+        return Ok((cols, rows, cell_width_px, cell_height_px, true));
+    }
+    let (cols, rows) = terminal_grid_size()?;
+    if !pixel_geometry_fallback {
+        return Ok((cols, rows, 0, 0, false));
+    }
+    let (cell_width_px, cell_height_px) =
+        cell_size_fallback(reported_cell_size.load(Ordering::Acquire), last_cell_size);
+    Ok((cols, rows, cell_width_px, cell_height_px, false))
+}
+
 fn current_terminal_geometry(
     pixel_geometry_enabled: bool,
     pixel_geometry_fallback: bool,
     reported_cell_size: &AtomicU64,
     last_cell_size: Option<(u32, u32)>,
-) -> (u16, u16, u32, u32, bool) {
-    if !pixel_geometry_enabled {
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        return (cols, rows, 0, 0, false);
-    }
-    if let Some((cols, rows, cell_width_px, cell_height_px)) = ioctl_terminal_geometry() {
-        return (cols, rows, cell_width_px, cell_height_px, true);
-    }
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    if !pixel_geometry_fallback {
-        return (cols, rows, 0, 0, false);
-    }
-    let (cell_width_px, cell_height_px) =
-        cell_size_fallback(reported_cell_size.load(Ordering::Acquire), last_cell_size);
-    (cols, rows, cell_width_px, cell_height_px, false)
+) -> io::Result<TerminalGeometry> {
+    current_terminal_geometry_with(
+        pixel_geometry_enabled,
+        pixel_geometry_fallback,
+        reported_cell_size,
+        last_cell_size,
+        ioctl_terminal_geometry(),
+        crate::platform::terminal_grid_size,
+    )
 }
 
 /// Reads terminal geometry before the handshake. Pixel input and direct graphics
@@ -85,28 +105,13 @@ fn current_terminal_geometry(
 pub(super) fn initial_terminal_geometry(
     pixel_geometry_enabled: bool,
     pixel_geometry_fallback: bool,
-) -> (u16, u16, u32, u32, bool) {
-    if !pixel_geometry_enabled {
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        return (cols, rows, 0, 0, false);
-    }
-    match ioctl_terminal_geometry() {
-        Some((cols, rows, width, height)) => (cols, rows, width, height, true),
-        None => {
-            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-            if pixel_geometry_fallback {
-                (
-                    cols,
-                    rows,
-                    DEFAULT_CELL_WIDTH_PX,
-                    DEFAULT_CELL_HEIGHT_PX,
-                    false,
-                )
-            } else {
-                (cols, rows, 0, 0, false)
-            }
-        }
-    }
+) -> io::Result<TerminalGeometry> {
+    current_terminal_geometry(
+        pixel_geometry_enabled,
+        pixel_geometry_fallback,
+        &AtomicU64::new(0),
+        None,
+    )
 }
 
 pub(super) fn resize_report_required(
@@ -146,12 +151,18 @@ pub(super) fn resize_poll_loop(
     while !should_quit.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(100));
         let signalled = crate::platform::take_terminal_resize_signal();
-        let new_size = current_terminal_geometry(
+        let new_size = match current_terminal_geometry(
             pixel_geometry_enabled,
             pixel_geometry_fallback,
             reported_cell_size,
             Some((last_size.2, last_size.3)),
-        );
+        ) {
+            Ok(size) => size,
+            Err(err) => {
+                let _ = resize_tx.blocking_send(ClientLoopEvent::TerminalUnavailable(err));
+                break;
+            }
+        };
         if resize_report_required(signalled, new_size, last_size) {
             last_size = new_size;
             if resize_tx

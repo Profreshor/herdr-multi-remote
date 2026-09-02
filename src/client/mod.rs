@@ -36,9 +36,9 @@ pub use terminal_sessions::{run_terminal_session_control, run_terminal_session_o
 use terminal_geometry::query_host_terminal_appearance;
 #[cfg(test)]
 use terminal_geometry::{
-    cell_size_fallback, ioctl_cell_size, pack_cell_size, resize_report_required,
-    should_query_host_cell_size, write_host_cell_size_query, write_host_terminal_appearance_query,
-    write_host_terminal_theme_query,
+    cell_size_fallback, current_terminal_geometry_with, ioctl_cell_size, pack_cell_size,
+    resize_report_required, should_query_host_cell_size, write_host_cell_size_query,
+    write_host_terminal_appearance_query, write_host_terminal_theme_query,
 };
 use terminal_geometry::{
     host_cell_size_query_required, initial_terminal_geometry, query_host_cell_size,
@@ -302,6 +302,8 @@ enum ClientLoopEvent {
     StdinEvents(Vec<crate::protocol::ClientInputEvent>),
     /// Terminal resize detected, including current exact-pixel eligibility.
     Resize(u16, u16, u32, u32, bool),
+    /// The client's host terminal can no longer report a valid grid.
+    TerminalUnavailable(io::Error),
     /// Server message received.
     ServerMessage(Box<ServerMessage>),
     /// Server reader thread exited (connection lost).
@@ -400,7 +402,7 @@ fn run_client_with_mode(
 
     // Get the terminal geometry before handshake (before raw mode).
     let (cols, rows, cell_width_px, cell_height_px, exact_cell_size) =
-        initial_terminal_geometry(pixel_geometry_enabled, kitty_graphics_enabled);
+        initial_terminal_geometry(pixel_geometry_enabled, kitty_graphics_enabled)?;
 
     let shell_surface_size = loop_config
         .shell_config
@@ -1215,6 +1217,11 @@ async fn run_client_loop(
                     continue;
                 }
                 // Direct terminal attach is Unix-only; every Windows client uses ClientShell.
+            }
+            ClientLoopEvent::TerminalUnavailable(err) => {
+                info!(err = %err, "client terminal unavailable; detaching");
+                let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
+                return Ok(());
             }
             ClientLoopEvent::Resize(
                 new_cols,
