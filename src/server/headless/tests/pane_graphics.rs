@@ -304,6 +304,7 @@ fn direct_stream_message(
     path: String,
     image_width: u32,
     image_height: u32,
+    sequence: u64,
 ) -> (api::ApiRequestMessage, std::sync::mpsc::Receiver<String>) {
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     (
@@ -320,7 +321,7 @@ fn direct_stream_message(
                         image_height,
                         format: api::schema::PaneGraphicsFormat::Rgba,
                         path,
-                        sequence: 1,
+                        sequence,
                         revision: 1,
                         placement: Default::default(),
                     },
@@ -612,6 +613,114 @@ fn rejected_or_stale_requests_do_not_schedule_rendering() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn direct_graphics_availability_follows_foreground_client_with_background_clients() {
+    let (mut server, _client_rx, _pane_id) = retained_test_server(b"direct eligibility");
+    let foreground = server.clients.get_mut(&1).unwrap();
+    foreground.direct_graphics = true;
+    foreground.pixel_mouse = true;
+
+    let (background_writer, _background_control_rx, _background_render_rx) = test_client_writer();
+    server.clients.insert(
+        2,
+        ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            2,
+            RenderEncoding::SemanticFrame,
+            Some(background_writer),
+        ),
+    );
+
+    server.sync_foreground_client_state();
+    assert!(server.direct_graphics_available());
+    assert!(server.app.direct_graphics_available);
+
+    server.foreground_client_id = Some(2);
+    server.sync_foreground_client_state();
+    assert!(!server.direct_graphics_available());
+    assert!(!server.app.direct_graphics_available);
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_graphics_routing_prefers_the_target_stream_owner() {
+    let (mut server, first_key, response_rx) = direct_gate_server(&[1, 2, 3, 4]);
+    add_direct_client(&mut server, 7);
+    add_direct_client(&mut server, 8);
+    server.clients.get_mut(&8).unwrap().last_activity = 2;
+    let (transfer_id, image_id) = direct_ids(&server, &first_key);
+    assert!(server.complete_direct_graphics(7, transfer_id, image_id, true));
+    assert_eq!(response_rx.recv().unwrap(), "ack");
+
+    let second_key = (first_key.0, "second".into());
+    let second_layer = crate::app::pane_graphics::Layer {
+        format: crate::api::schema::PaneGraphicsFormat::Rgba,
+        image_width: 1,
+        image_height: 1,
+        backing: crate::app::pane_graphics::Backing::Resident {
+            len: 4,
+            client_id: 8,
+        },
+        data_fingerprint: 2,
+        render: Default::default(),
+        z_index: 0,
+    };
+    server.app.pane_graphics.slots.insert(
+        second_key.clone(),
+        crate::app::pane_graphics::Slot::test((1 << 31) | 901, Some(second_layer)),
+    );
+
+    assert_eq!(server.direct_graphics_client_for_key(&first_key), Some(7));
+    assert_eq!(server.direct_graphics_client_for_key(&second_key), Some(8));
+    assert_eq!(
+        server.direct_graphics_client_for_key(&(first_key.0, "new".into())),
+        Some(8)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn resident_direct_stream_survives_non_direct_client_becoming_foreground() {
+    let (mut server, key, response_rx) = direct_gate_server(&[1, 2, 3, 4]);
+    add_direct_client(&mut server, 7);
+    server.foreground_client_id = Some(7);
+    server.sync_foreground_client_state();
+    let (transfer_id, image_id) = direct_ids(&server, &key);
+    assert!(server.complete_direct_graphics(7, transfer_id, image_id, true));
+    assert_eq!(response_rx.recv().unwrap(), "ack");
+
+    let (writer, _control_rx, _render_rx) = test_client_writer();
+    server.clients.insert(
+        8,
+        ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            2,
+            RenderEncoding::SemanticFrame,
+            Some(writer),
+        ),
+    );
+    server.foreground_client_id = Some(8);
+    server.sync_foreground_client_state();
+
+    assert!(server.direct_graphics_available());
+    assert!(server.app.direct_graphics_available);
+    assert_eq!(
+        server.app.pane_graphics.slots[&key]
+            .layer
+            .as_ref()
+            .and_then(crate::app::pane_graphics::Layer::resident_client),
+        Some(7)
+    );
+
+    server.remove_client_and_resize_if_needed(7);
+    assert!(!server.app.pane_graphics.slots.contains_key(&key));
+    assert!(!server.direct_graphics_available());
+    assert!(!server.app.direct_graphics_available);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn client_shell_direct_graphics_uploads_without_server_authored_coordinates() {
     let (mut server, client_rx, pane_id) = retained_test_server(b"client shell direct");
     server.app.state.kitty_graphics_enabled = true;
@@ -626,11 +735,25 @@ async fn client_shell_direct_graphics_uploads_without_server_authored_coordinate
     client.direct_graphics = true;
     client.pixel_mouse = true;
     server.app.direct_graphics_available = true;
+    let (background_writer, _background_control_rx, background_render_rx) = test_client_writer();
+    server.clients.insert(
+        2,
+        ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize {
+                width_px: 10,
+                height_px: 20,
+            },
+            2,
+            RenderEncoding::SemanticFrame,
+            Some(background_writer),
+        ),
+    );
     set_stream_owner(&mut server, pane_id, "browser");
     let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
     let path = sparse_direct_frame(&server, "client-shell-direct.rgba", 1, 1);
     let (message, response_rx) =
-        direct_stream_message("shell-direct", &public_pane_id, "browser", path, 1, 1);
+        direct_stream_message("shell-direct", &public_pane_id, "browser", path, 1, 1, 1);
 
     assert_eq!(
         server.handle_pane_graphics_stream_frame(message),
@@ -656,6 +779,7 @@ async fn client_shell_direct_graphics_uploads_without_server_authored_coordinate
         }
         other => panic!("expected client shell graphics file, got {other:?}"),
     };
+    assert!(background_render_rx.try_recv().is_err());
     assert_eq!(
         image_id,
         crate::kitty_graphics::surface::host_image_id(&server.client_shell_boot_id, &asset)
@@ -684,6 +808,47 @@ async fn client_shell_direct_graphics_uploads_without_server_authored_coordinate
         &response_rx.recv_timeout(Duration::from_secs(1)).unwrap()
     )
     .is_ok());
+
+    server.foreground_client_id = Some(2);
+    server.sync_foreground_client_state();
+    let next_path = sparse_direct_frame(&server, "client-shell-direct-next.rgba", 1, 1);
+    let (next_message, next_response_rx) = direct_stream_message(
+        "shell-direct-next",
+        &public_pane_id,
+        "browser",
+        next_path,
+        1,
+        1,
+        2,
+    );
+    assert_eq!(
+        server.handle_pane_graphics_stream_frame(next_message),
+        RenderImpact::None
+    );
+    let (next_transfer_id, next_image_id, next_asset) = match read_server_message(
+        client_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("sticky owner direct upload"),
+    ) {
+        ServerMessage::GraphicsFile {
+            transfer_id,
+            image_id,
+            surface_asset: Some(asset),
+            ..
+        } => (transfer_id, image_id, asset),
+        other => panic!("expected sticky owner graphics file, got {other:?}"),
+    };
+    assert!(background_render_rx.try_recv().is_err());
+    server.start_direct_graphics_response(1, next_transfer_id, next_image_id);
+    assert!(server.complete_direct_graphics(1, next_transfer_id, next_image_id, true));
+    assert!(serde_json::from_str::<api::schema::SuccessResponse>(
+        &next_response_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+    )
+    .is_ok());
+    assert!(server.app.direct_graphics_available);
+
     server.clients.get_mut(&1).unwrap().request_repaint();
     server.render_and_stream();
     let surface = read_server_message(
@@ -696,8 +861,20 @@ async fn client_shell_direct_graphics_uploads_without_server_authored_coordinate
     };
     assert_eq!(surface.graphics.placements.len(), 1);
     assert!(surface.graphics.assets.is_empty());
-    assert_eq!(surface.graphics.placements[0].asset, asset);
-    assert_eq!(surface.graphics.retained_assets, vec![asset.clone()]);
+    assert_eq!(surface.graphics.placements[0].asset, next_asset);
+    assert_eq!(surface.graphics.retained_assets, vec![next_asset.clone()]);
+
+    let background_surface = read_server_message(
+        background_render_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("non-owning client shell scene"),
+    );
+    let ServerMessage::PaneSurface(background_surface) = background_surface else {
+        panic!("expected non-owning client shell pane surface");
+    };
+    assert!(background_surface.graphics.assets.is_empty());
+    assert!(background_surface.graphics.placements.is_empty());
+    assert!(background_surface.graphics.retained_assets.is_empty());
 
     let (hidden, _) = crate::server::client_shell_graphics::collect(
         &server.app,
@@ -716,7 +893,7 @@ async fn client_shell_direct_graphics_uploads_without_server_authored_coordinate
         1,
     );
     assert!(hidden.placements.is_empty());
-    assert_eq!(hidden.retained_assets, vec![asset]);
+    assert_eq!(hidden.retained_assets, vec![next_asset]);
 }
 
 #[cfg(unix)]

@@ -502,6 +502,7 @@ fn collect_visible_placements(
     cell_size: HostCellSize,
     uploaded_images: &HashMap<u32, ImageSignature>,
     oversized_images: &HashMap<HostSourceKey, ImageSignature>,
+    client_id: u64,
 ) -> Vec<HostPlacement> {
     let Some(target) = surface.target else {
         tracing::debug!("collect_visible_placements: no tab surface target");
@@ -536,9 +537,10 @@ fn collect_visible_placements(
             .filter_map(|((pane_id, layer_id), slot)| {
                 (*pane_id == info.id)
                     .then(|| {
-                        slot.layer
-                            .as_ref()
-                            .map(|layer| (layer_id, slot.host_image_id, layer))
+                        slot.layer.as_ref().and_then(|layer| {
+                            (!layer.terminal_only() || slot.direct_client() == Some(client_id))
+                                .then_some((layer_id, slot.host_image_id, layer))
+                        })
                     })
                     .flatten()
             })

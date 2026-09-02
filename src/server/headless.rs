@@ -933,16 +933,54 @@ impl HeadlessServer {
             .count()
     }
 
-    fn direct_graphics_available(&self) -> bool {
-        self.app_client_count() == 1
-            && self.foreground_client_id.is_some_and(|id| {
-                self.clients.get(&id).is_some_and(|client| {
-                    client.is_shell_client()
-                        && client.writer.is_some()
-                        && client.direct_graphics
-                        && client.pixel_mouse
-                })
+    fn client_supports_direct_graphics(&self, client_id: u64) -> bool {
+        self.clients.get(&client_id).is_some_and(|client| {
+            client.is_shell_client()
+                && client.writer.is_some()
+                && client.direct_graphics
+                && client.pixel_mouse
+        })
+    }
+
+    fn existing_direct_graphics_client(&self) -> Option<u64> {
+        self.app
+            .pane_graphics
+            .slots
+            .values()
+            .filter_map(crate::app::pane_graphics::Slot::direct_client)
+            .filter_map(|client_id| {
+                let client = self.clients.get(&client_id)?;
+                self.client_supports_direct_graphics(client_id)
+                    .then_some((client.last_activity, client_id))
             })
+            .max()
+            .map(|(_, client_id)| client_id)
+    }
+
+    fn direct_graphics_client(&self) -> Option<u64> {
+        self.existing_direct_graphics_client().or_else(|| {
+            self.foreground_client_id
+                .filter(|client_id| self.client_supports_direct_graphics(*client_id))
+        })
+    }
+
+    fn direct_graphics_client_for_key(&self, key: &crate::app::pane_graphics::Key) -> Option<u64> {
+        match self
+            .app
+            .pane_graphics
+            .slots
+            .get(key)
+            .and_then(crate::app::pane_graphics::Slot::direct_client)
+        {
+            Some(client_id) => self
+                .client_supports_direct_graphics(client_id)
+                .then_some(client_id),
+            None => self.direct_graphics_client(),
+        }
+    }
+
+    fn direct_graphics_available(&self) -> bool {
+        self.direct_graphics_client().is_some()
     }
 
     fn has_app_client(&self) -> bool {
@@ -987,6 +1025,7 @@ impl HeadlessServer {
                 self.send_shell_focus_target(target, crate::ghostty::FocusEvent::Lost);
             }
         }
+        self.app.direct_graphics_available = self.direct_graphics_available();
         if was_foreground {
             self.promote_latest_remaining_client()
         } else {

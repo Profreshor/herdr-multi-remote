@@ -33,10 +33,9 @@ impl HeadlessServer {
                 )
             })
         });
-        let direct_client = self
-            .direct_graphics_available()
-            .then_some(self.foreground_client_id)
-            .flatten();
+        let direct_client = direct_key
+            .as_ref()
+            .and_then(|key| self.direct_graphics_client_for_key(key));
         let gate_busy = self
             .app
             .pane_graphics
@@ -259,6 +258,7 @@ impl HeadlessServer {
         if self.app.pane_graphics.slots.remove(key).is_some() {
             self.app.pane_graphics.mark_changed();
         }
+        self.app.direct_graphics_available = self.direct_graphics_available();
     }
 
     pub(super) fn start_direct_graphics_response(
@@ -340,6 +340,7 @@ impl HeadlessServer {
                 self.retire_direct_gate(&key);
                 return true;
             }
+            self.app.direct_graphics_available = self.direct_graphics_available();
             return true;
         }
 

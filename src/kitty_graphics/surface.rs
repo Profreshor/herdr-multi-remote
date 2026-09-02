@@ -339,6 +339,7 @@ pub(crate) fn collect_scene(
         cell_size,
         &uploaded_images,
         &delivered_terminal_images,
+        client_id,
     );
 
     if let (Some(popup), Some((width, height)), Some((_, target))) = (
@@ -476,12 +477,8 @@ pub(crate) fn collect_scene(
         .iter()
         .filter_map(|(key, slot)| {
             let layer = slot.layer.as_ref()?;
-            let retained_for_client = layer.resident_client() == Some(client_id)
-                || slot
-                    .direct_gate
-                    .as_ref()
-                    .is_some_and(|gate| gate.client_id == client_id);
-            retained_for_client.then(|| pane_layer_asset_key(app, key, layer))?
+            (slot.direct_client() == Some(client_id))
+                .then(|| pane_layer_asset_key(app, key, layer))?
         })
         .collect::<Vec<_>>();
     retained_assets.sort_by_key(|key| format!("{:?}", key.source));

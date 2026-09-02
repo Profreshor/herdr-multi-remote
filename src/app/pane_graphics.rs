@@ -65,6 +65,13 @@ impl Slot {
             .as_ref()
             .is_some_and(|active| active.load(std::sync::atomic::Ordering::Acquire))
     }
+
+    pub(crate) fn direct_client(&self) -> Option<u64> {
+        self.direct_gate
+            .as_ref()
+            .map(|gate| gate.client_id)
+            .or_else(|| self.layer.as_ref().and_then(Layer::resident_client))
+    }
 }
 
 impl Drop for Slot {
