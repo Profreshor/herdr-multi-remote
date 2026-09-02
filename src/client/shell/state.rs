@@ -880,6 +880,7 @@ pub(crate) struct ClientShellState {
     pub(super) agent_scroll: usize,
     pub(super) tab_scroll: usize,
     pub(super) mobile_switcher_scroll: usize,
+    pub(super) reveal_focused_workspace: bool,
     pub(super) reveal_mobile_workspace: bool,
     pub(super) mobile_switcher_suspended: bool,
     pub(super) reveal_focused_tab: bool,
@@ -1021,6 +1022,7 @@ impl ClientShellState {
             agent_scroll: 0,
             tab_scroll: 0,
             mobile_switcher_scroll: 0,
+            reveal_focused_workspace: true,
             reveal_mobile_workspace: false,
             mobile_switcher_suspended: false,
             reveal_focused_tab: true,
@@ -1242,6 +1244,7 @@ impl ClientShellState {
             self.agent_scroll = 0;
             self.tab_scroll = 0;
             self.mobile_switcher_scroll = 0;
+            self.reveal_focused_workspace = true;
             self.reveal_mobile_workspace = false;
             self.mobile_switcher_suspended = false;
             self.reveal_focused_tab = true;
@@ -1317,6 +1320,14 @@ impl ClientShellState {
                     })
                 || render::tab_bar_status_width(current) != render::tab_bar_status_width(&snapshot)
         });
+        if self
+            .snapshot
+            .as_deref()
+            .and_then(|current| current.focused_workspace_id.as_deref())
+            != snapshot.focused_workspace_id.as_deref()
+        {
+            self.reveal_focused_workspace = true;
+        }
         if tab_layout_changed
             || self
                 .snapshot

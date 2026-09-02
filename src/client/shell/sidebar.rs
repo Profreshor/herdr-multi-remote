@@ -246,12 +246,32 @@ pub(crate) fn render_sidebar(
                 .map_or(0, |next| u16::from(!next.indented) * config.spaces.row_gap)
         })
         .collect::<Vec<_>>();
-    let metrics = super::scroll::list_scroll_metrics(
+    let mut metrics = super::scroll::list_scroll_metrics(
         &row_heights,
         &gaps,
         body.height,
         *state.workspace_scroll,
     );
+    if !body.is_empty() && std::mem::take(state.reveal_focused_workspace) {
+        if let Some(target) = entries
+            .iter()
+            .position(|entry| snapshot.workspaces[entry.index].focused)
+        {
+            *state.workspace_scroll = super::scroll::list_scroll_start_to_reveal(
+                &row_heights,
+                &gaps,
+                body.height,
+                *state.workspace_scroll,
+                target,
+            );
+            metrics = super::scroll::list_scroll_metrics(
+                &row_heights,
+                &gaps,
+                body.height,
+                *state.workspace_scroll,
+            );
+        }
+    }
     hits.workspace_max_scroll = metrics.max_offset_from_bottom;
     hits.workspace_scroll_metrics = Some(metrics);
     *state.workspace_scroll = metrics
