@@ -834,7 +834,11 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
         method: Method::AgentPrompt(AgentPromptParams {
             target: target.clone(),
             text: text.clone(),
-            wait: wait.then_some(AgentPromptWaitOptions { until, timeout_ms }),
+            wait: wait.then_some(AgentPromptWaitOptions {
+                until,
+                timeout_ms,
+                submission_deadline: None,
+            }),
         }),
     })?;
     super::print_response(&response)

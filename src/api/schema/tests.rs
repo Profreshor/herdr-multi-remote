@@ -133,6 +133,7 @@ fn agent_start_and_prompt_requests_round_trip() {
             wait: Some(AgentPromptWaitOptions {
                 until: vec![AgentStatus::Idle, AgentStatus::Done],
                 timeout_ms: Some(120_000),
+                submission_deadline: None,
             }),
         }),
     };

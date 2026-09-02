@@ -12,6 +12,18 @@ use super::responses::{encode_error, encode_error_body, encode_success};
 
 const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 
+fn agent_prompt_submit_delay(agent: crate::detect::Agent, prompt_bytes: usize) -> Duration {
+    #[cfg(windows)]
+    if agent == crate::detect::Agent::Codex {
+        // Codex consumes Windows paste bursts at about 4 bytes/ms, then suppresses Enter briefly.
+        // ponytail: best-effort ConPTY timing; remove when Codex exposes a paste-complete boundary.
+        return Duration::from_millis(600 + prompt_bytes as u64 / 4);
+    }
+    #[cfg(not(windows))]
+    let _ = (agent, prompt_bytes);
+    AGENT_PROMPT_SUBMIT_DELAY
+}
+
 impl App {
     pub(super) fn handle_agent_list(&mut self, id: String) -> String {
         encode_success(
@@ -72,6 +84,9 @@ impl App {
                 std::thread::spawn(move || {
                     let response = match completion.recv() {
                         Ok(Ok(())) => encode_success(id, ResponseResult::AgentPrompted { agent }),
+                        Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
+                            encode_error(id, "timeout", err.to_string())
+                        }
                         Ok(Err(err)) => encode_error(id, "agent_prompt_failed", err.to_string()),
                         Err(_) => encode_error(id, "agent_prompt_failed", "pty actor closed"),
                     };
@@ -149,6 +164,14 @@ impl App {
                 ),
             ));
         }
+        let submit_delay = agent_prompt_submit_delay(expected_agent, params.text.len());
+        #[cfg(windows)]
+        let submit_deadline = params
+            .wait
+            .as_ref()
+            .and_then(|wait| wait.submission_deadline);
+        #[cfg(not(windows))]
+        let submit_deadline = None;
         if expected_agent == crate::detect::Agent::GithubCopilot {
             // Copilot ignores synthetic Enter after focus loss until it receives focus gained.
             let focus = match crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained) {
@@ -170,7 +193,8 @@ impl App {
             .queue_user_input_submission(
                 Bytes::from(text),
                 Bytes::from(enter),
-                AGENT_PROMPT_SUBMIT_DELAY,
+                submit_delay,
+                submit_deadline,
             )
             .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
         Ok((id, agent, completion))
@@ -398,6 +422,19 @@ mod tests {
         start_deferred_agent_prompt(app, id, params)
             .recv_timeout(Duration::from_secs(1))
             .expect("agent prompt responds after submission")
+    }
+
+    #[test]
+    fn prompt_delay_only_scales_for_windows_codex() {
+        let codex_delay = agent_prompt_submit_delay(Agent::Codex, 4_096);
+        #[cfg(windows)]
+        assert_eq!(codex_delay, Duration::from_millis(1_624));
+        #[cfg(not(windows))]
+        assert_eq!(codex_delay, AGENT_PROMPT_SUBMIT_DELAY);
+        assert_eq!(
+            agent_prompt_submit_delay(Agent::OpenCode, 4_096),
+            AGENT_PROMPT_SUBMIT_DELAY
+        );
     }
 
     #[tokio::test]

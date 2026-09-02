@@ -8,7 +8,7 @@ pub(crate) use unix::*;
 mod windows {
     use std::io::{Read, Write};
     use std::sync::{mpsc as std_mpsc, Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use bytes::Bytes;
     use portable_pty::{MasterPty, PtySize};
@@ -49,6 +49,7 @@ mod windows {
             text: Bytes,
             enter: Bytes,
             delay: Duration,
+            deadline: Option<Instant>,
             reply: std_mpsc::Sender<std::io::Result<()>>,
         },
     }
@@ -57,6 +58,7 @@ mod windows {
         Write(Bytes),
         SubmissionPart {
             bytes: Bytes,
+            deadline: Option<Instant>,
             reply: std_mpsc::Sender<std::io::Result<()>>,
         },
     }
@@ -110,6 +112,7 @@ mod windows {
             text: Bytes,
             enter: Bytes,
             delay: Duration,
+            deadline: Option<Instant>,
         ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
             let accepting = self
                 .accepting
@@ -127,6 +130,7 @@ mod windows {
                     text,
                     enter,
                     delay,
+                    deadline,
                     reply: reply_tx,
                 })
                 .map_err(|err| match err {
@@ -292,9 +296,19 @@ mod windows {
         for command in write_rx {
             let result = match command {
                 PtyIoWriteCommand::Write(bytes) => write_and_flush(writer, &bytes),
-                PtyIoWriteCommand::SubmissionPart { bytes, reply } => {
-                    let result = write_and_flush(writer, &bytes);
-                    let failed = result.is_err();
+                PtyIoWriteCommand::SubmissionPart {
+                    bytes,
+                    deadline,
+                    reply,
+                } => {
+                    let result = if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        Err(input_submission_timed_out())
+                    } else {
+                        write_and_flush(writer, &bytes)
+                    };
+                    let failed = result
+                        .as_ref()
+                        .is_err_and(|err| err.kind() != std::io::ErrorKind::TimedOut);
                     let _ = reply.send(result);
                     if failed {
                         break;
@@ -324,19 +338,32 @@ mod windows {
                     text,
                     enter,
                     delay,
+                    deadline,
                     reply,
                 } => {
-                    let result = write_submission_part(&write_tx, text).and_then(|()| {
-                        std::thread::sleep(delay);
-                        let accepting = accepting
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if !*accepting {
-                            return Err(pty_actor_closed());
-                        }
-                        write_submission_part(&write_tx, enter)
-                    });
-                    let failed = result.is_err();
+                    let result = if deadline.is_some_and(|deadline| {
+                        deadline.saturating_duration_since(Instant::now()) <= delay
+                    }) {
+                        Err(input_submission_timed_out())
+                    } else {
+                        let text_deadline =
+                            deadline.and_then(|deadline| deadline.checked_sub(delay));
+                        write_submission_part(&write_tx, text, text_deadline).and_then(|()| {
+                            // A started text write is committed. Finish Enter even if the caller
+                            // stops waiting so a timeout cannot leave a partial prompt.
+                            std::thread::sleep(delay);
+                            let accepting = accepting
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if !*accepting {
+                                return Err(pty_actor_closed());
+                            }
+                            write_submission_part(&write_tx, enter, None)
+                        })
+                    };
+                    let failed = result
+                        .as_ref()
+                        .is_err_and(|err| err.kind() != std::io::ErrorKind::TimedOut);
                     let _ = reply.send(result);
                     if failed {
                         break;
@@ -349,10 +376,15 @@ mod windows {
     fn write_submission_part(
         write_tx: &std_mpsc::Sender<PtyIoWriteCommand>,
         bytes: Bytes,
+        deadline: Option<Instant>,
     ) -> std::io::Result<()> {
         let (reply, completion) = std_mpsc::channel();
         write_tx
-            .send(PtyIoWriteCommand::SubmissionPart { bytes, reply })
+            .send(PtyIoWriteCommand::SubmissionPart {
+                bytes,
+                deadline,
+                reply,
+            })
             .map_err(|_| pty_actor_closed())?;
         completion
             .recv()
@@ -363,6 +395,13 @@ mod windows {
         std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pty actor closed")
     }
 
+    fn input_submission_timed_out() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "agent prompt timed out before input submission",
+        )
+    }
+
     fn write_and_flush(writer: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
         writer.write_all(bytes)?;
         writer.flush()
@@ -371,8 +410,6 @@ mod windows {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::time::Instant;
-
         struct RecordingWriter {
             writes: Vec<(Vec<u8>, Instant)>,
             flushes: Vec<Instant>,
@@ -402,6 +439,7 @@ mod windows {
         fn run_recorded_submission(
             fail_after: Option<usize>,
             delay: Duration,
+            deadline: Option<Instant>,
             during_delay: impl FnOnce(&std_mpsc::Sender<PtyIoWriteCommand>, &Arc<Mutex<bool>>),
         ) -> (RecordingWriter, std::io::Result<()>) {
             let (flushed_tx, flushed_rx) = std_mpsc::channel();
@@ -420,6 +458,7 @@ mod windows {
                     text: Bytes::from_static(b"prompt"),
                     enter: Bytes::from_static(b"\r"),
                     delay,
+                    deadline,
                     reply: reply_tx,
                 })
                 .unwrap();
@@ -449,7 +488,7 @@ mod windows {
         #[test]
         fn submission_sequences_user_input_but_allows_terminal_responses() {
             let delay = Duration::from_millis(30);
-            let (writer, result) = run_recorded_submission(None, delay, |write_tx, _| {
+            let (writer, result) = run_recorded_submission(None, delay, None, |write_tx, _| {
                 write_tx
                     .send(PtyIoWriteCommand::Write(Bytes::from_static(b"response")))
                     .unwrap();
@@ -465,7 +504,8 @@ mod windows {
 
         #[test]
         fn submission_returns_enter_write_failure() {
-            let (_writer, result) = run_recorded_submission(Some(1), Duration::ZERO, |_, _| {});
+            let (_writer, result) =
+                run_recorded_submission(Some(1), Duration::ZERO, None, |_, _| {});
             let err = result.expect_err("enter failure reaches caller");
 
             assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
@@ -474,7 +514,7 @@ mod windows {
         #[test]
         fn shutdown_during_submission_delay_cancels_enter() {
             let (writer, result) =
-                run_recorded_submission(None, Duration::from_millis(30), |_, accepting| {
+                run_recorded_submission(None, Duration::from_millis(30), None, |_, accepting| {
                     *accepting.lock().unwrap() = false;
                 });
             let err = result.expect_err("shutdown cancels enter");
@@ -486,6 +526,65 @@ mod windows {
                     .map(|write| write.0.as_slice())
                     .collect::<Vec<_>>(),
                 vec![b"prompt"]
+            );
+        }
+
+        #[test]
+        fn expired_queued_submission_is_not_written() {
+            let (flushed_tx, _flushed_rx) = std_mpsc::channel();
+            let mut writer = RecordingWriter {
+                writes: Vec::new(),
+                flushes: Vec::new(),
+                fail_after: None,
+                flushed: flushed_tx,
+            };
+            let (data_tx, mut data_rx) = mpsc::channel(2);
+            let (write_tx, write_rx) = std_mpsc::channel();
+            let (first_reply_tx, first_reply_rx) = std_mpsc::channel();
+            let (expired_reply_tx, expired_reply_rx) = std_mpsc::channel();
+            let accepting = Arc::new(Mutex::new(true));
+            data_tx
+                .try_send(PtyIoDataCommand::SubmitUserInput {
+                    text: Bytes::from_static(b"first"),
+                    enter: Bytes::from_static(b"\r"),
+                    delay: Duration::from_millis(30),
+                    deadline: None,
+                    reply: first_reply_tx,
+                })
+                .unwrap();
+            data_tx
+                .try_send(PtyIoDataCommand::SubmitUserInput {
+                    text: Bytes::from_static(b"expired"),
+                    enter: Bytes::from_static(b"\r"),
+                    delay: Duration::ZERO,
+                    deadline: Some(Instant::now() + Duration::from_millis(10)),
+                    reply: expired_reply_tx,
+                })
+                .unwrap();
+
+            let writer_thread = std::thread::spawn(move || {
+                run_writer(&mut writer, write_rx);
+                writer
+            });
+            let input_write_tx = write_tx.clone();
+            let input_thread = std::thread::spawn(move || {
+                run_input_forwarder(&mut data_rx, input_write_tx, accepting)
+            });
+            first_reply_rx.recv().unwrap().unwrap();
+            let err = expired_reply_rx.recv().unwrap().unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+
+            drop(data_tx);
+            input_thread.join().unwrap();
+            drop(write_tx);
+            let writer = writer_thread.join().unwrap();
+            assert_eq!(
+                writer
+                    .writes
+                    .iter()
+                    .map(|write| write.0.as_slice())
+                    .collect::<Vec<_>>(),
+                vec![b"first".as_slice(), b"\r".as_slice()]
             );
         }
     }

@@ -454,8 +454,10 @@ impl TerminalRuntime {
         text: Bytes,
         enter: Bytes,
         delay: std::time::Duration,
+        deadline: Option<std::time::Instant>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
-        self.0.queue_user_input_submission(text, enter, delay)
+        self.0
+            .queue_user_input_submission(text, enter, delay, deadline)
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
