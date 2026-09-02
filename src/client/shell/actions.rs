@@ -388,11 +388,16 @@ impl ClientShellState {
         } else if !self.endpoint_notice_seen.insert(key.clone()) {
             return false;
         }
+        let duration_seconds = if kind == ClientEndpointNoticeKind::Rejected {
+            3
+        } else {
+            8
+        };
         self.visible_endpoint_notice = Some(ClientVisibleEndpointNotice {
             key,
             title: title.into(),
             body,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(8),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(duration_seconds),
         });
         true
     }

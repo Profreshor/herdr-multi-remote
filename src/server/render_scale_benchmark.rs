@@ -59,6 +59,7 @@ impl RenderPipeline {
             "bench-boot",
             1,
             None,
+            None,
         )));
 
         Self {
@@ -71,9 +72,19 @@ impl RenderPipeline {
     fn render_once(&mut self) -> (Duration, Duration) {
         let surface_size = self.client.surface_size(COLS, ROWS);
         let started = Instant::now();
+        let target = self
+            .app
+            .state
+            .active
+            .map(|workspace_index| crate::ui::TabSurfaceTarget {
+                workspace_index,
+                tab_index: self.app.state.workspaces[workspace_index].active_tab_index(),
+            });
         let rendered = super::client_shell::render_pane_surface(
             &mut self.app,
+            target,
             Rect::new(0, 0, surface_size.cols, surface_size.rows),
+            true,
             true,
             HostCellSize {
                 width_px: 1,
@@ -219,7 +230,7 @@ fn profile_snapshot_encoding(
     let pipeline = RenderPipeline::new(build(count));
     let run = || {
         let started = Instant::now();
-        let template = super::client_shell::snapshot(&pipeline.app, "bench-boot", 1, None);
+        let template = super::client_shell::snapshot(&pipeline.app, "bench-boot", 1, None, None);
         for client_index in 0..client_count {
             let mut snapshot = template.clone();
             snapshot.revision = client_index as u64 + 1;

@@ -505,6 +505,7 @@ fn generic_endpoint_failures_and_control_errors_are_visible() {
         [ClientShellAction::Endpoint { request, .. }] => request.id.clone(),
         other => panic!("expected generic endpoint request, got {other:?}"),
     };
+    let rejected_at = std::time::Instant::now();
     let (repaint, actions) = state.handle_endpoint_result(
         "boot-1",
         &request_id,
@@ -522,6 +523,9 @@ fn generic_endpoint_failures_and_control_errors_are_visible() {
     assert_eq!(notice.key.kind, ClientEndpointNoticeKind::Rejected);
     assert_eq!(notice.key.code, "workspace.focus:not_found");
     assert_eq!(notice.body, "workspace no longer exists");
+    let observed_at = std::time::Instant::now();
+    assert!(notice.deadline >= rejected_at + std::time::Duration::from_secs(3));
+    assert!(notice.deadline <= observed_at + std::time::Duration::from_secs(3));
     assert!(state.endpoint_error.is_none());
 
     assert!(state.receive_endpoint_error("Paste rejected: too large".into()));

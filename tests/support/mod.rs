@@ -21,6 +21,7 @@ pub const SERVER_MESSAGE_PANE_SURFACE: u32 = 13;
 pub const SERVER_MESSAGE_SEMANTIC_NOTIFICATION: u32 = 14;
 pub const SERVER_MESSAGE_PANE_SURFACE_PATCH: u32 = 19;
 const CLIENT_MESSAGE_CLIENT_SHELL_PANE_INPUT: u32 = 13;
+const CLIENT_MESSAGE_CLIENT_SHELL_FOCUS: u32 = 18;
 const CLIENT_MESSAGE_ENDPOINT_CONTROL: u32 = 20;
 
 pub fn register_spawned_herdr_pid(pid: Option<u32>) {
@@ -385,6 +386,17 @@ pub fn send_client_shell_shift_enter(stream: &mut UnixStream, pane_id: &str) -> 
     stream
         .flush()
         .map_err(|e| format!("flush client shell key: {e}"))
+}
+
+pub fn send_client_shell_focus(stream: &mut UnixStream, focused: bool) -> Result<(), String> {
+    let mut payload = encode_varint_u32(CLIENT_MESSAGE_CLIENT_SHELL_FOCUS);
+    payload.push(u8::from(focused));
+    stream
+        .write_all(&frame_message(&payload))
+        .map_err(|e| format!("write client shell focus: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("flush client shell focus: {e}"))
 }
 
 pub fn send_detach(stream: &mut UnixStream) -> Result<(), String> {

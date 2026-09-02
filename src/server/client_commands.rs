@@ -92,6 +92,20 @@ pub(crate) fn error_message(
     }
 }
 
+fn correlate_response_id(response: String, request_id: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&response) else {
+        return response;
+    };
+    let Some(id) = value.get_mut("id") else {
+        return response;
+    };
+    if id.as_str() == Some(request_id) {
+        return response;
+    }
+    *id = serde_json::Value::String(request_id.to_owned());
+    serde_json::to_string(&value).unwrap_or(response)
+}
+
 pub(crate) fn spawn_response_waiter(
     client_id: u64,
     boot_id: String,
@@ -109,7 +123,7 @@ pub(crate) fn spawn_response_waiter(
                     "endpoint command ended without a response",
                 )
             });
-            let response = response.into_bytes();
+            let response = correlate_response_id(response, &request_id).into_bytes();
             if response.is_empty() {
                 let _ = server_event_tx.blocking_send(
                     ServerEvent::ClientShellEndpointResponseChunkReady {
@@ -316,6 +330,20 @@ mod tests {
         assert!(!supports_client_shell_method(&Method::ServerStop(
             crate::api::schema::EmptyParams::default(),
         )));
+    }
+
+    #[test]
+    fn endpoint_response_uses_the_client_request_id() {
+        let response = serde_json::json!({
+            "id": "endpoint:boot-a:7:client-shell:1",
+            "result": { "type": "ok" }
+        })
+        .to_string();
+
+        let correlated = correlate_response_id(response, "client-shell:1");
+        let decoded: serde_json::Value = serde_json::from_str(&correlated).expect("response json");
+
+        assert_eq!(decoded["id"], "client-shell:1");
     }
 
     #[test]
