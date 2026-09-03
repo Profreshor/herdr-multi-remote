@@ -603,7 +603,7 @@ impl WindowsInputMapper {
             };
         }
 
-        let events = self.translate_semantic_key_events(key);
+        let events = self.translate_semantic_key_events(key, resolve_ctrl_oem_char(key));
         let items = if let Some(bytes) = self.paste_payload_bytes_for_key(key) {
             vec![PlatformInputItem::PasteAwareKey {
                 win32_paste_bytes: bytes.clone(),
@@ -657,10 +657,11 @@ impl WindowsInputMapper {
                             win32_paste_bytes,
                         });
                     } else {
+                        let oem_char = resolve_ctrl_oem_char(record);
                         items.push(PlatformInputItem::PasteAwareKey {
                             bytes,
                             win32_paste_bytes,
-                            events: self.translate_semantic_key_events(record),
+                            events: self.translate_semantic_key_events(record, oem_char),
                         })
                     }
                 }
@@ -740,6 +741,7 @@ impl WindowsInputMapper {
     fn translate_semantic_key_events(
         &mut self,
         key: WindowsKeyRecord,
+        oem_char: Option<char>,
     ) -> Vec<crate::protocol::ClientInputEvent> {
         if !self.key_record_can_emit_event(key) {
             return Vec::new();
@@ -764,8 +766,9 @@ impl WindowsInputMapper {
             && !is_alt_code
             && !(0xd800..=0xdfff).contains(&key.unicode);
         if carries_native_record {
+            let kind = Self::semantic_key_kind(key, is_alt_code, 0);
             return self
-                .translate_semantic_key_event(key, Self::semantic_key_kind(key, is_alt_code, 0))
+                .translate_semantic_key_event(key, kind, oem_char)
                 .map(|event| match event {
                     crate::protocol::ClientInputEvent::Key {
                         code,
@@ -801,6 +804,7 @@ impl WindowsInputMapper {
                 self.translate_semantic_key_event(
                     key,
                     Self::semantic_key_kind(key, is_alt_code, repeat_idx),
+                    oem_char,
                 )
             })
             .collect()
@@ -842,6 +846,7 @@ impl WindowsInputMapper {
         &mut self,
         key: WindowsKeyRecord,
         kind: crate::protocol::ClientKeyKind,
+        oem_char: Option<char>,
     ) -> Option<crate::protocol::ClientInputEvent> {
         let modifiers = windows_key_modifiers(key.control_key_state);
         if key.virtual_key_code == 0 {
@@ -880,7 +885,7 @@ impl WindowsInputMapper {
             if modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                 && !(0x30..=0x39).contains(&key.virtual_key_code)
             {
-                if let Some(code) = windows_unicode_control_to_key_code(key.unicode) {
+                if let Some(code) = ctrl_key_code(key.virtual_key_code, key.unicode, oem_char) {
                     self.pending_high_surrogate = None;
                     return Some(crate::protocol::ClientInputEvent::Key {
                         code,
@@ -1200,17 +1205,33 @@ fn windows_virtual_key_to_char_code(
     Some(ClientKeyCode::Char(ch))
 }
 
-fn windows_unicode_control_to_key_code(unicode: u16) -> Option<crate::protocol::ClientKeyCode> {
+fn ctrl_key_code(vk: u16, u: u16, oem: Option<char>) -> Option<crate::protocol::ClientKeyCode> {
     use crate::protocol::ClientKeyCode;
-    Some(match unicode {
-        0x00 => ClientKeyCode::Char(' '),
-        0x1b => ClientKeyCode::Char('['),
-        0x1c => ClientKeyCode::Char('\\'),
-        0x1d => ClientKeyCode::Char(']'),
-        0x1e => ClientKeyCode::Char('^'),
-        0x1f => ClientKeyCode::Char('-'),
+    Some(match (vk, u) {
+        (0xbf, 0x00) => ClientKeyCode::Char(oem?),
+        (_, 0x00) => ClientKeyCode::Char(' '),
+        (_, 0x1b) => ClientKeyCode::Char('['),
+        (_, 0x1c) => ClientKeyCode::Char('\\'),
+        (_, 0x1d) => ClientKeyCode::Char(']'),
+        (_, 0x1e) => ClientKeyCode::Char('^'),
+        (_, 0x1f) => ClientKeyCode::Char('-'),
         _ => return None,
     })
+}
+
+fn resolve_ctrl_oem_char(key: WindowsKeyRecord) -> Option<char> {
+    if key.virtual_key_code == 0xbf
+        && key.unicode == 0
+        && windows_key_modifiers(key.control_key_state)
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+    {
+        #[cfg(windows)]
+        return crate::platform::resolve_base_printable_key(
+            key.virtual_key_code,
+            key.virtual_scan_code,
+        );
+    }
+    None
 }
 
 #[cfg(any(windows, test))]
@@ -1768,6 +1789,44 @@ mod tests {
                 "vk={vk:#x} unicode={unicode:#x}"
             );
         }
+    }
+
+    #[test]
+    fn vti_ctrl_oem_record_uses_resolved_layout_character() {
+        let pressed = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0xbf,
+            virtual_scan_code: 0x35,
+            unicode: 0,
+            control_key_state: 0x0028,
+        };
+        let released = WindowsKeyRecord {
+            key_down: false,
+            ..pressed
+        };
+        let mut mapper = WindowsInputMapper::default();
+        let expected = |record, kind, ch| crate::protocol::ClientInputEvent::Key {
+            code: crate::protocol::ClientKeyCode::Char(ch),
+            modifiers: crossterm::event::KeyModifiers::CONTROL.bits(),
+            kind,
+            repeat_count: 1,
+            generated_text: None,
+            source: crate::protocol::ClientKeySource::WindowsConsole { record },
+        };
+        for (record, kind, ch) in [
+            (pressed, crate::protocol::ClientKeyKind::Press, '/'),
+            (released, crate::protocol::ClientKeyKind::Release, '/'),
+            (pressed, crate::protocol::ClientKeyKind::Press, 'ß'),
+        ] {
+            assert_eq!(
+                mapper.translate_semantic_key_events(record, Some(ch)),
+                [expected(record, kind, ch)]
+            );
+        }
+        assert!(mapper
+            .translate_semantic_key_events(pressed, None)
+            .is_empty());
     }
 
     #[test]

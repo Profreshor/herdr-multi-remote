@@ -57,6 +57,7 @@ impl ClientShellState {
                 workspace_scroll: &mut self.workspace_scroll,
                 agent_scroll: &mut self.agent_scroll,
                 tab_scroll: &mut self.tab_scroll,
+                reveal_focused_workspace: &mut self.reveal_focused_workspace,
                 reveal_focused_tab: &mut self.reveal_focused_tab,
                 sidebar_collapsed: self.sidebar_collapsed,
                 sidebar_section_split: self.sidebar_section_split,

@@ -200,6 +200,7 @@ pub(super) struct ShellRenderState<'a> {
     pub(super) workspace_scroll: &'a mut usize,
     pub(super) agent_scroll: &'a mut usize,
     pub(super) tab_scroll: &'a mut usize,
+    pub(super) reveal_focused_workspace: &'a mut bool,
     pub(super) reveal_focused_tab: &'a mut bool,
     pub(super) sidebar_collapsed: bool,
     pub(super) sidebar_section_split: f32,

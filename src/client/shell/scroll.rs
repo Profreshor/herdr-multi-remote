@@ -53,6 +53,29 @@ pub(super) fn list_scroll_metrics(
     }
 }
 
+pub(super) fn list_scroll_start_to_reveal(
+    row_heights: &[u16],
+    gaps_after: &[u16],
+    body_height: u16,
+    requested_start: usize,
+    target: usize,
+) -> usize {
+    let mut metrics = list_scroll_metrics(row_heights, gaps_after, body_height, requested_start);
+    let mut start = metrics
+        .max_offset_from_bottom
+        .saturating_sub(metrics.offset_from_bottom);
+    if target < start {
+        return target;
+    }
+    while target >= start.saturating_add(metrics.viewport_rows)
+        && start < metrics.max_offset_from_bottom
+    {
+        start = start.saturating_add(1);
+        metrics = list_scroll_metrics(row_heights, gaps_after, body_height, start);
+    }
+    start
+}
+
 pub(super) fn render_list_scrollbar(
     buffer: &mut Buffer,
     track: Rect,

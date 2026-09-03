@@ -501,7 +501,7 @@ fn encode_legacy_inner(key: TerminalKey) -> Vec<u8> {
                     ']' | '5' => vec![29],
                     '^' | '6' => vec![30],
                     '_' | '/' | '7' | '-' => vec![31],
-                    _ => vec![ch as u8],
+                    _ => ch.to_string().into_bytes(),
                 }
             } else {
                 let ch = if key.modifiers == KeyModifiers::SHIFT {
@@ -587,6 +587,12 @@ mod tests {
     fn legacy_ctrl_slash_aliases_ctrl_underscore() {
         let key = KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL);
         assert_eq!(encode_key(key, KeyboardProtocol::Legacy), vec![31]);
+    }
+
+    #[test]
+    fn legacy_ctrl_non_ascii_char_uses_utf8() {
+        let key = KeyEvent::new(KeyCode::Char('ß'), KeyModifiers::CONTROL);
+        assert_eq!(encode_key(key, KeyboardProtocol::Legacy), "ß".as_bytes());
     }
 
     #[test]

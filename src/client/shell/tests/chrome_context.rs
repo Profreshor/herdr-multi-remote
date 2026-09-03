@@ -47,6 +47,53 @@ fn tab_overflow_controls_scroll_the_client_owned_tab_bar() {
 }
 
 #[test]
+fn focused_workspace_change_reveals_new_workspace_in_full_sidebar() {
+    let mut initial = snapshot();
+    let template = initial.workspaces[0].clone();
+    initial.workspaces = (1..=12)
+        .map(|number| ClientShellWorkspace {
+            workspace_id: format!("ws_{number}"),
+            number,
+            label: format!("space-{number}"),
+            branch: None,
+            focused: number == 1,
+            ..template.clone()
+        })
+        .collect();
+
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(initial));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).expect("full sidebar");
+    assert!(state.hits.workspace_max_scroll > 0);
+    assert!(state
+        .hits
+        .workspaces
+        .iter()
+        .all(|hit| hit.workspace_id != "ws_12"));
+
+    let mut update = state.snapshot.as_deref().expect("snapshot").clone();
+    update.revision = 2;
+    update.focused_workspace_id = Some("ws_12".into());
+    for workspace in &mut update.workspaces {
+        workspace.focused = workspace.workspace_id == "ws_12";
+    }
+    let mut updated_surface = surface();
+    updated_surface.projection_revision = 2;
+    state.set_snapshot(Box::new(update));
+    state.set_pane_surface(updated_surface);
+    state.compose(106, 2).expect("zero-height workspace body");
+    assert!(state.reveal_focused_workspace);
+    state.compose(106, 20).expect("updated full sidebar");
+
+    assert!(state
+        .hits
+        .workspaces
+        .iter()
+        .any(|hit| hit.workspace_id == "ws_12"));
+}
+
+#[test]
 fn client_owned_sidebar_dividers_resize_live() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot()));
