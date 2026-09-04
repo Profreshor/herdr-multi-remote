@@ -154,10 +154,7 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
 
-    if let Some(reason) = channel_set_rejection(
-        channel,
-        crate::update::preview_channel_rejection_for_current_install(),
-    ) {
+    if let Some(reason) = channel_set_rejection(channel) {
         eprintln!("{reason}.");
         return Ok(1);
     }
@@ -227,12 +224,9 @@ fn parse_channel_set_arg(args: &[String]) -> Option<&str> {
     }
 }
 
-fn channel_set_rejection(
-    channel: &str,
-    install_rejection: Option<&'static str>,
-) -> Option<&'static str> {
+fn channel_set_rejection(channel: &str) -> Option<&'static str> {
     if channel == "preview" {
-        return install_rejection;
+        return Some("the Profreshor/herdr-multi-remote fork provides stable releases only; preview is unavailable");
     }
 
     None
@@ -1061,16 +1055,12 @@ mod tests {
     }
 
     #[test]
-    fn channel_set_only_applies_package_rejection_to_preview() {
+    fn channel_set_rejects_preview_for_the_fork() {
         assert_eq!(
-            super::channel_set_rejection("preview", Some("no preview")),
-            Some("no preview")
+            super::channel_set_rejection("preview"),
+            Some("the Profreshor/herdr-multi-remote fork provides stable releases only; preview is unavailable")
         );
-        assert_eq!(
-            super::channel_set_rejection("stable", Some("no preview")),
-            None
-        );
-        assert_eq!(super::channel_set_rejection("preview", None), None);
+        assert_eq!(super::channel_set_rejection("stable"), None);
     }
 
     #[test]

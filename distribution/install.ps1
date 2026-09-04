@@ -20,6 +20,9 @@ if ($channelWasExplicit -and $Channel -notin @("stable", "preview")) {
     Write-Error "Invalid Herdr channel '$Channel'. Use 'stable' or 'preview'."
     exit 1
 }
+if ($Channel -eq "preview") {
+    throw "The Profreshor/herdr-multi-remote fork provides stable releases only; preview is unavailable."
+}
 
 $localPackageValueCount = @(
     $LocalPackagePath,
@@ -732,35 +735,19 @@ if ($useLocalPackage) {
         }
     }
 
+    if ($Channel -eq "preview") {
+        throw "The Profreshor/herdr-multi-remote fork provides stable releases only; preview is unavailable. Rerun with -Channel stable."
+    }
+
     if ([string]::IsNullOrWhiteSpace($ManifestUrl)) {
-        $ManifestUrl = if ($Channel -eq "preview") {
-            "https://herdr.dev/preview.json"
-        } else {
-            "https://herdr.dev/latest.json"
-        }
+        $ManifestUrl = "https://github.com/Profreshor/herdr-multi-remote/releases/latest/download/latest.json"
     }
 
     Write-Step "Fetching Herdr $Channel manifest"
     $manifest = Get-RemoteManifest -Uri $ManifestUrl
     $manifestChannelProperty = $manifest.PSObject.Properties["channel"]
-    if (-not $channelWasExplicit -and $null -ne $manifestChannelProperty -and [string]$manifestChannelProperty.Value -eq "preview") {
-        $Channel = "preview"
-    }
-    $assetsProperty = $manifest.PSObject.Properties["assets"]
-    $assetProperty = if ($null -eq $assetsProperty) {
-        $null
-    } else {
-        $assetsProperty.Value.PSObject.Properties[$target]
-    }
-    if ($null -eq $assetProperty -and
-        -not $channelWasExplicit -and
-        $Channel -eq "stable" -and
-        $ManifestUrl -match "/latest\.json$") {
-        Write-WarningStep "The stable manifest does not include Windows yet; using preview during the stable-channel rollout."
-        $Channel = "preview"
-        $ManifestUrl = $ManifestUrl.Substring(0, $ManifestUrl.Length - "latest.json".Length) + "preview.json"
-        Write-Step "Fetching Herdr preview manifest"
-        $manifest = Get-RemoteManifest -Uri $ManifestUrl
+    if ($null -ne $manifestChannelProperty -and [string]$manifestChannelProperty.Value -eq "preview") {
+        throw "The Profreshor/herdr-multi-remote fork provides stable releases only; the selected manifest is a preview manifest."
     }
     $asset = Get-ManifestAsset -Manifest $manifest -Target $target
     if (-not [string]::IsNullOrWhiteSpace($ExpectedBuildId) -and [string]$manifest.build_id -ne $ExpectedBuildId) {

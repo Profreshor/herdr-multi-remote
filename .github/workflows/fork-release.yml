@@ -1,0 +1,123 @@
+name: Fork release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+jobs:
+  build:
+    if: github.repository == 'Profreshor/herdr-multi-remote'
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: herdr-linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            name: herdr-linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: herdr-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: herdr-macos-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            name: herdr-windows-x86_64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Verify tag
+        shell: bash
+        run: test "$(sed -n 's/^version = \"\(.*\)\"/\1/p' Cargo.toml | head -1)" = "${GITHUB_REF_NAME#v}"
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: ${{ matrix.target }}
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build musl-tools gcc-aarch64-linux-gnu crossbuild-essential-arm64
+      - name: Set Linux aarch64 linker
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+      - name: Install Zig
+        if: runner.os != 'macOS'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+      - name: Install macOS build tools and Zig
+        if: runner.os == 'macOS'
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install cmake ninja zig@0.15
+          echo "$(brew --prefix zig@0.15)/bin" >> "$GITHUB_PATH"
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Package Unix artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        run: cp "target/${{ matrix.target }}/release/herdr" "${{ matrix.name }}"
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP "Microsoft.Windows.Console.ConPTY.nupkg"
+          $stage = Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64"
+          .\scripts\package_windows_conpty.ps1 -HerdrExe "target\${{ matrix.target }}\release\herdr.exe" -PackagePath $package -StageDir $stage -OutputPath "${{ matrix.name }}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+
+  release:
+    needs: build
+    if: github.repository == 'Profreshor/herdr-multi-remote'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Create stable manifest
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          protocol="$(sed -n 's/.*PROTOCOL_VERSION: u32 = \([0-9]*\);/\1/p' src/protocol/wire.rs)"
+          endpoint_generation="$(sed -n 's/.*ENDPOINT_PROTOCOL_GENERATION: u32 = \([0-9]*\);/\1/p' src/protocol/endpoint.rs)"
+          printf 'Profreshor/herdr-multi-remote stable release v%s.\n' "$version" > RELEASE_NOTES.md
+          python3 - "$version" "$protocol" "$endpoint_generation" > latest.json <<'PY'
+          import hashlib, json, sys
+          version, protocol, endpoint_generation = sys.argv[1:]
+          names = ["linux-x86_64", "linux-aarch64", "macos-x86_64", "macos-aarch64", "windows-x86_64"]
+          assets = {name: f"https://github.com/Profreshor/herdr-multi-remote/releases/download/v{version}/herdr-{name}{'.zip' if name == 'windows-x86_64' else ''}" for name in names}
+          filenames = {name: f"herdr-{name}{'.zip' if name == 'windows-x86_64' else ''}" for name in names}
+          files = {name: f"release-assets/{filename}" for name, filename in filenames.items()}
+          sha256 = {name: hashlib.sha256(open(path, "rb").read()).hexdigest() for name, path in files.items()}
+          notes = f"Profreshor/herdr-multi-remote stable release v{version}."
+          print(json.dumps({"version": version, "protocol": int(protocol), "endpoint_generation": int(endpoint_generation), "notes": notes, "assets": assets, "sha256": sha256, "releases": {version: {"notes": notes, "protocol": int(protocol), "endpoint_generation": int(endpoint_generation), "assets": assets, "sha256": sha256}}}, indent=2))
+          PY
+      - uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        with:
+          files: |
+            release-assets/herdr-linux-x86_64
+            release-assets/herdr-linux-aarch64
+            release-assets/herdr-macos-x86_64
+            release-assets/herdr-macos-aarch64
+            release-assets/herdr-windows-x86_64.zip
+            latest.json
+        body_path: RELEASE_NOTES.md

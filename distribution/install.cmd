@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-set "INSTALLER_URL=https://herdr.dev/install.ps1"
+set "INSTALLER_URL=https://raw.githubusercontent.com/Profreshor/herdr-multi-remote/master/distribution/install.ps1"
 set "CURL_PROTOCOL=--proto =https --tlsv1.2"
 if defined HERDR_INSTALLER_URL (
     set "INSTALLER_URL=%HERDR_INSTALLER_URL%"
