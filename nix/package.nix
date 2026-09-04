@@ -41,6 +41,7 @@ rustPlatform.buildRustPackage {
       lib.fileset.unions [
         ../assets
         ../docs/next/api/herdr-api.schema.json
+        ../distribution/install.ps1
         ../src
         ../vendor/libghostty-vt
         ../vendor/libghostty-vt.vendor.json

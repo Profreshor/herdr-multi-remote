@@ -14,7 +14,7 @@ if ($architecture -ne "Arm64") {
 $root = Join-Path $env:RUNNER_TEMP "herdr-windows-arm64-installer-test"
 $env:HERDR_HOME = Join-Path $root "home"
 $env:HERDR_INSTALL_DIR = Join-Path $root "bin"
-$env:HERDR_CHANNEL = "preview"
+$env:HERDR_CHANNEL = "stable"
 Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $root | Out-Null
 $installer = (Resolve-Path (Join-Path $PSScriptRoot "..\distribution\install.ps1")).Path

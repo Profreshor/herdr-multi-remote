@@ -244,9 +244,15 @@ jobs:
       - name: Test packaged installer and repair with Windows PowerShell 5.1
         shell: pwsh
         run: |
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
-            .\scripts\windows_install_conpty_package_test.ps1 `
-            -ArchivePath artifacts\herdr-windows-x86_64.zip
+          $installerTestArgs = @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+            '.\scripts\windows_install_conpty_package_test.ps1',
+            '-ArchivePath', 'artifacts\herdr-windows-x86_64.zip'
+          )
+          if ('${{ github.repository }}' -ne 'herdrdev/herdr') {
+            $installerTestArgs += '-StableOnly'
+          }
+          & powershell.exe @installerTestArgs
           if ($LASTEXITCODE -ne 0) {
             throw "Windows PowerShell installer test failed with exit code $LASTEXITCODE"
           }

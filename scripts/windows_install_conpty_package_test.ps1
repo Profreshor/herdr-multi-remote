@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$ArchivePath
+    [string]$ArchivePath,
+    [switch]$StableOnly
 )
 
 Set-StrictMode -Version Latest
@@ -145,6 +146,16 @@ try {
     $env:HERDR_HOME = Join-Path $root "unused\..\home"
     $previewManifestUrl = "http://127.0.0.1:$port/preview.json"
     $stableManifestUrl = "http://127.0.0.1:$port/latest.json"
+    $repairManifest = if ($StableOnly) { $stableManifest } else { $previewManifest }
+    $repairManifestPath = if ($StableOnly) { $stableManifestPath } else { $previewManifestPath }
+    $repairInstallArgs = @{
+        Channel = if ($StableOnly) { "stable" } else { "preview" }
+        ManifestUrl = if ($StableOnly) { $stableManifestUrl } else { $previewManifestUrl }
+        InstallDir = $installDir
+    }
+    if (-not $StableOnly) {
+        $repairInstallArgs.ExpectedBuildId = "installer-test"
+    }
     for ($attempt = 0; $attempt -lt 20; $attempt++) {
         try {
             Invoke-WebRequest -Uri $stableManifestUrl -UseBasicParsing | Out-Null
@@ -175,16 +186,21 @@ try {
         throw "fresh installer did not default to the stable Windows package"
     }
 
-    $legacyStableManifest | Out-File -LiteralPath $stableManifestPath -Encoding utf8
     $env:HERDR_HOME = Join-Path $root "unused\..\home"
     $env:Path = $oldProcessPath
-    & $installerPath `
-        -ManifestUrl $stableManifestUrl `
-        -InstallDir $installDir `
-        -ExpectedBuildId "installer-test"
+    if ($StableOnly) {
+        $stableManifest | Out-File -LiteralPath $stableManifestPath -Encoding utf8
+        & $installerPath @repairInstallArgs
+    } else {
+        $legacyStableManifest | Out-File -LiteralPath $stableManifestPath -Encoding utf8
+        & $installerPath `
+            -ManifestUrl $stableManifestUrl `
+            -InstallDir $installDir `
+            -ExpectedBuildId "installer-test"
 
-    # Keep the existing positional web-installer contract, including Retain in slot five.
-    & $installerPath "preview" $previewManifestUrl $installDir "installer-test" 3
+        # Keep the existing positional web-installer contract, including Retain in slot five.
+        & $installerPath "preview" $previewManifestUrl $installDir "installer-test" 3
+    }
 
     $localInstallDir = Join-Path $root "local-bin"
     $env:HERDR_HOME = Join-Path $root "local-home"
@@ -258,16 +274,16 @@ try {
     }
     Remove-Item -LiteralPath (Join-Path $releaseDir.FullName "conpty\conpty.dll") -Force
 
-    $badManifest = $previewManifest | ConvertFrom-Json
-    $badManifest.assets."windows-x86_64".url = "http://127.0.0.1:$port/missing.zip"
-    $badManifest | ConvertTo-Json -Depth 5 | Out-File -LiteralPath $previewManifestPath -Encoding utf8
+    $badManifest = $repairManifest | ConvertFrom-Json
+    if ($StableOnly) {
+        $badManifest.assets."windows-x86_64" = "http://127.0.0.1:$port/missing.zip"
+    } else {
+        $badManifest.assets."windows-x86_64".url = "http://127.0.0.1:$port/missing.zip"
+    }
+    $badManifest | ConvertTo-Json -Depth 5 | Out-File -LiteralPath $repairManifestPath -Encoding utf8
     $downloadFailed = $false
     try {
-        & "$PSScriptRoot\..\distribution\install.ps1" `
-            -Channel preview `
-            -ManifestUrl $previewManifestUrl `
-            -InstallDir $installDir `
-            -ExpectedBuildId "installer-test"
+        & "$PSScriptRoot\..\distribution\install.ps1" @repairInstallArgs
     } catch {
         if ($_.Exception.Message -notmatch "(?i)(404|not found)") {
             throw
@@ -281,7 +297,7 @@ try {
         throw "failed repair removed the existing release"
     }
 
-    $previewManifest | Out-File -LiteralPath $previewManifestPath -Encoding utf8
+    $repairManifest | Out-File -LiteralPath $repairManifestPath -Encoding utf8
     $stagedConpty = Join-Path $releasesDir ".staging.$($releaseDir.Name).$PID\conpty\conpty.dll"
 
     $transientLockState = @{ Handle = $null; Acquired = $false; Released = $false }
@@ -316,11 +332,7 @@ try {
     }.GetNewClosure()
     $transientLockBreakpoint = Set-PSBreakpoint -Script $installerPath -Variable "backupDir" -Mode Write -Action $lockStagedFileTransiently
     try {
-        & $installerPath `
-            -Channel preview `
-            -ManifestUrl $previewManifestUrl `
-            -InstallDir $installDir `
-            -ExpectedBuildId "installer-test"
+        & $installerPath @repairInstallArgs
         if (-not $transientLockState.Acquired) {
             throw "installer did not acquire the transient staged-file lock"
         }
@@ -357,11 +369,7 @@ try {
     try {
         $swapFailed = $false
         try {
-            & $installerPath `
-                -Channel preview `
-                -ManifestUrl $previewManifestUrl `
-                -InstallDir $installDir `
-                -ExpectedBuildId "installer-test"
+            & $installerPath @repairInstallArgs
         } catch {
             $swapFailed = $true
         }
@@ -389,11 +397,7 @@ try {
         }
     }
 
-    & "$PSScriptRoot\..\distribution\install.ps1" `
-        -Channel preview `
-        -ManifestUrl $previewManifestUrl `
-        -InstallDir $installDir `
-        -ExpectedBuildId "installer-test"
+    & "$PSScriptRoot\..\distribution\install.ps1" @repairInstallArgs
     if (-not (Test-Path -LiteralPath (Join-Path $installDir "conpty\conpty.dll") -PathType Leaf)) {
         throw "installer did not repair an incomplete release"
     }
@@ -402,31 +406,29 @@ try {
     $junctionTarget = Join-Path $root "junction-target"
     Move-Item -LiteralPath $x64HostDir -Destination $junctionTarget
     New-Item -ItemType Junction -Path $x64HostDir -Target $junctionTarget | Out-Null
-    & "$PSScriptRoot\..\distribution\install.ps1" `
-        -Channel preview `
-        -ManifestUrl $previewManifestUrl `
-        -InstallDir $installDir `
-        -ExpectedBuildId "installer-test"
+    & "$PSScriptRoot\..\distribution\install.ps1" @repairInstallArgs
     $repairedHostDir = Get-Item -LiteralPath (Join-Path $installDir "conpty\x64") -Force
     if ($repairedHostDir.Attributes -band [IO.FileAttributes]::ReparsePoint) {
         throw "installer accepted a reparse-point ConPTY directory"
     }
 
-    $rejected = $false
-    try {
-        & "$PSScriptRoot\..\distribution\install.ps1" `
-            -Channel preview `
-            -ManifestUrl $previewManifestUrl `
-            -InstallDir $installDir `
-            -ExpectedBuildId "different-build"
-    } catch {
-        if ($_.Exception.Message -notlike "Preview manifest changed while updating.*") {
-            throw
+    if (-not $StableOnly) {
+        $rejected = $false
+        try {
+            & "$PSScriptRoot\..\distribution\install.ps1" `
+                -Channel preview `
+                -ManifestUrl $previewManifestUrl `
+                -InstallDir $installDir `
+                -ExpectedBuildId "different-build"
+        } catch {
+            if ($_.Exception.Message -notlike "Preview manifest changed while updating.*") {
+                throw
+            }
+            $rejected = $true
         }
-        $rejected = $true
-    }
-    if (-not $rejected) {
-        throw "installer accepted a manifest that did not match the updater-selected build"
+        if (-not $rejected) {
+            throw "installer accepted a manifest that did not match the updater-selected build"
+        }
     }
 
     $stableManifest | Out-File -LiteralPath $stableManifestPath -Encoding utf8
@@ -446,12 +448,13 @@ try {
         }
     }
 
-    $customPreviewManifestPath = Join-Path $webRoot "candidate.json"
-    $customPreviewManifest = $previewManifest | ConvertFrom-Json
-    $customPreviewManifest.PSObject.Properties.Remove("channel")
-    $customPreviewManifest | ConvertTo-Json -Depth 5 | Out-File -LiteralPath $customPreviewManifestPath -Encoding utf8
-    $fakeBin = Join-Path $root "fake-existing"
-    New-Item -ItemType Directory -Force -Path $fakeBin | Out-Null
+    if (-not $StableOnly) {
+        $customPreviewManifestPath = Join-Path $webRoot "candidate.json"
+        $customPreviewManifest = $previewManifest | ConvertFrom-Json
+        $customPreviewManifest.PSObject.Properties.Remove("channel")
+        $customPreviewManifest | ConvertTo-Json -Depth 5 | Out-File -LiteralPath $customPreviewManifestPath -Encoding utf8
+        $fakeBin = Join-Path $root "fake-existing"
+        New-Item -ItemType Directory -Force -Path $fakeBin | Out-Null
     @'
 @echo off
 if "%1"=="channel" if "%2"=="show" (
@@ -461,30 +464,31 @@ if "%1"=="channel" if "%2"=="show" (
 exit /b 1
 '@ | Out-File -LiteralPath (Join-Path $fakeBin "herdr.cmd") -Encoding ascii
 
-    $preserveHome = Join-Path $root "preserve-home"
-    $preserveBin = Join-Path $root "preserve-bin"
-    $env:HERDR_HOME = $preserveHome
-    $env:Path = "$fakeBin;$oldProcessPath"
-    & "$PSScriptRoot\..\distribution\install.ps1" `
-        -ManifestUrl "http://127.0.0.1:$port/candidate.json" `
-        -InstallDir $preserveBin `
-        -ExpectedBuildId "installer-test"
-    $preservedPreview = Get-ChildItem -LiteralPath (Join-Path $preserveHome "packages\standalone\releases") -Directory |
-        Where-Object { $_.Name.StartsWith("0.0.0-preview.installer-test-") } |
-        Select-Object -First 1
-    if ($null -eq $preservedPreview) {
-        throw "installer did not preserve the existing preview channel"
-    }
+        $preserveHome = Join-Path $root "preserve-home"
+        $preserveBin = Join-Path $root "preserve-bin"
+        $env:HERDR_HOME = $preserveHome
+        $env:Path = "$fakeBin;$oldProcessPath"
+        & "$PSScriptRoot\..\distribution\install.ps1" `
+            -ManifestUrl "http://127.0.0.1:$port/candidate.json" `
+            -InstallDir $preserveBin `
+            -ExpectedBuildId "installer-test"
+        $preservedPreview = Get-ChildItem -LiteralPath (Join-Path $preserveHome "packages\standalone\releases") -Directory |
+            Where-Object { $_.Name.StartsWith("0.0.0-preview.installer-test-") } |
+            Select-Object -First 1
+        if ($null -eq $preservedPreview) {
+            throw "installer did not preserve the existing preview channel"
+        }
 
-    & "$PSScriptRoot\..\distribution\install.ps1" `
-        -Channel stable `
-        -ManifestUrl $stableManifestUrl `
-        -InstallDir $preserveBin
-    $explicitStable = Get-ChildItem -LiteralPath (Join-Path $preserveHome "packages\standalone\releases") -Directory |
-        Where-Object { $_.Name.StartsWith("0.0.1-") } |
-        Select-Object -First 1
-    if ($null -eq $explicitStable) {
-        throw "explicit stable channel did not override the existing preview channel"
+        & "$PSScriptRoot\..\distribution\install.ps1" `
+            -Channel stable `
+            -ManifestUrl $stableManifestUrl `
+            -InstallDir $preserveBin
+        $explicitStable = Get-ChildItem -LiteralPath (Join-Path $preserveHome "packages\standalone\releases") -Directory |
+            Where-Object { $_.Name.StartsWith("0.0.1-") } |
+            Select-Object -First 1
+        if ($null -eq $explicitStable) {
+            throw "explicit stable channel did not override the existing preview channel"
+        }
     }
 } finally {
     $env:HERDR_HOME = $oldHerdrHome
