@@ -117,7 +117,7 @@ worktree チェックアウトの削除は明示的に行います。グルー�
 manage_ssh_config = true
 ```
 
-有効な場合、`herdr --remote` は最初にユーザーとシステムの SSH 設定を取り込み、その後にフォールバックの `ServerAliveInterval` と `ServerAliveCountMax` の値を加えた、プライベートな一時 SSH 設定を書き込みます。ユーザー自身のキープアライブ設定が優先されます。Linux と macOS クライアントは、最初に認証した接続を再利用するため、アタッチごとにプライベートな OpenSSH コントロールソケットも使います。Windows OpenSSH ではこの接続再利用を使いません。Herdr が生成した設定やコントロールソケットを使わず、通常の `ssh` でリモートアタッチを実行するには `manage_ssh_config = false` を設定してください。
+有効な場合、`herdr --remote` はユーザーとシステムの SSH 設定を取り込み、フォールバックのキープアライブ値を加えたプライベートな一時 SSH 設定を書き込みます。Herdr が管理するコマンドでは、切断した通信を一定時間内に検出するため `ServerAliveInterval 15` と `ServerAliveCountMax 4` を強制します。Linux と macOS クライアントは、最初に認証した接続を再利用するため、アタッチごとにプライベートな OpenSSH コントロールソケットも使います。Windows OpenSSH ではこの接続再利用を使いません。SSH のキープアライブ設定を変更せず、通常の `ssh` でリモートアタッチを実行するには `manage_ssh_config = false` を設定してください。
 
 ## キーバインド
 

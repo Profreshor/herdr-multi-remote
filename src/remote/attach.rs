@@ -989,6 +989,11 @@ fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshO
             .arg("-o")
             .arg("ControlPersist=yes");
     }
+    command
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=4");
 }
 
 impl InstallSource {
@@ -2354,8 +2359,8 @@ fn ssh_config_include_path(path: &Path) -> String {
     }
 }
 
-/// Builds a temporary ssh config that includes the user's settings first, so
-/// OpenSSH's first-value-wins behavior preserves explicit user keepalives.
+/// Builds a temporary ssh config that includes the user's settings and provides
+/// keepalive fallbacks for tools that consume the config directly.
 fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
     let paths = crate::platform::remote_ssh_config_paths();
     let dir = crate::platform::create_remote_ssh_config_dir(SSH_CONTROL_SOCKET_NAME)?;
@@ -2943,8 +2948,8 @@ mod tests {
         assert!(!contents.contains("ControlMaster"));
         assert!(!contents.contains("ControlPersist"));
         assert!(!contents.contains("ControlPath"));
-        // ...and any user config is Included (quoted) BEFORE it so
-        // first-value-wins keeps the user's own settings.
+        // ...and any user config is Included (quoted) before the fallback.
+        // Managed Herdr ssh commands enforce their liveness bound with `-o`.
         if let Some(home) = std::env::var_os("HOME") {
             let user_config = PathBuf::from(home).join(".ssh").join("config");
             if user_config.is_file() {
@@ -3020,6 +3025,10 @@ mod tests {
                 "ControlMaster=auto".to_string(),
                 "-o".to_string(),
                 "ControlPersist=yes".to_string(),
+                "-o".to_string(),
+                "ServerAliveInterval=15".to_string(),
+                "-o".to_string(),
+                "ServerAliveCountMax=4".to_string(),
                 "-T".to_string(),
                 "example".to_string(),
             ]
@@ -3052,6 +3061,10 @@ mod tests {
             vec![
                 "-F".to_string(),
                 config_path.to_string_lossy().into_owned(),
+                "-o".to_string(),
+                "ServerAliveInterval=15".to_string(),
+                "-o".to_string(),
+                "ServerAliveCountMax=4".to_string(),
                 "-T".to_string(),
                 "example".to_string(),
             ]

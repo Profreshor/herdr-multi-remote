@@ -63,9 +63,9 @@ Host workbox
 herdr --remote workbox
 ```
 
-リモートアタッチは、Linux、macOS、Windows のローカルクライアントから、x86_64 と aarch64 の Linux および macOS ホストへの接続をサポートします。Herdr はリモートのプラットフォームを確認し、リモートの `PATH` 上にある一致する `herdr` を優先してから、一般的な直接インストール、Homebrew、mise、Nix プロファイルのパスを確認します。一致するバイナリがない場合、対話的な実行では `~/.local/bin/herdr` へのインストールを提案します。非対話的な実行はホストを変更せずに失敗します。`~/.local/bin` がリモートの `PATH` にない場合、Herdr はインストール後に警告します。Windows をリモートホストとして使うことはできません。
+リモートアタッチは、Linux、macOS、Windows のクライアントとホストをサポートします。Linux と macOS ホストは x86_64 と aarch64 に対応し、Windows ホストは Windows ARM64 エミュレーションを含め x86_64 パッケージを使います。Herdr はリモートのプラットフォームを確認し、リモートの `PATH` 上にある互換性のある `herdr` を優先してから、一般的な直接インストール、Homebrew、mise、Nix、Windows スタンドアロンのインストール先を確認します。両方が安定版エンドポイント世代に対応していれば、ローカルとリモートのバージョンが一致する必要はありません。互換性のあるバイナリがない場合、対話的な実行では Unix の `~/.local/bin/herdr` または Windows のユーザー単位 Herdr プログラムディレクトリへのインストールを提案し、非対話的な実行はホストを変更せずに失敗します。Unix ホストの `PATH` に `~/.local/bin` がない場合、Herdr はインストール後に警告します。
 
-デフォルトでは、`herdr --remote` はユーザーの SSH config を最初に include し、その後にフォールバックのキープアライブ設定を加えた一時的な SSH config を通してリモートセットアップとブリッジを実行します。既存のユーザーのキープアライブ設定が優先されます。Linux と macOS クライアントは接続再利用用のプライベートなアタッチ単位コントロールソケットも使いますが、Windows OpenSSH では使いません。Herdr が生成する設定やコントロールソケットを使わず通常の `ssh` を使うには `[remote].manage_ssh_config = false` を設定してください。
+デフォルトでは、`herdr --remote` はユーザーの SSH config とフォールバックのキープアライブ設定を含む一時的な SSH config を通してリモートセットアップとブリッジを実行します。Herdr が管理するコマンドでは、切断した通信を一定時間内に検出するため `ServerAliveInterval 15` と `ServerAliveCountMax 4` を強制します。Linux と macOS クライアントは接続再利用用のプライベートなアタッチ単位コントロールソケットも使いますが、Windows OpenSSH では使いません。SSH のキープアライブ設定を変更せず通常の `ssh` を使うには `[remote].manage_ssh_config = false` を設定してください。
 
 デフォルトでは、実行中のリモートサーバーの置き換えや再起動が必要な場合、リモートアタッチは通常の再起動/停止フローを使います。対応する実行中リモートサーバーで実験的なライブハンドオフにオプトインするには `--handoff` を渡します:
 
