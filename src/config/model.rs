@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, num::NonZeroUsize};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroUsize,
+};
 
 use crossterm::event::KeyModifiers;
 use serde::{de, Deserialize, Deserializer, Serialize};
@@ -320,6 +323,7 @@ pub struct Config {
     pub advanced: AdvancedConfig,
     pub experimental: ExperimentalConfig,
     pub remote: RemoteConfig,
+    pub remotes: BTreeMap<String, RemoteServerConfig>,
 }
 
 #[derive(Debug)]
@@ -967,6 +971,73 @@ pub struct RemoteConfig {
     pub manage_ssh_config: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct RemoteServerConfig {
+    /// OpenSSH host, alias, or user@host target. Authentication remains owned by OpenSSH.
+    pub host: String,
+    /// Herdr session on the remote host. Empty means the default session.
+    pub session: Option<String>,
+    /// Keep the entry in config without connecting it. Default: true.
+    pub enabled: bool,
+}
+
+impl Default for RemoteServerConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            session: None,
+            enabled: true,
+        }
+    }
+}
+
+pub(crate) fn validate_remote_server_id(id: &str) -> Result<(), &'static str> {
+    if id == "local" {
+        return Err("is reserved for the local server");
+    }
+    if id.is_empty() || id.len() > 63 {
+        return Err("must contain between 1 and 63 characters");
+    }
+    if !id.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+    }) {
+        return Err("may only contain lowercase ASCII letters, numbers, '-' and '_'");
+    }
+    Ok(())
+}
+
+impl RemoteServerConfig {
+    pub(crate) fn validation_error(&self, id: &str) -> Option<String> {
+        if let Err(reason) = validate_remote_server_id(id) {
+            return Some(format!("remotes.{id} {reason}; disabling remote"));
+        }
+        if self.host.is_empty() {
+            return Some(format!(
+                "remotes.{id}.host must not be empty; disabling remote"
+            ));
+        }
+        if self.host.starts_with('-') {
+            return Some(format!(
+                "remotes.{id}.host must not start with '-'; disabling remote"
+            ));
+        }
+        if self.host.chars().any(char::is_whitespace) {
+            return Some(format!(
+                "remotes.{id}.host must not contain whitespace; disabling remote"
+            ));
+        }
+        if let Some(session) = self.session.as_deref() {
+            if let Err(reason) = crate::session::validate_name(session) {
+                return Some(format!(
+                    "remotes.{id}.session is invalid: {reason}; disabling remote"
+                ));
+            }
+        }
+        None
+    }
+}
+
 impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
@@ -1233,6 +1304,81 @@ impl Default for AdvancedConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_servers_default_empty_and_parse_without_changing_remote_transport() {
+        let default_config = Config::default();
+        assert!(default_config.remotes.is_empty());
+        assert!(default_config.remote.manage_ssh_config);
+
+        let config: Config = toml::from_str(
+            r#"
+[remote]
+manage_ssh_config = false
+
+[remotes.analytics]
+host = "dev@analytics"
+
+[remotes.portal-staging]
+host = "portal-staging"
+session = "work"
+enabled = false
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.remote.manage_ssh_config);
+        assert_eq!(
+            config
+                .remotes
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["analytics", "portal-staging"]
+        );
+        assert_eq!(config.remotes["analytics"].host, "dev@analytics");
+        assert_eq!(config.remotes["analytics"].session, None);
+        assert!(config.remotes["analytics"].enabled);
+        assert_eq!(
+            config.remotes["portal-staging"].session.as_deref(),
+            Some("work")
+        );
+        assert!(!config.remotes["portal-staging"].enabled);
+        assert!(config.collect_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn remote_server_validation_names_the_exact_entry() {
+        for (toml, diagnostic) in [
+            (
+                "[remotes.local]\nhost = \"host\"\n",
+                "remotes.local is reserved for the local server; disabling remote",
+            ),
+            (
+                "[remotes.Analytics]\nhost = \"host\"\n",
+                "remotes.Analytics may only contain lowercase ASCII letters, numbers, '-' and '_'; disabling remote",
+            ),
+            (
+                "[remotes.analytics]\nhost = \"\"\n",
+                "remotes.analytics.host must not be empty; disabling remote",
+            ),
+            (
+                "[remotes.analytics]\nhost = \"-oProxyCommand=nope\"\n",
+                "remotes.analytics.host must not start with '-'; disabling remote",
+            ),
+            (
+                "[remotes.analytics]\nhost = \"bad host\"\n",
+                "remotes.analytics.host must not contain whitespace; disabling remote",
+            ),
+            (
+                "[remotes.analytics]\nhost = \"host\"\nsession = \"bad/name\"\n",
+                "remotes.analytics.session is invalid: session name may only contain ASCII letters, numbers, '.', '_' and '-'; disabling remote",
+            ),
+        ] {
+            let config: Config = toml::from_str(toml).unwrap();
+            assert_eq!(config.collect_diagnostics(), vec![diagnostic]);
+        }
+    }
 
     #[test]
     fn update_config_defaults_and_parses() {

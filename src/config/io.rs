@@ -10,6 +10,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "keys",
     "onboarding",
     "remote",
+    "remotes",
     "server",
     "session",
     "terminal",
@@ -349,6 +350,20 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         &mut invalid_sections,
         |section| config.remote = section,
     );
+    load_live_section(
+        table,
+        "remotes",
+        "remote servers config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.remotes = section,
+    );
+    for (id, remote) in &config.remotes {
+        if let Some(diagnostic) = remote.validation_error(id) {
+            diagnostics.push(diagnostic);
+            invalid_sections.push(format!("remotes.{id}"));
+        }
+    }
 
     diagnostics.extend(config.theme.diagnostics());
 
@@ -872,6 +887,50 @@ resume_agents_on_restore = true
         assert!(loaded.config.session.resume_agents_on_restore);
         assert!(loaded.diagnostics.is_empty());
         assert!(loaded.invalid_sections.is_empty());
+    }
+
+    #[test]
+    fn load_live_config_parses_remote_servers_and_reports_unknown_credentials() {
+        let loaded = load_live_config_from_str(
+            r#"
+[remote]
+manage_ssh_config = false
+
+[remotes.analytics]
+host = "analytics"
+password = "do-not-store-this"
+"#,
+        )
+        .unwrap();
+
+        assert!(!loaded.config.remote.manage_ssh_config);
+        assert_eq!(loaded.config.remotes["analytics"].host, "analytics");
+        assert_eq!(
+            loaded.diagnostics,
+            vec!["unknown config key remotes.analytics.password; ignoring key"]
+        );
+        assert!(loaded.invalid_sections.is_empty());
+    }
+
+    #[test]
+    fn load_live_config_marks_only_invalid_remote_entries() {
+        let loaded = load_live_config_from_str(
+            r#"
+[remotes.analytics]
+host = "analytics"
+
+[remotes.bad_host]
+host = "bad host"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(loaded.config.remotes["analytics"].host, "analytics");
+        assert_eq!(
+            loaded.diagnostics,
+            vec!["remotes.bad_host.host must not contain whitespace; disabling remote"]
+        );
+        assert_eq!(loaded.invalid_sections, vec!["remotes.bad_host"]);
     }
 
     #[test]

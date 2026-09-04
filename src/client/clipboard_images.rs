@@ -46,7 +46,7 @@ pub(super) fn write_remote_image_to_server(
 pub(super) fn client_remote_image_paste_key(
     config: &crate::config::Config,
 ) -> Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)> {
-    if !is_remote_client_process() {
+    if config.remotes.is_empty() && !is_remote_client_process() {
         return None;
     }
 

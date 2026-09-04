@@ -22,6 +22,7 @@ mod frame_output;
 mod handshake;
 mod input;
 mod notifications;
+mod server_connection;
 mod shell;
 mod terminal_geometry;
 mod terminal_sessions;
@@ -29,7 +30,7 @@ mod terminal_setup;
 mod timer;
 
 #[cfg(test)]
-pub(crate) use shell::{ClientShellConfig, ClientShellState};
+pub(crate) use shell::{ClientServerLifecycle, ClientShellConfig, ClientShellState};
 pub use terminal_sessions::{run_terminal_session_control, run_terminal_session_observe};
 
 #[cfg(not(windows))]
@@ -77,14 +78,18 @@ use frame_output::{
     contains_kitty_graphics_bytes, record_received_kitty_graphics,
     write_encoded_frame_with_graphics,
 };
-use handshake::{client_shell_keybinding_source, do_handshake, is_remote_client_process};
 #[cfg(test)]
+use handshake::direct_graphics_profile_values;
 use handshake::{
-    direct_graphics_profile_values, handshake_read_timeout, REMOTE_HANDSHAKE_READ_TIMEOUT,
+    client_shell_keybinding_source, do_handshake, handshake_read_timeout, is_remote_client_process,
+    REMOTE_HANDSHAKE_READ_TIMEOUT,
 };
 use notifications::{handle_notify, handle_shell_notification_effects};
 #[cfg(test)]
 use notifications::{handle_notify_with_notifiers, sound_from_notify_message};
+use server_connection::{
+    RemoteConnectorThreads, ServerConnection, ServerConnectionKey, ServerConnections, ServerId,
+};
 #[cfg(test)]
 use terminal_sessions::terminal_control_command_from_json;
 
@@ -111,6 +116,11 @@ use crate::protocol::{
 use crate::protocol::{AttachScrollDirection, AttachScrollSource, NotifyKind};
 use crate::server::socket_paths::client_socket_path;
 
+const MAX_REMOTE_RETRY_ATTEMPTS: usize = 5;
+const REMOTE_CONNECTION_STABLE_AFTER: Duration = Duration::from_secs(30);
+const CLIENT_SERVER_EVENT_CAPACITY: usize = 64;
+const CLIENT_INPUT_EVENT_CAPACITY: usize = 256;
+
 // ---------------------------------------------------------------------------
 // Client state
 // ---------------------------------------------------------------------------
@@ -124,8 +134,23 @@ struct ClientLoopConfig {
     pixel_geometry_enabled: bool,
     pixel_geometry_fallback: bool,
     mouse_capture_active: bool,
+    endpoint_keybindings: bool,
+    remotes: std::collections::BTreeMap<String, crate::config::RemoteServerConfig>,
+    manage_ssh_config: bool,
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     shell_config: Option<shell::ClientShellConfig>,
+}
+
+struct ClientLoopStartup {
+    stream: LocalStream,
+    cols: u16,
+    rows: u16,
+    cell_width_px: u32,
+    cell_height_px: u32,
+    pixel_geometry_exact: bool,
+    negotiated_encoding: RenderEncoding,
+    endpoint_methods: Option<Vec<String>>,
+    presentation_control: bool,
 }
 
 /// State tracking for the thin client.
@@ -165,10 +190,14 @@ struct ClientState {
     direct_graphics_response: Arc<Mutex<direct_graphics::ResponseMatcher>>,
     /// One server-retired direct transfer to suppress if it was still queued.
     #[cfg(unix)]
-    retired_direct_graphics: Option<(u64, u32)>,
+    retired_direct_graphics: Option<(ServerConnectionKey, u64, u32)>,
     /// ClientShell assets waiting for the host terminal's direct-upload response.
     #[cfg(unix)]
-    pending_surface_graphics: HashMap<u64, crate::protocol::SurfaceGraphicsAssetKey>,
+    pending_surface_graphics:
+        HashMap<(ServerConnectionKey, u64), crate::protocol::SurfaceGraphicsAssetKey>,
+    /// Connection that owns each host-terminal direct graphics transmission.
+    #[cfg(unix)]
+    direct_graphics_owners: HashMap<u64, (ServerConnectionKey, u32)>,
     /// Direct attach prefix escape state. None for ClientShell connections.
     attach_escape: Option<AttachEscapeState>,
     /// Rows scrolled for one direct-attach wheel notch.
@@ -304,12 +333,411 @@ enum ClientLoopEvent {
     Resize(u16, u16, u32, u32, bool),
     /// The client's host terminal can no longer report a valid grid.
     TerminalUnavailable(io::Error),
-    /// Server message received.
-    ServerMessage(Box<ServerMessage>),
+    /// Server message received, tagged with the connection generation that produced it.
+    ServerMessage {
+        source: ServerConnectionKey,
+        message: Box<ServerMessage>,
+        _permit: ServerMessagePermit,
+    },
     /// Server reader thread exited (connection lost).
-    ServerDisconnected,
+    ServerDisconnected(ServerConnectionKey),
+    /// A background connector completed one remote endpoint handshake.
+    ServerConnected(Box<ServerConnection>),
+    /// A background connector failed without affecting other endpoints.
+    ServerConnectionFailed {
+        source: ServerConnectionKey,
+        error: String,
+        version_mismatch: bool,
+        retrying: bool,
+    },
     /// Timer tick.
     Timer,
+}
+
+struct ServerMessagePermit {
+    return_token: std::sync::mpsc::SyncSender<()>,
+}
+
+impl Drop for ServerMessagePermit {
+    fn drop(&mut self) {
+        let _ = self.return_token.try_send(());
+    }
+}
+
+struct ServerMessageAdmission {
+    return_token: std::sync::mpsc::SyncSender<()>,
+    token: std::sync::mpsc::Receiver<()>,
+}
+
+impl ServerMessageAdmission {
+    fn new() -> Self {
+        let (return_token, token) = std::sync::mpsc::sync_channel(1);
+        return_token
+            .send(())
+            .expect("new server-message admission channel is open");
+        Self {
+            return_token,
+            token,
+        }
+    }
+
+    fn acquire(&self) -> Option<ServerMessagePermit> {
+        self.token.recv().ok().map(|()| ServerMessagePermit {
+            return_token: self.return_token.clone(),
+        })
+    }
+}
+
+struct RemoteConnectorSpec {
+    key: ServerConnectionKey,
+    target: String,
+    session: String,
+    manage_ssh_config: bool,
+    endpoint_keybindings: bool,
+    mouse_capture: bool,
+    cols: u16,
+    rows: u16,
+    cell_width_px: u32,
+    cell_height_px: u32,
+    pixel_geometry_exact: bool,
+    shell_surface_size: crate::protocol::ClientSurfaceSize,
+}
+
+#[derive(Default)]
+struct RemoteReconnectBackoff {
+    connected_at: std::collections::BTreeMap<ServerId, std::time::Instant>,
+    short_connections: std::collections::BTreeMap<ServerId, usize>,
+}
+
+impl RemoteReconnectBackoff {
+    fn connected(&mut self, server_id: ServerId, now: std::time::Instant) {
+        self.connected_at.insert(server_id, now);
+    }
+
+    fn reset(&mut self, server_id: &ServerId) {
+        self.connected_at.remove(server_id);
+        self.short_connections.remove(server_id);
+    }
+
+    fn retry_delay_after_disconnect(
+        &mut self,
+        server_id: &ServerId,
+        now: std::time::Instant,
+    ) -> Duration {
+        if self
+            .connected_at
+            .remove(server_id)
+            .is_some_and(|connected_at| {
+                now.saturating_duration_since(connected_at) >= REMOTE_CONNECTION_STABLE_AFTER
+            })
+        {
+            self.short_connections.remove(server_id);
+        }
+        let attempts = self.short_connections.entry(server_id.clone()).or_default();
+        *attempts = attempts.saturating_add(1);
+        remote_retry_delay(*attempts)
+    }
+}
+
+fn remote_retry_delay(attempt: usize) -> Duration {
+    Duration::from_secs(1_u64 << attempt.saturating_sub(1).min(4)).min(Duration::from_secs(15))
+}
+
+fn remote_retry_wait(cancelled: &AtomicBool, delay: Duration) -> bool {
+    let deadline = std::time::Instant::now() + delay;
+    while std::time::Instant::now() < deadline {
+        if cancelled.load(Ordering::Acquire) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    cancelled.load(Ordering::Acquire)
+}
+
+fn remote_connector_spec(
+    key: ServerConnectionKey,
+    remote: &crate::config::RemoteServerConfig,
+    manage_ssh_config: bool,
+    endpoint_keybindings: bool,
+    mouse_capture: bool,
+    state: &ClientState,
+    shell_surface_size: crate::protocol::ClientSurfaceSize,
+) -> RemoteConnectorSpec {
+    RemoteConnectorSpec {
+        key,
+        target: remote.host.clone(),
+        session: remote
+            .session
+            .clone()
+            .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string()),
+        manage_ssh_config,
+        endpoint_keybindings,
+        mouse_capture,
+        cols: state.reported_size.0,
+        rows: state.reported_size.1,
+        cell_width_px: state.reported_cell_size.0,
+        cell_height_px: state.reported_cell_size.1,
+        pixel_geometry_exact: state.pixel_geometry_exact,
+        shell_surface_size,
+    }
+}
+
+fn spawn_remote_connector(
+    connectors: &mut RemoteConnectorThreads,
+    spec: RemoteConnectorSpec,
+    initial_delay: Duration,
+    event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
+) {
+    let cancelled = connectors.replace(spec.key.server_id.clone());
+    connectors.push(std::thread::spawn(move || {
+        let mut attempts = 0;
+        if remote_retry_wait(&cancelled, initial_delay) {
+            return;
+        }
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            let result = (|| {
+                let (mut stream, bridge) = crate::remote::connect_remote_client(
+                    spec.target.clone(),
+                    spec.session.clone(),
+                    spec.manage_ssh_config,
+                    cancelled.clone(),
+                )
+                .map_err(ClientError::ConnectionFailed)?;
+                let handshake = do_handshake(
+                    &mut stream,
+                    spec.cols,
+                    spec.rows,
+                    spec.cell_width_px,
+                    spec.cell_height_px,
+                    spec.pixel_geometry_exact,
+                    Some(spec.shell_surface_size),
+                    false,
+                    spec.endpoint_keybindings,
+                    spec.mouse_capture,
+                    REMOTE_HANDSHAKE_READ_TIMEOUT,
+                )?;
+                Ok::<_, ClientError>(ServerConnection::remote(
+                    spec.key.clone(),
+                    stream,
+                    handshake.endpoint_methods,
+                    handshake.presentation_control,
+                    bridge,
+                ))
+            })();
+            match result {
+                Ok(connection) => {
+                    send_connector_event(
+                        &event_tx,
+                        ClientLoopEvent::ServerConnected(Box::new(connection)),
+                        &cancelled,
+                    );
+                    return;
+                }
+                Err(error) => {
+                    attempts += 1;
+                    let version_mismatch = matches!(error, ClientError::HandshakeRejected { .. })
+                        || matches!(
+                            &error,
+                            ClientError::ConnectionFailed(error)
+                                if crate::remote::is_remote_compatibility_error(error)
+                        );
+                    let cancelled_error = matches!(
+                        &error,
+                        ClientError::ConnectionFailed(error)
+                            if error.kind() == io::ErrorKind::Interrupted
+                    );
+                    if cancelled_error && cancelled.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let retrying =
+                        remote_connection_retry_limit(&error).is_none_or(|limit| attempts < limit);
+                    send_connector_event(
+                        &event_tx,
+                        ClientLoopEvent::ServerConnectionFailed {
+                            source: spec.key.clone(),
+                            error: error.to_string(),
+                            version_mismatch,
+                            retrying,
+                        },
+                        &cancelled,
+                    );
+                    if !retrying {
+                        return;
+                    }
+                }
+            }
+            if remote_retry_wait(&cancelled, remote_retry_delay(attempts)) {
+                return;
+            }
+        }
+    }));
+}
+
+fn send_connector_event(
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    mut event: ClientLoopEvent,
+    cancelled: &AtomicBool,
+) {
+    loop {
+        match event_tx.try_send(event) {
+            Ok(()) => return,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                event = returned;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+/// `None` means retry indefinitely with capped delay; zero means never retry.
+fn remote_connection_retry_limit(error: &ClientError) -> Option<usize> {
+    let ClientError::ConnectionFailed(error) = error else {
+        return Some(0);
+    };
+    if crate::remote::is_remote_compatibility_error(error) {
+        return Some(0);
+    }
+    if matches!(
+        error.kind(),
+        io::ErrorKind::NotFound
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::Unsupported
+            | io::ErrorKind::PermissionDenied
+    ) {
+        return Some(0);
+    }
+    let message = error.to_string().to_ascii_lowercase();
+    if [
+        "permission denied",
+        "host key verification failed",
+        "no compatible herdr endpoint",
+        "needs an interactive update",
+        "unsupported remote platform",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+    {
+        return Some(0);
+    }
+    if matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::Interrupted
+    ) || [
+        "connection refused",
+        "connection reset",
+        "connection timed out",
+        "operation timed out",
+        "no route to host",
+        "network is unreachable",
+        "connection closed",
+        "broken pipe",
+        "could not resolve hostname",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+    {
+        return None;
+    }
+    Some(MAX_REMOTE_RETRY_ATTEMPTS)
+}
+
+fn defer_fleet_connection_loss(
+    error: ClientError,
+    servers: &ServerConnections,
+    pending_disconnect: &mut Option<ServerConnectionKey>,
+) -> Result<(), ClientError> {
+    if matches!(error, ClientError::ConnectionLost(_)) && servers.fleet_mode() {
+        if let Some(source) = servers.active_key() {
+            warn!(?source, %error, "isolating failed fleet connection");
+            *pending_disconnect = Some(source);
+        }
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+fn isolate_fleet_protocol_failure(
+    servers: &mut ServerConnections,
+    state: &mut ClientState,
+    source: &ServerConnectionKey,
+    error: &str,
+    version_mismatch: bool,
+) -> bool {
+    if !servers.fleet_mode() || !servers.is_live(source) {
+        return false;
+    }
+    warn!(?source, error, "isolating invalid fleet protocol source");
+    #[cfg(unix)]
+    if let Some(connection) = servers.get_mut(source) {
+        cancel_connection_graphics(state, connection);
+    }
+    let _ = servers.retire_protocol_source(source);
+    if let Some(shell) = state.shell.as_mut() {
+        shell.set_server_lifecycle(
+            source.server_id.as_str(),
+            if version_mismatch {
+                shell::ClientServerLifecycle::VersionMismatch(error.to_owned())
+            } else {
+                shell::ClientServerLifecycle::Failed(error.to_owned())
+            },
+        );
+    }
+    state.request_repaint();
+    true
+}
+
+fn remote_config_delta(
+    previous: &std::collections::BTreeMap<String, crate::config::RemoteServerConfig>,
+    previous_manage_ssh_config: bool,
+    next: &std::collections::BTreeMap<String, crate::config::RemoteServerConfig>,
+    next_manage_ssh_config: bool,
+) -> (std::collections::BTreeSet<String>, Vec<String>, Vec<String>) {
+    let usable =
+        |remotes: &std::collections::BTreeMap<String, crate::config::RemoteServerConfig>| {
+            remotes
+                .iter()
+                .filter(|(id, remote)| remote.enabled && remote.validation_error(id).is_none())
+                .map(|(id, _)| id.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+    let previous_ids = usable(previous);
+    let next_ids = usable(next);
+    let changed = previous_ids
+        .intersection(&next_ids)
+        .filter(|id| {
+            previous_manage_ssh_config != next_manage_ssh_config
+                || previous.get(*id) != next.get(*id)
+        })
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let removed = previous_ids
+        .difference(&next_ids)
+        .cloned()
+        .chain(changed.iter().cloned())
+        .collect();
+    let added = next_ids
+        .difference(&previous_ids)
+        .cloned()
+        .chain(changed)
+        .collect();
+    (next_ids, removed, added)
 }
 
 /// Runs the thin client: connects to the server, performs the handshake,
@@ -373,6 +801,9 @@ fn run_client_with_mode(
     let kitty_graphics_enabled =
         loaded_config.config.kitty_graphics_enabled() && client_rendered_shell;
     let pixel_geometry_enabled = kitty_graphics_enabled || attach_escape.is_some();
+    let endpoint_keybindings = shell_config
+        .as_ref()
+        .is_some_and(shell::ClientShellConfig::uses_endpoint_keybindings);
     let loop_config = ClientLoopConfig {
         sound_config: loaded_config.config.ui.sound,
         mouse_scroll_lines,
@@ -382,6 +813,13 @@ fn run_client_with_mode(
         pixel_geometry_enabled,
         pixel_geometry_fallback: kitty_graphics_enabled,
         mouse_capture_active: mouse_capture,
+        endpoint_keybindings,
+        remotes: if client_rendered_shell && !is_remote_client_process() {
+            loaded_config.config.remotes
+        } else {
+            std::collections::BTreeMap::new()
+        },
+        manage_ssh_config: loaded_config.config.remote.manage_ssh_config,
         remote_image_paste_key,
         shell_config,
     };
@@ -408,11 +846,6 @@ fn run_client_with_mode(
         .shell_config
         .as_ref()
         .map(|shell| shell.initial_surface_size(cols, rows));
-    let endpoint_keybindings = loop_config
-        .shell_config
-        .as_ref()
-        .is_some_and(shell::ClientShellConfig::uses_endpoint_keybindings);
-
     // Perform handshake while the stream is still in blocking mode.
     let handshake = match do_handshake(
         &mut stream,
@@ -422,8 +855,10 @@ fn run_client_with_mode(
         cell_height_px,
         exact_cell_size,
         shell_surface_size,
+        true,
         endpoint_keybindings,
         loop_config.mouse_capture_active,
+        handshake_read_timeout(),
     ) {
         Ok(encoding) => encoding,
         Err(err) => {
@@ -483,16 +918,19 @@ fn run_client_with_mode(
 
     let result = rt.block_on(async {
         run_client_loop(
-            stream,
-            cols,
-            rows,
-            cell_width_px,
-            cell_height_px,
-            exact_cell_size,
+            ClientLoopStartup {
+                stream,
+                cols,
+                rows,
+                cell_width_px,
+                cell_height_px,
+                pixel_geometry_exact: exact_cell_size,
+                negotiated_encoding: handshake.encoding,
+                endpoint_methods: handshake.endpoint_methods,
+                presentation_control: handshake.presentation_control,
+            },
             should_quit,
             loop_config,
-            handshake.encoding,
-            handshake.endpoint_methods,
             attach_escape,
         )
         .await
@@ -528,21 +966,40 @@ fn run_client_with_mode(
 
 fn dispatch_client_shell_actions(
     actions: Vec<shell::ClientShellAction>,
-    endpoint_commands: &mut endpoint_commands::EndpointCommands,
-    write_stream: &mut LocalStream,
+    mut server: Option<&mut ServerConnection>,
     detached_process_children: &mut Vec<std::process::Child>,
-) -> Result<Vec<crossterm::event::MouseEvent>, ClientError> {
+) -> Result<DispatchedShellActions, ClientError> {
     let mut replay_mouse = Vec::new();
+    let mut activate_server = None;
+    let mut activate_pane = None;
+    let mut activate_workspace = None;
     for action in actions {
         match action {
+            shell::ClientShellAction::ActivateServer(server_id) => {
+                activate_server = Some(server_id);
+            }
+            shell::ClientShellAction::ActivatePane { server_id, pane_id } => {
+                activate_pane = Some((server_id, pane_id));
+            }
+            shell::ClientShellAction::ActivateWorkspace {
+                server_id,
+                workspace_id,
+            } => {
+                activate_workspace = Some((server_id, workspace_id));
+            }
             shell::ClientShellAction::Endpoint { boot_id, request } => {
-                endpoint_commands.enqueue(boot_id, request);
+                if let Some(server) = server.as_deref_mut() {
+                    server.endpoint_commands.enqueue(boot_id, request);
+                }
             }
             shell::ClientShellAction::ClipboardWrite(bytes) => {
                 crate::selection::write_osc52_bytes(&bytes);
             }
             shell::ClientShellAction::Request(request) => {
-                write_to_server(write_stream, &request).map_err(ClientError::ConnectionLost)?;
+                if let Some(server) = server.as_deref_mut() {
+                    write_to_server(&mut server.write_stream, &request)
+                        .map_err(ClientError::ConnectionLost)?;
+                }
             }
             shell::ClientShellAction::OpenSafeWebUrl(url) => {
                 if crate::app::actions::safe_web_url(&url).is_some() {
@@ -562,10 +1019,200 @@ fn dispatch_client_shell_actions(
             }
         }
     }
-    endpoint_commands
-        .send_next(write_stream)
-        .map_err(ClientError::ConnectionLost)?;
-    Ok(replay_mouse)
+    if let Some(server) = server {
+        server
+            .endpoint_commands
+            .send_next(&mut server.write_stream)
+            .map_err(ClientError::ConnectionLost)?;
+    }
+    Ok(DispatchedShellActions {
+        replay_mouse,
+        activate_server,
+        activate_pane,
+        activate_workspace,
+    })
+}
+
+struct DispatchedShellActions {
+    replay_mouse: Vec<crossterm::event::MouseEvent>,
+    activate_server: Option<String>,
+    activate_pane: Option<(String, String)>,
+    activate_workspace: Option<(String, String)>,
+}
+
+fn write_connection_presentation(
+    connection: &mut ServerConnection,
+    visible: bool,
+) -> io::Result<()> {
+    if !connection.presentation_control {
+        return Ok(());
+    }
+    let data =
+        serde_json::to_string(&crate::protocol::endpoint::EndpointPresentationDemand { visible })
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    write_to_server(
+        &mut connection.write_stream,
+        &ClientMessage::EndpointControl {
+            kind: crate::protocol::endpoint::PRESENTATION_CONTROL_V1.into(),
+            data,
+        },
+    )
+}
+
+#[cfg(unix)]
+fn cancel_connection_graphics(state: &mut ClientState, connection: &mut ServerConnection) {
+    let transfers = state
+        .direct_graphics_owners
+        .iter()
+        .filter(|(_, (owner, _))| owner == &connection.key)
+        .map(|(transfer_id, (_, image_id))| (*transfer_id, *image_id))
+        .collect::<Vec<_>>();
+    for (transfer_id, image_id) in transfers {
+        state.direct_graphics_owners.remove(&transfer_id);
+        state
+            .pending_surface_graphics
+            .remove(&(connection.key.clone(), transfer_id));
+        if let Ok(mut matcher) = state.direct_graphics_response.lock() {
+            matcher.cancel(transfer_id);
+        }
+        let _ = write_to_server(
+            &mut connection.write_stream,
+            &ClientMessage::GraphicsTransmissionResult {
+                transfer_id,
+                image_id,
+                success: false,
+            },
+        );
+    }
+}
+
+fn activate_server(
+    servers: &mut ServerConnections,
+    server_id: &str,
+    state: &mut ClientState,
+    prefix_input_source: &mut impl crate::platform::PrefixInputSource,
+) -> Result<bool, ClientError> {
+    let Some(target) = servers.key_for_id(server_id) else {
+        let cached = state
+            .shell
+            .as_ref()
+            .is_some_and(|shell| shell.has_server_snapshot(server_id));
+        if !cached || servers.selected_is(server_id) {
+            return Ok(false);
+        }
+        if let Some(previous) = servers.current_mut() {
+            #[cfg(unix)]
+            cancel_connection_graphics(state, previous);
+            if let Err(error) = write_connection_presentation(previous, false) {
+                warn!(%error, "failed to hide previous server presentation");
+            }
+        }
+        servers.select(ServerId::new(server_id));
+        let frame = state.shell.as_mut().and_then(|shell| {
+            shell.set_active_server(server_id.to_owned());
+            shell.set_endpoint_methods(None);
+            shell.compose(state.reported_size.0, state.reported_size.1)
+        });
+        apply_client_shell_input_source_changes(state, prefix_input_source);
+        let title = state
+            .shell
+            .as_ref()
+            .and_then(|shell| shell.sourced_window_title(server_id, None));
+        let _ = crate::terminal_effects::write_window_title(&mut io::stdout(), title.as_deref());
+        if let Some(frame) = frame {
+            state.present_frame(frame);
+        }
+        return Ok(false);
+    };
+    if servers.is_active(&target)
+        || servers
+            .get_mut(&target)
+            .is_none_or(|connection| connection.latest_snapshot.is_none())
+    {
+        return Ok(false);
+    }
+    let previous = servers
+        .current_mut()
+        .map(|connection| connection.key.clone());
+    if let Some(previous) = servers.current_mut() {
+        #[cfg(unix)]
+        cancel_connection_graphics(state, previous);
+        if let Err(error) = write_connection_presentation(previous, false) {
+            warn!(%error, "failed to hide previous server presentation");
+        }
+    }
+    if !servers.activate(&target) {
+        return Ok(false);
+    }
+
+    let connection = servers.active_mut();
+    let snapshot = connection
+        .latest_snapshot
+        .clone()
+        .expect("checked target snapshot");
+    if let Some(shell) = state.shell.as_mut() {
+        shell.set_active_server(server_id.to_owned());
+        shell.set_endpoint_methods(connection.endpoint_methods.clone());
+    }
+    let title = state.shell.as_ref().and_then(|shell| {
+        shell.sourced_window_title(server_id, connection.window_title.as_deref())
+    });
+    let _ = crate::terminal_effects::write_window_title(&mut io::stdout(), title.as_deref());
+    let activated = (|| {
+        install_client_shell_snapshot(state, snapshot, connection, prefix_input_source)?;
+        write_connection_presentation(connection, true).map_err(ClientError::ConnectionLost)?;
+        if let Some(shell) = state.shell.as_ref() {
+            let resize = client_shell_resize_message(
+                shell,
+                state.reported_size.0,
+                state.reported_size.1,
+                state.reported_cell_size.0,
+                state.reported_cell_size.1,
+                state.pixel_geometry_exact,
+            );
+            write_to_server(&mut connection.write_stream, &resize)
+                .map_err(ClientError::ConnectionLost)?;
+            if let Some(focused) = shell.outer_focused() {
+                write_to_server(
+                    &mut connection.write_stream,
+                    &ClientMessage::ClientShellFocus { focused },
+                )
+                .map_err(ClientError::ConnectionLost)?;
+            }
+        }
+        Ok::<_, ClientError>(())
+    })();
+    if let Err(error) = activated {
+        warn!(server_id, %error, "server switch failed; restoring previous server");
+        let Some(previous) = previous else {
+            return Err(error);
+        };
+        if !servers.activate(&previous) {
+            return Err(error);
+        }
+        let connection = servers.active_mut();
+        let snapshot = connection
+            .latest_snapshot
+            .clone()
+            .expect("previous active connection has a snapshot");
+        if let Some(shell) = state.shell.as_mut() {
+            shell.set_active_server(previous.server_id.as_str().to_owned());
+            shell.set_endpoint_methods(connection.endpoint_methods.clone());
+        }
+        let title = state.shell.as_ref().and_then(|shell| {
+            shell.sourced_window_title(
+                previous.server_id.as_str(),
+                connection.window_title.as_deref(),
+            )
+        });
+        let _ = crate::terminal_effects::write_window_title(&mut io::stdout(), title.as_deref());
+        install_client_shell_snapshot(state, snapshot, connection, prefix_input_source)?;
+        if let Err(error) = write_connection_presentation(connection, true) {
+            warn!(%error, "failed to restore previous server presentation");
+        }
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn client_shell_resize_message(
@@ -619,7 +1266,7 @@ fn apply_client_shell_input_source_changes(
 fn install_client_shell_snapshot(
     state: &mut ClientState,
     snapshot: Box<crate::protocol::ClientShellSnapshot>,
-    write_stream: &mut LocalStream,
+    server: &mut ServerConnection,
     prefix_input_source: &mut impl crate::platform::PrefixInputSource,
 ) -> Result<(), ClientError> {
     let (composed, resize, graphics_cleanup) = if let Some(shell) = &mut state.shell {
@@ -647,7 +1294,7 @@ fn install_client_shell_snapshot(
     apply_client_shell_input_source_changes(state, prefix_input_source);
     state.present_graphics(&graphics_cleanup);
     if let Some(resize) = resize {
-        write_to_server(write_stream, &resize).map_err(ClientError::ConnectionLost)?;
+        write_to_server(&mut server.write_stream, &resize).map_err(ClientError::ConnectionLost)?;
     }
     if let Some(frame) = composed {
         state.present_frame(frame);
@@ -655,17 +1302,39 @@ fn install_client_shell_snapshot(
     Ok(())
 }
 
+fn receive_semantic_notification(
+    state: &mut ClientState,
+    server_id: &str,
+    event: crate::protocol::SemanticNotification,
+) {
+    if state.shell.is_none() {
+        return;
+    }
+    let (effects, frame) = {
+        let shell = state.shell.as_mut().expect("checked shell mode");
+        let (effects, repaint) =
+            shell.receive_notification_from(server_id.to_owned(), event, std::time::Instant::now());
+        let frame = repaint
+            .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
+            .flatten();
+        (effects, frame)
+    };
+    handle_shell_notification_effects(effects, &state.sound_config);
+    if let Some(frame) = frame {
+        state.present_frame(frame);
+    }
+}
+
 fn finish_client_shell_input(
     state: &mut ClientState,
     outcome: shell::ClientShellInput,
     frame: Option<FrameData>,
-    write_stream: &mut LocalStream,
-    endpoint_commands: &mut endpoint_commands::EndpointCommands,
+    servers: &mut ServerConnections,
     prefix_input_source: &mut impl crate::platform::PrefixInputSource,
 ) -> Result<bool, ClientError> {
     apply_client_shell_input_source_changes(state, prefix_input_source);
     if outcome.detach {
-        let _ = write_to_server(write_stream, &ClientMessage::Detach);
+        let _ = servers.send_active(&ClientMessage::Detach);
         return Ok(true);
     }
     if outcome.resize {
@@ -678,7 +1347,9 @@ fn finish_client_shell_input(
             state.reported_cell_size.1,
             state.pixel_geometry_exact,
         );
-        write_to_server(write_stream, &resize).map_err(ClientError::ConnectionLost)?;
+        servers
+            .send_active(&resize)
+            .map_err(ClientError::ConnectionLost)?;
     }
     #[cfg(not(windows))]
     if outcome.query_host_appearance {
@@ -688,23 +1359,72 @@ fn finish_client_shell_input(
         query_host_terminal_theme();
     }
     sync_client_shell_keyboard_report_all(state)?;
-    let replay = dispatch_client_shell_actions(
+    let dispatched = dispatch_client_shell_actions(
         outcome.actions,
-        endpoint_commands,
-        write_stream,
+        servers.current_mut(),
         &mut state.detached_process_children,
     )?;
+    if let Some(server_id) = dispatched.activate_server.as_deref() {
+        activate_server(servers, server_id, state, prefix_input_source)?;
+    }
+    if let Some((server_id, pane_id)) = dispatched.activate_pane {
+        if activate_server(servers, &server_id, state, prefix_input_source)? {
+            let outcome = state
+                .shell
+                .as_mut()
+                .expect("fleet pane requires shell mode")
+                .focus_pane(pane_id);
+            dispatch_client_shell_actions(
+                outcome.actions,
+                servers.current_mut(),
+                &mut state.detached_process_children,
+            )?;
+        }
+    }
+    if let Some((server_id, workspace_id)) = dispatched.activate_workspace {
+        if activate_server(servers, &server_id, state, prefix_input_source)? {
+            let outcome = state
+                .shell
+                .as_mut()
+                .expect("fleet workspace requires shell mode")
+                .focus_workspace(workspace_id);
+            dispatch_client_shell_actions(
+                outcome.actions,
+                servers.current_mut(),
+                &mut state.detached_process_children,
+            )?;
+        }
+    }
     debug_assert!(
-        replay.is_empty(),
+        dispatched.replay_mouse.is_empty(),
         "mouse replay only follows endpoint results"
     );
     for request in outcome.requests {
-        write_to_server(write_stream, &request).map_err(ClientError::ConnectionLost)?;
+        servers
+            .send_active(&request)
+            .map_err(ClientError::ConnectionLost)?;
     }
     if let Some(frame) = frame {
         state.present_frame(frame);
     }
     Ok(false)
+}
+
+fn finish_client_shell_input_isolated(
+    state: &mut ClientState,
+    outcome: shell::ClientShellInput,
+    frame: Option<FrameData>,
+    servers: &mut ServerConnections,
+    prefix_input_source: &mut impl crate::platform::PrefixInputSource,
+    pending_disconnect: &mut Option<ServerConnectionKey>,
+) -> Result<bool, ClientError> {
+    match finish_client_shell_input(state, outcome, frame, servers, prefix_input_source) {
+        Ok(finished) => Ok(finished),
+        Err(error) => {
+            defer_fleet_connection_loss(error, servers, pending_disconnect)?;
+            Ok(false)
+        }
+    }
 }
 
 /// The main client event loop.
@@ -715,23 +1435,38 @@ fn finish_client_shell_input(
 /// - server reader thread → reads ServerMessages and sends to main loop
 /// - main loop: coordinates input, output, and server communication
 async fn run_client_loop(
-    stream: LocalStream,
-    cols: u16,
-    rows: u16,
-    initial_cell_width_px: u32,
-    initial_cell_height_px: u32,
-    initial_pixel_geometry_exact: bool,
+    startup: ClientLoopStartup,
     should_quit: Arc<AtomicBool>,
     config: ClientLoopConfig,
-    negotiated_encoding: RenderEncoding,
-    endpoint_methods: Option<Vec<String>>,
     attach_escape: Option<AttachEscapeState>,
 ) -> Result<(), ClientError> {
+    let ClientLoopStartup {
+        stream,
+        cols,
+        rows,
+        cell_width_px: initial_cell_width_px,
+        cell_height_px: initial_cell_height_px,
+        pixel_geometry_exact: initial_pixel_geometry_exact,
+        negotiated_encoding,
+        endpoint_methods,
+        presentation_control,
+    } = startup;
     #[cfg(windows)]
     let _ = config.mouse_scroll_lines;
     let draw_host_cursor = attach_escape.is_none() && should_draw_host_cursor(config.host_cursor);
     let is_remote_client = is_remote_client_process();
+    let mut remote_configs = config.remotes;
+    let mut manage_ssh_config = config.manage_ssh_config;
+    let endpoint_keybindings = config.endpoint_keybindings;
+    let connector_mouse_capture = config.mouse_capture_active;
 
+    let initial_server = ServerConnection::local(stream, endpoint_methods, presentation_control);
+    let mut servers = ServerConnections::with_local(initial_server);
+    servers.set_fleet_mode(
+        remote_configs
+            .iter()
+            .any(|(id, remote)| remote.enabled && remote.validation_error(id).is_none()),
+    );
     let mut state = ClientState {
         blit_encoder: render_ansi::BlitEncoder::new(),
         mouse_capture_active: config.mouse_capture_active,
@@ -754,6 +1489,8 @@ async fn run_client_loop(
         retired_direct_graphics: None,
         #[cfg(unix)]
         pending_surface_graphics: HashMap::new(),
+        #[cfg(unix)]
+        direct_graphics_owners: HashMap::new(),
         attach_escape,
         #[cfg(unix)]
         mouse_scroll_lines: config.mouse_scroll_lines,
@@ -766,7 +1503,19 @@ async fn run_client_loop(
     };
     if let Some(shell) = state.shell.as_mut() {
         shell.set_graphics_cell_size(initial_cell_width_px, initial_cell_height_px);
-        shell.set_endpoint_methods(endpoint_methods);
+        shell.set_endpoint_methods(servers.active_mut().endpoint_methods.clone());
+        shell.configure_servers(
+            std::iter::once("local".to_owned())
+                .chain(
+                    remote_configs
+                        .iter()
+                        .filter(|(id, remote)| {
+                            remote.enabled && remote.validation_error(id).is_none()
+                        })
+                        .map(|(id, _)| id.clone()),
+                )
+                .collect(),
+        );
     }
     debug!(?negotiated_encoding, "client render encoding active");
     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
@@ -775,15 +1524,42 @@ async fn run_client_loop(
     let reported_cell_size = Arc::new(AtomicU64::new(0));
     let host_sgr_pixels_active = Arc::new(AtomicBool::new(false));
 
-    // Channel for events from the resize and server reader threads.
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
-    // Keep Windows console draining independent of server-frame backpressure.
-    #[cfg(windows)]
-    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
-    #[cfg(unix)]
-    let stdin_tx = event_tx.clone();
-
-    let mut endpoint_commands = endpoint_commands::EndpointCommands::default();
+    // Server readers share a bounded FIFO. Tokio grants blocked senders permits in
+    // request order, so one busy server cannot grow memory or indefinitely overtake
+    // a ready sibling.
+    let (event_tx, mut event_rx) =
+        tokio::sync::mpsc::channel::<ClientLoopEvent>(CLIENT_SERVER_EVENT_CAPACITY);
+    let mut remote_connectors = RemoteConnectorThreads::new(should_quit.clone());
+    if let Some(shell) = state.shell.as_ref() {
+        let shell_surface_size = shell.surface_size(cols, rows);
+        for (id, remote) in &remote_configs {
+            if !remote.enabled || remote.validation_error(id).is_some() {
+                continue;
+            }
+            let server_id = ServerId::new(id.clone());
+            let generation = servers.reserve_generation(&server_id);
+            spawn_remote_connector(
+                &mut remote_connectors,
+                remote_connector_spec(
+                    ServerConnectionKey {
+                        server_id,
+                        generation,
+                    },
+                    remote,
+                    manage_ssh_config,
+                    endpoint_keybindings,
+                    connector_mouse_capture,
+                    &state,
+                    shell_surface_size,
+                ),
+                Duration::ZERO,
+                event_tx.clone(),
+            );
+        }
+    }
+    // Keep host input independent of server-frame backpressure on every platform.
+    let (stdin_tx, mut stdin_rx) =
+        tokio::sync::mpsc::channel::<ClientLoopEvent>(CLIENT_INPUT_EVENT_CAPACITY);
 
     // Spawn the stdin reader thread.
     let will_query_host_terminal_theme =
@@ -853,39 +1629,36 @@ async fn run_client_loop(
 
     // Spawn the server reader thread (blocking reads from the socket).
     // Clone the stream's file descriptor so we can read from a blocking stream.
-    let server_read_quit = should_quit.clone();
-    let server_read_tx = event_tx.clone();
-    let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
-    std::thread::spawn(move || {
-        let max_frame_size = if kitty_graphics_enabled {
-            MAX_GRAPHICS_FRAME_SIZE
-        } else {
-            MAX_FRAME_SIZE
-        };
-        server_reader_thread(
-            read_stream,
-            server_read_tx,
-            &server_read_quit,
-            max_frame_size,
-        );
-    });
+    debug!(
+        presentation_control = servers.active_mut().presentation_control,
+        "initial server capabilities active"
+    );
+    spawn_server_reader(
+        servers.active_mut(),
+        event_tx.clone(),
+        should_quit.clone(),
+        kitty_graphics_enabled,
+    )?;
 
     // Use the original stream for writing (blocking is fine since we write
     // from the async loop).
-    let mut write_stream = stream;
-    write_stream
+    servers
+        .active_mut()
+        .write_stream
         .set_nonblocking(false)
         .map_err(ClientError::ConnectionFailed)?;
-
     // This (foreground) client owns the prefix ASCII input-source switch
     // (implemented on macOS and Windows; a no-op on other platforms).
     let mut prefix_input_source = crate::platform::RealPrefixInputSource::default();
 
     // Main event loop.
     let mut client_timer = timer::ClientLoopTimer::new();
-    #[cfg(windows)]
+    let mut fleet_snapshot_dirty = false;
+    let mut pending_disconnect = None;
+    let mut remote_setup_failures = std::collections::BTreeMap::<ServerId, usize>::new();
+    let mut remote_reconnect_backoff = RemoteReconnectBackoff::default();
     let mut stdin_open = true;
-    while !should_quit.load(Ordering::Acquire) {
+    'client: while !should_quit.load(Ordering::Acquire) {
         let timer_delay = state
             .shell
             .as_ref()
@@ -893,23 +1666,21 @@ async fn run_client_loop(
                 shell.timer_delay(std::time::Instant::now())
             });
         let timer_deadline = client_timer.deadline(std::time::Instant::now(), timer_delay);
-        #[cfg(windows)]
-        let event = tokio::select! {
-            _ = tokio::time::sleep_until(timer_deadline.into()) => ClientLoopEvent::Timer,
-            ev = stdin_rx.recv(), if stdin_open => match ev {
-                Some(event) => event,
-                None => {
-                    stdin_open = false;
-                    ClientLoopEvent::Timer
-                }
-            },
-            ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
-        };
-        #[cfg(unix)]
-        let event = tokio::select! {
-            biased;
-            _ = tokio::time::sleep_until(timer_deadline.into()) => ClientLoopEvent::Timer,
-            ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
+        let event = if let Some(source) = pending_disconnect.take() {
+            ClientLoopEvent::ServerDisconnected(source)
+        } else {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(timer_deadline.into()) => ClientLoopEvent::Timer,
+                ev = stdin_rx.recv(), if stdin_open => match ev {
+                    Some(event) => event,
+                    None => {
+                        stdin_open = false;
+                        ClientLoopEvent::Timer
+                    }
+                },
+                ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
+            }
         };
         let now = std::time::Instant::now();
         if let Some(shell) = state.shell.as_mut() {
@@ -917,8 +1688,143 @@ async fn run_client_loop(
         }
 
         match event {
+            ClientLoopEvent::ServerConnected(mut connection) => {
+                if !servers.is_current_generation(&connection.key) {
+                    debug!(?connection.key, "ignoring stale server connection");
+                    continue;
+                }
+                let setup = connection
+                    .write_stream
+                    .set_nonblocking(false)
+                    .map_err(ClientError::ConnectionFailed)
+                    .and_then(|()| {
+                        spawn_server_reader(
+                            &mut connection,
+                            event_tx.clone(),
+                            should_quit.clone(),
+                            state.kitty_graphics_enabled,
+                        )
+                    });
+                if let Err(error) = setup {
+                    warn!(server_id = connection.key.server_id.as_str(), %error, "remote connection setup failed");
+                    let remote = remote_configs
+                        .get(connection.key.server_id.as_str())
+                        .filter(|remote| {
+                            remote.enabled
+                                && remote
+                                    .validation_error(connection.key.server_id.as_str())
+                                    .is_none()
+                        });
+                    let shell_surface_size = state.shell.as_ref().map(|shell| {
+                        shell.surface_size(state.reported_size.0, state.reported_size.1)
+                    });
+                    let failures = remote_setup_failures
+                        .entry(connection.key.server_id.clone())
+                        .and_modify(|failures| *failures += 1)
+                        .or_insert(1);
+                    let retrying = *failures < MAX_REMOTE_RETRY_ATTEMPTS
+                        && remote.is_some()
+                        && shell_surface_size.is_some();
+                    if retrying {
+                        let remote = remote.expect("retry requires remote config");
+                        let shell_surface_size =
+                            shell_surface_size.expect("retry requires shell surface");
+                        let server_id = connection.key.server_id.clone();
+                        let generation = servers.reserve_generation(&server_id);
+                        spawn_remote_connector(
+                            &mut remote_connectors,
+                            remote_connector_spec(
+                                ServerConnectionKey {
+                                    server_id,
+                                    generation,
+                                },
+                                remote,
+                                manage_ssh_config,
+                                endpoint_keybindings,
+                                connector_mouse_capture,
+                                &state,
+                                shell_surface_size,
+                            ),
+                            remote_retry_delay(*failures),
+                            event_tx.clone(),
+                        );
+                    }
+                    if let Some(shell) = state.shell.as_mut() {
+                        shell.set_server_lifecycle(
+                            connection.key.server_id.as_str(),
+                            if retrying {
+                                shell::ClientServerLifecycle::Reconnecting(error.to_string())
+                            } else {
+                                shell::ClientServerLifecycle::Failed(error.to_string())
+                            },
+                        );
+                    }
+                    fleet_snapshot_dirty = true;
+                    continue;
+                }
+                remote_setup_failures.remove(&connection.key.server_id);
+                info!(
+                    server_id = connection.key.server_id.as_str(),
+                    generation = connection.key.generation,
+                    "remote server connected"
+                );
+                let connection_key = connection.key.clone();
+                let server_id = connection.key.server_id.clone();
+                if !servers.insert(*connection) {
+                    debug!(
+                        server_id = server_id.as_str(),
+                        "ignoring stale server connection"
+                    );
+                    continue;
+                }
+                if servers.is_active(&connection_key) {
+                    let connection = servers.active_mut();
+                    if let Some(shell) = state.shell.as_mut() {
+                        shell.set_endpoint_methods(connection.endpoint_methods.clone());
+                    }
+                    if let Err(error) = write_connection_presentation(connection, true) {
+                        warn!(server_id = server_id.as_str(), %error, "failed to restore selected server presentation");
+                        pending_disconnect = Some(connection_key);
+                        continue;
+                    }
+                }
+                remote_reconnect_backoff.connected(server_id.clone(), now);
+                if let Some(shell) = state.shell.as_mut() {
+                    shell.set_server_lifecycle(
+                        server_id.as_str(),
+                        shell::ClientServerLifecycle::Connecting,
+                    );
+                }
+                fleet_snapshot_dirty = true;
+            }
+            ClientLoopEvent::ServerConnectionFailed {
+                source,
+                error,
+                version_mismatch,
+                retrying,
+            } => {
+                if !servers.is_current_generation(&source) || servers.is_live(&source) {
+                    debug!(?source, "ignoring failure from an obsolete connector");
+                    continue;
+                }
+                warn!(server_id = source.server_id.as_str(), %error, "remote server connection failed");
+                if let Some(shell) = state.shell.as_mut() {
+                    shell.set_server_lifecycle(
+                        source.server_id.as_str(),
+                        if version_mismatch {
+                            shell::ClientServerLifecycle::VersionMismatch(error.clone())
+                        } else if retrying {
+                            shell::ClientServerLifecycle::Reconnecting(error.clone())
+                        } else {
+                            shell::ClientServerLifecycle::Failed(error.clone())
+                        },
+                    );
+                }
+                fleet_snapshot_dirty = true;
+            }
             #[cfg(unix)]
             ClientLoopEvent::StdinInput(data) => {
+                let active_is_remote = is_remote_client || servers.active_is_remote();
                 if state.shell.is_some() {
                     if will_query_host_cell_size {
                         let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
@@ -934,16 +1840,28 @@ async fn run_client_loop(
                     if let Some(target) = image_target.clone() {
                         if should_bridge_clipboard_image_paste(
                             &data,
-                            is_remote_client,
+                            active_is_remote,
                             state.remote_image_paste_key,
                         ) {
                             if let Some(image) = crate::platform::read_clipboard_image() {
-                                write_remote_image_to_server(
-                                    &mut write_stream,
-                                    target,
-                                    image,
-                                    "clipboard paste",
-                                )?;
+                                let write = servers
+                                    .active_stream()
+                                    .map_err(ClientError::ConnectionLost)
+                                    .and_then(|stream| {
+                                        write_remote_image_to_server(
+                                            stream,
+                                            target,
+                                            image,
+                                            "clipboard paste",
+                                        )
+                                    });
+                                if let Err(error) = write {
+                                    defer_fleet_connection_loss(
+                                        error,
+                                        &servers,
+                                        &mut pending_disconnect,
+                                    )?;
+                                }
                                 continue;
                             }
                             info!(
@@ -951,14 +1869,21 @@ async fn run_client_loop(
                             );
                         }
                         if let Some(image) =
-                            read_image_file_from_terminal_drop(&data, is_remote_client)
+                            read_image_file_from_terminal_drop(&data, active_is_remote)
                         {
-                            write_remote_image_to_server(
-                                &mut write_stream,
-                                target,
-                                image,
-                                "file drop",
-                            )?;
+                            let write = servers
+                                .active_stream()
+                                .map_err(ClientError::ConnectionLost)
+                                .and_then(|stream| {
+                                    write_remote_image_to_server(stream, target, image, "file drop")
+                                });
+                            if let Err(error) = write {
+                                defer_fleet_connection_loss(
+                                    error,
+                                    &servers,
+                                    &mut pending_disconnect,
+                                )?;
+                            }
                             continue;
                         }
                     }
@@ -971,13 +1896,13 @@ async fn run_client_loop(
                             .flatten();
                         (outcome, frame)
                     };
-                    if finish_client_shell_input(
+                    if finish_client_shell_input_isolated(
                         &mut state,
                         outcome,
                         frame,
-                        &mut write_stream,
-                        &mut endpoint_commands,
+                        &mut servers,
                         &mut prefix_input_source,
+                        &mut pending_disconnect,
                     )? {
                         return Ok(());
                     }
@@ -993,7 +1918,9 @@ async fn run_client_loop(
                         AttachInputAction::ForwardPair(first, second) => {
                             for data in [first, second] {
                                 if let Err(e) = write_to_server(
-                                    &mut write_stream,
+                                    servers
+                                        .active_stream()
+                                        .map_err(ClientError::ConnectionLost)?,
                                     &ClientMessage::Input { data },
                                 ) {
                                     return Err(ClientError::ConnectionLost(e));
@@ -1002,27 +1929,37 @@ async fn run_client_loop(
                             continue;
                         }
                         AttachInputAction::Semantic(action) => {
-                            if let Err(e) = write_attach_semantic_action(&mut write_stream, action)
-                            {
+                            if let Err(e) = write_attach_semantic_action(
+                                servers
+                                    .active_stream()
+                                    .map_err(ClientError::ConnectionLost)?,
+                                action,
+                            ) {
                                 return Err(ClientError::ConnectionLost(e));
                             }
                             continue;
                         }
                         AttachInputAction::ForwardThenSemantic(prefix, action) => {
                             if let Err(e) = write_to_server(
-                                &mut write_stream,
+                                servers
+                                    .active_stream()
+                                    .map_err(ClientError::ConnectionLost)?,
                                 &ClientMessage::Input { data: prefix },
                             ) {
                                 return Err(ClientError::ConnectionLost(e));
                             }
-                            if let Err(e) = write_attach_semantic_action(&mut write_stream, action)
-                            {
+                            if let Err(e) = write_attach_semantic_action(
+                                servers
+                                    .active_stream()
+                                    .map_err(ClientError::ConnectionLost)?,
+                                action,
+                            ) {
                                 return Err(ClientError::ConnectionLost(e));
                             }
                             continue;
                         }
                         AttachInputAction::Detach => {
-                            let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
+                            let _ = servers.send_active(&ClientMessage::Detach);
                             return Ok(());
                         }
                         AttachInputAction::None => continue,
@@ -1048,12 +1985,14 @@ async fn run_client_loop(
                 };
                 if should_bridge_clipboard_image_paste(
                     &data,
-                    is_remote_client,
+                    active_is_remote,
                     state.remote_image_paste_key,
                 ) {
                     if let Some(image) = crate::platform::read_clipboard_image() {
                         write_remote_image_to_server(
-                            &mut write_stream,
+                            servers
+                                .active_stream()
+                                .map_err(ClientError::ConnectionLost)?,
                             crate::protocol::ClientClipboardImageTarget::DirectTerminal,
                             image,
                             "clipboard paste",
@@ -1064,9 +2003,11 @@ async fn run_client_loop(
                         "clipboard image paste trigger received, but local clipboard has no image"
                     );
                 }
-                if let Some(image) = read_image_file_from_terminal_drop(&data, is_remote_client) {
+                if let Some(image) = read_image_file_from_terminal_drop(&data, active_is_remote) {
                     write_remote_image_to_server(
-                        &mut write_stream,
+                        servers
+                            .active_stream()
+                            .map_err(ClientError::ConnectionLost)?,
                         crate::protocol::ClientClipboardImageTarget::DirectTerminal,
                         image,
                         "file drop",
@@ -1074,15 +2015,24 @@ async fn run_client_loop(
                     continue;
                 }
                 let msg = ClientMessage::Input { data };
-                if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                if let Err(e) = servers.send_active(&msg) {
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
             #[cfg(unix)]
             ClientLoopEvent::DirectGraphicsResponse(response) => {
-                let composed = state
-                    .pending_surface_graphics
-                    .remove(&response.transfer_id)
+                let owner = state.direct_graphics_owners.remove(&response.transfer_id);
+                let surface_asset = owner.as_ref().and_then(|(owner, _)| {
+                    state
+                        .pending_surface_graphics
+                        .remove(&(owner.clone(), response.transfer_id))
+                });
+                let composed = surface_asset
+                    .filter(|_| {
+                        owner
+                            .as_ref()
+                            .is_some_and(|(owner, _)| servers.is_active(owner))
+                    })
                     .filter(|_| response.success)
                     .and_then(|asset| {
                         let shell = state.shell.as_mut()?;
@@ -1096,8 +2046,10 @@ async fn run_client_loop(
                     image_id: response.image_id,
                     success: response.success,
                 };
-                if let Err(err) = write_to_server(&mut write_stream, &message) {
-                    return Err(ClientError::ConnectionLost(err));
+                if let Some((owner, _)) = owner {
+                    if let Err(err) = servers.send_to(&owner, &message) {
+                        debug!(?owner, %err, "direct graphics owner disconnected before acknowledgement");
+                    }
                 }
                 if let Some(frame) = composed {
                     state.present_frame(frame);
@@ -1115,13 +2067,13 @@ async fn run_client_loop(
                             .flatten();
                         (outcome, frame)
                     };
-                    if finish_client_shell_input(
+                    if finish_client_shell_input_isolated(
                         &mut state,
                         outcome,
                         frame,
-                        &mut write_stream,
-                        &mut endpoint_commands,
+                        &mut servers,
                         &mut prefix_input_source,
+                        &mut pending_disconnect,
                     )? {
                         return Ok(());
                     }
@@ -1130,7 +2082,9 @@ async fn run_client_loop(
                 if let Some(attach_escape) = state.attach_escape.as_mut() {
                     if let Some(prefix) = attach_escape.take_pending_prefix() {
                         if let Err(err) = write_to_server(
-                            &mut write_stream,
+                            servers
+                                .active_stream()
+                                .map_err(ClientError::ConnectionLost)?,
                             &ClientMessage::Input { data: prefix },
                         ) {
                             return Err(ClientError::ConnectionLost(err));
@@ -1151,7 +2105,7 @@ async fn run_client_loop(
                             modifiers,
                             lines: state.mouse_scroll_lines.max(1).min(u16::MAX as usize) as u16,
                         };
-                        if let Err(err) = write_to_server(&mut write_stream, &message) {
+                        if let Err(err) = servers.send_active(&message) {
                             return Err(ClientError::ConnectionLost(err));
                         }
                     }
@@ -1159,6 +2113,7 @@ async fn run_client_loop(
             }
             #[cfg(windows)]
             ClientLoopEvent::StdinEvents(events) => {
+                let active_is_remote = is_remote_client || servers.active_is_remote();
                 if state.shell.is_some() {
                     let image_target = state
                         .shell
@@ -1167,16 +2122,28 @@ async fn run_client_loop(
                     if let Some(target) = image_target.clone() {
                         if should_bridge_clipboard_image_events(
                             &events,
-                            is_remote_client,
+                            active_is_remote,
                             state.remote_image_paste_key,
                         ) {
                             if let Some(image) = crate::platform::read_clipboard_image() {
-                                write_remote_image_to_server(
-                                    &mut write_stream,
-                                    target,
-                                    image,
-                                    "clipboard paste",
-                                )?;
+                                let write = servers
+                                    .active_stream()
+                                    .map_err(ClientError::ConnectionLost)
+                                    .and_then(|stream| {
+                                        write_remote_image_to_server(
+                                            stream,
+                                            target,
+                                            image,
+                                            "clipboard paste",
+                                        )
+                                    });
+                                if let Err(error) = write {
+                                    defer_fleet_connection_loss(
+                                        error,
+                                        &servers,
+                                        &mut pending_disconnect,
+                                    )?;
+                                }
                                 continue;
                             }
                             info!(
@@ -1184,14 +2151,21 @@ async fn run_client_loop(
                             );
                         }
                         if let Some(image) =
-                            read_image_file_from_client_events(&events, is_remote_client)
+                            read_image_file_from_client_events(&events, active_is_remote)
                         {
-                            write_remote_image_to_server(
-                                &mut write_stream,
-                                target,
-                                image,
-                                "file drop",
-                            )?;
+                            let write = servers
+                                .active_stream()
+                                .map_err(ClientError::ConnectionLost)
+                                .and_then(|stream| {
+                                    write_remote_image_to_server(stream, target, image, "file drop")
+                                });
+                            if let Err(error) = write {
+                                defer_fleet_connection_loss(
+                                    error,
+                                    &servers,
+                                    &mut pending_disconnect,
+                                )?;
+                            }
                             continue;
                         }
                     }
@@ -1204,13 +2178,13 @@ async fn run_client_loop(
                             .flatten();
                         (outcome, frame)
                     };
-                    if finish_client_shell_input(
+                    if finish_client_shell_input_isolated(
                         &mut state,
                         outcome,
                         frame,
-                        &mut write_stream,
-                        &mut endpoint_commands,
+                        &mut servers,
                         &mut prefix_input_source,
+                        &mut pending_disconnect,
                     )? {
                         return Ok(());
                     }
@@ -1220,7 +2194,7 @@ async fn run_client_loop(
             }
             ClientLoopEvent::TerminalUnavailable(err) => {
                 info!(err = %err, "client terminal unavailable; detaching");
-                let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
+                let _ = servers.send_active(&ClientMessage::Detach);
                 return Ok(());
             }
             ClientLoopEvent::Resize(
@@ -1262,17 +2236,166 @@ async fn run_client_loop(
                         pixel_mouse: pixel_geometry_exact,
                     }
                 };
-                if let Err(e) = write_to_server(&mut write_stream, &msg) {
-                    return Err(ClientError::ConnectionLost(e));
+                if let Err(e) = servers.send_active(&msg) {
+                    defer_fleet_connection_loss(
+                        ClientError::ConnectionLost(e),
+                        &servers,
+                        &mut pending_disconnect,
+                    )?;
+                    continue 'client;
                 }
             }
-            ClientLoopEvent::ServerMessage(msg) => match *msg {
+            ClientLoopEvent::ServerMessage { source, .. } if !servers.is_live(&source) => {
+                debug!(?source, "ignoring event from a stale server connection");
+            }
+            ClientLoopEvent::ServerMessage {
+                source, message, ..
+            } if !(servers.is_active(&source)
+                || source.server_id.as_str() == "local"
+                    && matches!(message.as_ref(), ServerMessage::ReloadSoundConfig)) =>
+            {
+                match *message {
+                    ServerMessage::EndpointControl { kind, data }
+                        if kind == crate::protocol::endpoint::ENDPOINT_SNAPSHOT_KIND =>
+                    {
+                        match serde_json::from_str::<crate::protocol::ClientShellSnapshot>(&data) {
+                            Ok(snapshot) => {
+                                if let Some(connection) = servers.get_mut(&source) {
+                                    let snapshot = Box::new(snapshot);
+                                    connection.latest_snapshot = Some(snapshot.clone());
+                                    if let Some(shell) = state.shell.as_mut() {
+                                        shell.set_server_snapshot(
+                                            source.server_id.as_str().to_owned(),
+                                            snapshot,
+                                        );
+                                        shell.set_server_lifecycle(
+                                            source.server_id.as_str(),
+                                            shell::ClientServerLifecycle::Connected,
+                                        );
+                                    }
+                                }
+                                fleet_snapshot_dirty = true;
+                            }
+                            Err(error) => {
+                                let error = format!("invalid endpoint snapshot: {error}");
+                                if isolate_fleet_protocol_failure(
+                                    &mut servers,
+                                    &mut state,
+                                    &source,
+                                    &error,
+                                    false,
+                                ) {
+                                    fleet_snapshot_dirty = true;
+                                    continue 'client;
+                                }
+                                return Err(ClientError::Protocol(protocol::FramingError::Io(
+                                    io::Error::new(io::ErrorKind::InvalidData, error),
+                                )));
+                            }
+                        }
+                    }
+                    ServerMessage::EndpointControl { kind, .. }
+                        if kind.starts_with("shell.snapshot.") =>
+                    {
+                        let error =
+                            format!("unsupported mandatory endpoint snapshot codec {kind:?}");
+                        if isolate_fleet_protocol_failure(
+                            &mut servers,
+                            &mut state,
+                            &source,
+                            &error,
+                            true,
+                        ) {
+                            fleet_snapshot_dirty = true;
+                            continue 'client;
+                        }
+                        return Err(ClientError::Protocol(protocol::FramingError::Io(
+                            io::Error::new(io::ErrorKind::InvalidData, error),
+                        )));
+                    }
+                    ServerMessage::ClientShellSnapshot(_) => {
+                        let error = "server sent an unnegotiated binary endpoint snapshot";
+                        if isolate_fleet_protocol_failure(
+                            &mut servers,
+                            &mut state,
+                            &source,
+                            error,
+                            true,
+                        ) {
+                            fleet_snapshot_dirty = true;
+                            continue 'client;
+                        }
+                        return Err(ClientError::Protocol(protocol::FramingError::Io(
+                            io::Error::new(io::ErrorKind::InvalidData, error),
+                        )));
+                    }
+                    ServerMessage::SemanticNotification(event) => {
+                        receive_semantic_notification(&mut state, source.server_id.as_str(), event);
+                    }
+                    ServerMessage::ClientShellEndpointResponseChunk {
+                        boot_id,
+                        request_id,
+                        final_chunk,
+                        data,
+                    } => {
+                        if let Some(connection) = servers.get_mut(&source) {
+                            let completed = connection.endpoint_commands.receive_chunk(
+                                &boot_id,
+                                &request_id,
+                                final_chunk,
+                                data,
+                            );
+                            match completed {
+                                Ok(Some(_)) => {
+                                    if let Err(error) = connection
+                                        .endpoint_commands
+                                        .send_next(&mut connection.write_stream)
+                                    {
+                                        warn!(?source, %error, "inactive endpoint command write failed");
+                                        pending_disconnect = Some(source.clone());
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    let error = format!("invalid endpoint response: {error}");
+                                    if isolate_fleet_protocol_failure(
+                                        &mut servers,
+                                        &mut state,
+                                        &source,
+                                        &error,
+                                        false,
+                                    ) {
+                                        fleet_snapshot_dirty = true;
+                                        continue 'client;
+                                    }
+                                    return Err(ClientError::ConnectionLost(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        error,
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            ClientLoopEvent::ServerMessage {
+                source, message, ..
+            } => match *message {
                 ServerMessage::ClientShellSnapshot(_) => {
+                    let error = "server sent an unnegotiated binary endpoint snapshot";
+                    if isolate_fleet_protocol_failure(
+                        &mut servers,
+                        &mut state,
+                        &source,
+                        error,
+                        true,
+                    ) {
+                        fleet_snapshot_dirty = true;
+                        continue 'client;
+                    }
                     return Err(ClientError::Protocol(protocol::FramingError::Io(
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "server sent an unnegotiated binary endpoint snapshot",
-                        ),
+                        io::Error::new(io::ErrorKind::InvalidData, error),
                     )));
                 }
                 ServerMessage::PaneSurface(surface) => {
@@ -1355,7 +2478,10 @@ async fn run_client_loop(
                 } => {
                     #[cfg(unix)]
                     {
-                        if state.retired_direct_graphics.take() == Some((transfer_id, image_id)) {
+                        if state.retired_direct_graphics.as_ref()
+                            == Some(&(source.clone(), transfer_id, image_id))
+                        {
+                            state.retired_direct_graphics.take();
                             continue;
                         }
                         let surface_asset_valid = match (state.shell.as_ref(), &surface_asset) {
@@ -1403,8 +2529,13 @@ async fn run_client_loop(
                             false
                         };
                         if sent {
+                            state
+                                .direct_graphics_owners
+                                .insert(transfer_id, (source.clone(), image_id));
                             if let Some(asset) = surface_asset {
-                                state.pending_surface_graphics.insert(transfer_id, asset);
+                                state
+                                    .pending_surface_graphics
+                                    .insert((source.clone(), transfer_id), asset);
                             }
                             if let Ok(mut matcher) = state.direct_graphics_response.lock() {
                                 matcher.start(transfer_id);
@@ -1413,11 +2544,18 @@ async fn run_client_loop(
                                 transfer_id,
                                 image_id,
                             };
-                            if let Err(err) = write_to_server(&mut write_stream, &started) {
-                                return Err(ClientError::ConnectionLost(err));
+                            if let Err(err) = servers.send_active(&started) {
+                                defer_fleet_connection_loss(
+                                    ClientError::ConnectionLost(err),
+                                    &servers,
+                                    &mut pending_disconnect,
+                                )?;
+                                continue 'client;
                             }
                         } else {
-                            state.pending_surface_graphics.remove(&transfer_id);
+                            state
+                                .pending_surface_graphics
+                                .remove(&(source.clone(), transfer_id));
                             if let Ok(mut matcher) = state.direct_graphics_response.lock() {
                                 if valid {
                                     matcher.retire(transfer_id);
@@ -1430,8 +2568,13 @@ async fn run_client_loop(
                                 image_id,
                                 success: false,
                             };
-                            if let Err(err) = write_to_server(&mut write_stream, &result) {
-                                return Err(ClientError::ConnectionLost(err));
+                            if let Err(err) = servers.send_active(&result) {
+                                defer_fleet_connection_loss(
+                                    ClientError::ConnectionLost(err),
+                                    &servers,
+                                    &mut pending_disconnect,
+                                )?;
+                                continue 'client;
                             }
                         }
                     }
@@ -1452,8 +2595,18 @@ async fn run_client_loop(
                 } => {
                     #[cfg(unix)]
                     {
-                        state.retired_direct_graphics = Some((transfer_id, image_id));
-                        state.pending_surface_graphics.remove(&transfer_id);
+                        state.retired_direct_graphics =
+                            Some((source.clone(), transfer_id, image_id));
+                        state
+                            .pending_surface_graphics
+                            .remove(&(source.clone(), transfer_id));
+                        if state
+                            .direct_graphics_owners
+                            .get(&transfer_id)
+                            .is_some_and(|(owner, _)| owner == &source)
+                        {
+                            state.direct_graphics_owners.remove(&transfer_id);
+                        }
                         let cleanup = state.shell.as_mut().map_or_else(Vec::new, |shell| {
                             shell.retire_direct_graphics_image(image_id);
                             shell
@@ -1470,6 +2623,10 @@ async fn run_client_loop(
                     let _ = (transfer_id, image_id);
                 }
                 ServerMessage::ServerShutdown { reason } => {
+                    if servers.fleet_mode() {
+                        pending_disconnect = Some(source);
+                        continue 'client;
+                    }
                     return Err(ClientError::ServerShutdown { reason });
                 }
                 ServerMessage::Notify {
@@ -1482,23 +2639,7 @@ async fn run_client_loop(
                     }
                 }
                 ServerMessage::SemanticNotification(event) => {
-                    if state.shell.is_some() {
-                        let (effects, frame) = {
-                            let shell = state.shell.as_mut().expect("checked shell mode");
-                            let (effects, repaint) =
-                                shell.receive_notification(event, std::time::Instant::now());
-                            let frame = repaint
-                                .then(|| {
-                                    shell.compose(state.reported_size.0, state.reported_size.1)
-                                })
-                                .flatten();
-                            (effects, frame)
-                        };
-                        handle_shell_notification_effects(effects, &state.sound_config);
-                        if let Some(frame) = frame {
-                            state.present_frame(frame);
-                        }
-                    }
+                    receive_semantic_notification(&mut state, source.server_id.as_str(), event);
                 }
                 ServerMessage::ClientShellError { message } => {
                     if let Some(shell) = state.shell.as_mut() {
@@ -1516,9 +2657,28 @@ async fn run_client_loop(
                     final_chunk,
                     data,
                 } => {
-                    let completed = endpoint_commands
-                        .receive_chunk(&boot_id, &request_id, final_chunk, data)
-                        .map_err(ClientError::ConnectionLost)?;
+                    let completed = match servers.active_mut().endpoint_commands.receive_chunk(
+                        &boot_id,
+                        &request_id,
+                        final_chunk,
+                        data,
+                    ) {
+                        Ok(completed) => completed,
+                        Err(error) => {
+                            let message = format!("invalid endpoint response: {error}");
+                            if isolate_fleet_protocol_failure(
+                                &mut servers,
+                                &mut state,
+                                &source,
+                                &message,
+                                false,
+                            ) {
+                                fleet_snapshot_dirty = true;
+                                continue 'client;
+                            }
+                            return Err(ClientError::ConnectionLost(error));
+                        }
+                    };
                     let Some(completed) = completed else {
                         continue;
                     };
@@ -1536,12 +2696,26 @@ async fn run_client_loop(
                         shell.reconcile_input_source();
                     }
                     apply_client_shell_input_source_changes(&mut state, &mut prefix_input_source);
-                    let replay_mouse = dispatch_client_shell_actions(
+                    let dispatched = match dispatch_client_shell_actions(
                         actions,
-                        &mut endpoint_commands,
-                        &mut write_stream,
+                        Some(servers.active_mut()),
                         &mut state.detached_process_children,
-                    )?;
+                    ) {
+                        Ok(dispatched) => dispatched,
+                        Err(error) => {
+                            defer_fleet_connection_loss(error, &servers, &mut pending_disconnect)?;
+                            continue 'client;
+                        }
+                    };
+                    if let Some(server_id) = dispatched.activate_server.as_deref() {
+                        activate_server(
+                            &mut servers,
+                            server_id,
+                            &mut state,
+                            &mut prefix_input_source,
+                        )?;
+                    }
+                    let replay_mouse = dispatched.replay_mouse;
                     if replay_mouse.is_empty() {
                         if repaint {
                             if let Some(frame) = state.shell.as_mut().and_then(|shell| {
@@ -1563,13 +2737,13 @@ async fn run_client_loop(
                                 .flatten();
                             (outcome, frame)
                         };
-                        if finish_client_shell_input(
+                        if finish_client_shell_input_isolated(
                             &mut state,
                             outcome,
                             frame,
-                            &mut write_stream,
-                            &mut endpoint_commands,
+                            &mut servers,
                             &mut prefix_input_source,
+                            &mut pending_disconnect,
                         )? {
                             return Ok(());
                         }
@@ -1591,6 +2765,15 @@ async fn run_client_loop(
                     let _ = io::stdout().flush();
                 }
                 ServerMessage::WindowTitle { title } => {
+                    if let Some(connection) = servers.get_mut(&source) {
+                        connection.window_title = title.clone();
+                    }
+                    let title = match state.shell.as_ref() {
+                        Some(shell) => {
+                            shell.sourced_window_title(source.server_id.as_str(), title.as_deref())
+                        }
+                        None => title,
+                    };
                     let _ = crate::terminal_effects::write_window_title(
                         &mut io::stdout(),
                         title.as_deref(),
@@ -1599,24 +2782,114 @@ async fn run_client_loop(
                 ServerMessage::ReloadSoundConfig => {
                     let previous_mouse_capture = state.shell_mouse_capture_preference;
                     let mut mouse_capture = previous_mouse_capture;
-                    reload_local_client_config(
+                    let reloaded_remotes = reload_local_client_config(
                         &mut state.sound_config,
                         &mut state.redraw_on_focus_gained,
                         &mut state.draw_host_cursor,
                         &mut state.remote_image_paste_key,
                         &mut mouse_capture,
                     );
+                    if let Some((next_remotes, next_manage_ssh_config)) = reloaded_remotes {
+                        let (next_ids, removed, added) = remote_config_delta(
+                            &remote_configs,
+                            manage_ssh_config,
+                            &next_remotes,
+                            next_manage_ssh_config,
+                        );
+                        let changed = removed
+                            .iter()
+                            .filter(|id| added.contains(id))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let removed_active = state.shell.as_ref().is_some_and(|shell| {
+                            removed.iter().any(|id| id == shell.active_server_id())
+                        });
+                        for id in &removed {
+                            let server_id = ServerId::new(id.clone());
+                            remote_connectors.cancel(&server_id);
+                            remote_setup_failures.remove(&server_id);
+                            remote_reconnect_backoff.reset(&server_id);
+                            servers.reserve_generation(&server_id);
+                            if let Some(key) = servers.key_for_id(id) {
+                                #[cfg(unix)]
+                                if let Some(connection) = servers.get_mut(&key) {
+                                    cancel_connection_graphics(&mut state, connection);
+                                }
+                                let _ = servers.remove(&key);
+                            }
+                        }
+                        remote_configs = next_remotes;
+                        manage_ssh_config = next_manage_ssh_config;
+                        if removed_active {
+                            let fallback_id = servers
+                                .fallback_key()
+                                .map(|key| key.server_id.as_str().to_owned())
+                                .unwrap_or_else(|| "local".to_owned());
+                            activate_server(
+                                &mut servers,
+                                &fallback_id,
+                                &mut state,
+                                &mut prefix_input_source,
+                            )?;
+                        }
+                        if let Some(shell) = state.shell.as_mut() {
+                            for id in &changed {
+                                shell.forget_server(id);
+                            }
+                            shell.configure_servers(
+                                std::iter::once("local".to_owned())
+                                    .chain(next_ids.iter().cloned())
+                                    .collect(),
+                            );
+                        }
+                        servers.set_fleet_mode(!next_ids.is_empty());
+                        if let Some(shell) = state.shell.as_ref() {
+                            let shell_surface_size =
+                                shell.surface_size(state.reported_size.0, state.reported_size.1);
+                            for id in added {
+                                let remote = &remote_configs[&id];
+                                let server_id = ServerId::new(id);
+                                let generation = servers.reserve_generation(&server_id);
+                                spawn_remote_connector(
+                                    &mut remote_connectors,
+                                    remote_connector_spec(
+                                        ServerConnectionKey {
+                                            server_id,
+                                            generation,
+                                        },
+                                        remote,
+                                        manage_ssh_config,
+                                        endpoint_keybindings,
+                                        connector_mouse_capture,
+                                        &state,
+                                        shell_surface_size,
+                                    ),
+                                    Duration::ZERO,
+                                    event_tx.clone(),
+                                );
+                            }
+                        }
+                    }
                     state.shell_mouse_capture_preference = mouse_capture;
                     state.direct_mouse_capture_preference =
                         state.attach_escape.is_some() && mouse_capture;
                     if state.shell.is_some() && previous_mouse_capture != mouse_capture {
-                        write_to_server(
-                            &mut write_stream,
-                            &ClientMessage::ClientShellMouseCapture {
-                                enabled: mouse_capture,
-                            },
-                        )
-                        .map_err(ClientError::ConnectionLost)?;
+                        let write = servers.active_stream().and_then(|stream| {
+                            write_to_server(
+                                stream,
+                                &ClientMessage::ClientShellMouseCapture {
+                                    enabled: mouse_capture,
+                                },
+                            )
+                        });
+                        if let Err(error) = write {
+                            defer_fleet_connection_loss(
+                                ClientError::ConnectionLost(error),
+                                &servers,
+                                &mut pending_disconnect,
+                            )?;
+                            continue 'client;
+                        }
                     }
                     if state.attach_escape.is_some() {
                         let enabled = effective_mouse_capture(
@@ -1664,8 +2937,14 @@ async fn run_client_loop(
                     };
                     apply_client_shell_input_source_changes(&mut state, &mut prefix_input_source);
                     if let Some(resize) = resize {
-                        write_to_server(&mut write_stream, &resize)
-                            .map_err(ClientError::ConnectionLost)?;
+                        if let Err(error) = servers.send_active(&resize) {
+                            defer_fleet_connection_loss(
+                                ClientError::ConnectionLost(error),
+                                &servers,
+                                &mut pending_disconnect,
+                            )?;
+                            continue 'client;
+                        }
                     }
                     if let Some(frame) = frame {
                         state.present_frame(frame);
@@ -1722,41 +3001,134 @@ async fn run_client_loop(
                 ServerMessage::EndpointControl { kind, data } => {
                     if kind != crate::protocol::endpoint::ENDPOINT_SNAPSHOT_KIND {
                         if kind.starts_with("shell.snapshot.") {
+                            let error =
+                                format!("unsupported mandatory endpoint snapshot codec {kind:?}");
+                            if isolate_fleet_protocol_failure(
+                                &mut servers,
+                                &mut state,
+                                &source,
+                                &error,
+                                true,
+                            ) {
+                                fleet_snapshot_dirty = true;
+                                continue 'client;
+                            }
                             return Err(ClientError::Protocol(protocol::FramingError::Io(
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!(
-                                        "unsupported mandatory endpoint snapshot codec {kind:?}"
-                                    ),
-                                ),
+                                io::Error::new(io::ErrorKind::InvalidData, error),
                             )));
                         }
                         debug!(%kind, "ignoring unknown endpoint control message");
                         continue;
                     }
-                    let snapshot: crate::protocol::ClientShellSnapshot =
-                        serde_json::from_str(&data).map_err(|error| {
-                            ClientError::Protocol(protocol::FramingError::Io(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("invalid endpoint snapshot: {error}"),
-                            )))
-                        })?;
-                    install_client_shell_snapshot(
+                    let snapshot: Box<crate::protocol::ClientShellSnapshot> =
+                        match serde_json::from_str(&data) {
+                            Ok(snapshot) => snapshot,
+                            Err(error) => {
+                                let error = format!("invalid endpoint snapshot: {error}");
+                                if isolate_fleet_protocol_failure(
+                                    &mut servers,
+                                    &mut state,
+                                    &source,
+                                    &error,
+                                    false,
+                                ) {
+                                    fleet_snapshot_dirty = true;
+                                    continue 'client;
+                                }
+                                return Err(ClientError::Protocol(protocol::FramingError::Io(
+                                    io::Error::new(io::ErrorKind::InvalidData, error),
+                                )));
+                            }
+                        };
+                    if let Some(connection) = servers.get_mut(&source) {
+                        connection.latest_snapshot = Some(snapshot.clone());
+                    }
+                    if let Some(shell) = state.shell.as_mut() {
+                        shell.set_server_lifecycle(
+                            source.server_id.as_str(),
+                            shell::ClientServerLifecycle::Connected,
+                        );
+                    }
+                    if let Err(error) = install_client_shell_snapshot(
                         &mut state,
-                        Box::new(snapshot),
-                        &mut write_stream,
+                        snapshot,
+                        servers.active_mut(),
                         &mut prefix_input_source,
-                    )?;
+                    ) {
+                        defer_fleet_connection_loss(error, &servers, &mut pending_disconnect)?;
+                        continue 'client;
+                    }
                 }
                 ServerMessage::Welcome { .. } => {
                     debug!("received unexpected Welcome in main loop");
                 }
             },
-            ClientLoopEvent::ServerDisconnected => {
-                return Err(ClientError::ConnectionLost(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "server closed connection",
-                )));
+            ClientLoopEvent::ServerDisconnected(source) => {
+                if !servers.is_live(&source) {
+                    debug!(
+                        ?source,
+                        "ignoring disconnect from a stale server connection"
+                    );
+                    continue;
+                }
+                let was_active = servers.is_active(&source);
+                info!(?source, was_active, "server disconnected");
+                #[cfg(unix)]
+                if let Some(connection) = servers.get_mut(&source) {
+                    cancel_connection_graphics(&mut state, connection);
+                }
+                let _ = servers.remove(&source);
+                if !servers.fleet_mode() {
+                    return Err(ClientError::ConnectionLost(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "server disconnected",
+                    )));
+                }
+                let reconnecting = remote_configs
+                    .get(source.server_id.as_str())
+                    .filter(|remote| {
+                        remote.enabled
+                            && remote.validation_error(source.server_id.as_str()).is_none()
+                    });
+                let reconnect_delay = reconnecting.map(|_| {
+                    remote_reconnect_backoff.retry_delay_after_disconnect(&source.server_id, now)
+                });
+                if let (Some(remote), Some(shell), Some(reconnect_delay)) =
+                    (reconnecting, state.shell.as_ref(), reconnect_delay)
+                {
+                    let generation = servers.reserve_generation(&source.server_id);
+                    spawn_remote_connector(
+                        &mut remote_connectors,
+                        remote_connector_spec(
+                            ServerConnectionKey {
+                                server_id: source.server_id.clone(),
+                                generation,
+                            },
+                            remote,
+                            manage_ssh_config,
+                            endpoint_keybindings,
+                            connector_mouse_capture,
+                            &state,
+                            shell.surface_size(state.reported_size.0, state.reported_size.1),
+                        ),
+                        reconnect_delay,
+                        event_tx.clone(),
+                    );
+                }
+                if let Some(shell) = state.shell.as_mut() {
+                    shell.set_server_lifecycle(
+                        source.server_id.as_str(),
+                        if reconnect_delay.is_some() {
+                            shell::ClientServerLifecycle::Reconnecting("connection closed".into())
+                        } else {
+                            shell::ClientServerLifecycle::Failed("connection closed".into())
+                        },
+                    );
+                }
+                fleet_snapshot_dirty = true;
+                if was_active {
+                    state.request_repaint();
+                }
             }
             ClientLoopEvent::Timer => {
                 client_timer.fired();
@@ -1768,10 +3140,13 @@ async fn run_client_loop(
                     .detached_process_children
                     .retain_mut(|child| child.try_wait().ok().flatten().is_none());
                 if state.shell.is_some() {
-                    let expired_endpoint = endpoint_commands.expire(now);
+                    let expired_endpoint = servers
+                        .current_mut()
+                        .and_then(|connection| connection.endpoint_commands.expire(now));
                     let (effects, outcome, frame) = {
                         let shell = state.shell.as_mut().expect("checked shell mode");
                         let mut outcome = shell.tick_selection_autoscroll(now);
+                        outcome.repaint |= std::mem::take(&mut fleet_snapshot_dirty);
                         if let Some(expired) = expired_endpoint {
                             let (repaint, actions) = shell.handle_endpoint_result(
                                 &expired.boot_id,
@@ -1790,13 +3165,13 @@ async fn run_client_loop(
                         (effects, outcome, frame)
                     };
                     handle_shell_notification_effects(effects, &state.sound_config);
-                    if finish_client_shell_input(
+                    if finish_client_shell_input_isolated(
                         &mut state,
                         outcome,
                         frame,
-                        &mut write_stream,
-                        &mut endpoint_commands,
+                        &mut servers,
                         &mut prefix_input_source,
+                        &mut pending_disconnect,
                     )? {
                         return Ok(());
                     }
@@ -1807,7 +3182,7 @@ async fn run_client_loop(
 
     // Clean exit (Ctrl+C). Send Detach before closing.
     let detach = ClientMessage::Detach;
-    let _ = write_to_server(&mut write_stream, &detach);
+    let _ = servers.send_active(&detach);
     let _ = io::stdout().flush();
 
     Ok(())
@@ -1817,12 +3192,44 @@ async fn run_client_loop(
 // Server reader thread
 // ---------------------------------------------------------------------------
 
+fn spawn_server_reader(
+    connection: &mut ServerConnection,
+    event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    should_quit: Arc<AtomicBool>,
+    kitty_graphics_enabled: bool,
+) -> Result<(), ClientError> {
+    let source = connection.key.clone();
+    let presentation_active = connection.presentation_active();
+    let read_stream = connection
+        .write_stream
+        .try_clone()
+        .map_err(ClientError::ConnectionFailed)?;
+    std::thread::spawn(move || {
+        let max_frame_size = if kitty_graphics_enabled {
+            MAX_GRAPHICS_FRAME_SIZE
+        } else {
+            MAX_FRAME_SIZE
+        };
+        server_reader_thread(
+            read_stream,
+            event_tx,
+            source,
+            &should_quit,
+            &presentation_active,
+            max_frame_size,
+        );
+    });
+    Ok(())
+}
+
 /// Blocking thread that reads ServerMessages from the server and sends them
 /// to the main event loop.
 fn server_reader_thread(
     mut stream: LocalStream,
     event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    source: ServerConnectionKey,
     should_quit: &Arc<AtomicBool>,
+    presentation_active: &AtomicBool,
     max_frame_size: usize,
 ) {
     // Ensure the read stream is in blocking mode to avoid WouldBlock errors
@@ -1830,19 +3237,34 @@ fn server_reader_thread(
     // blocking after handshake, but we enforce it here as a safety measure.
     if stream.set_nonblocking(false).is_err() {
         // If we can't set blocking mode, the stream is likely broken.
-        let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected);
+        let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected(source));
         return;
     }
+    let admission = ServerMessageAdmission::new();
 
     loop {
         if should_quit.load(Ordering::Acquire) {
             break;
         }
+        let Some(permit) = admission.acquire() else {
+            break;
+        };
 
         match protocol::read_message(&mut stream, max_frame_size) {
             Ok(msg) => {
+                if !server_message_reaches_main(
+                    presentation_active.load(Ordering::Acquire),
+                    source.server_id.as_str() == "local",
+                    &msg,
+                ) {
+                    continue;
+                }
                 if event_tx
-                    .blocking_send(ClientLoopEvent::ServerMessage(Box::new(msg)))
+                    .blocking_send(ClientLoopEvent::ServerMessage {
+                        source: source.clone(),
+                        message: Box::new(msg),
+                        _permit: permit,
+                    })
                     .is_err()
                 {
                     break; // Main loop gone.
@@ -1850,7 +3272,7 @@ fn server_reader_thread(
             }
             Err(protocol::FramingError::UnexpectedEof) => {
                 // Server closed connection.
-                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected);
+                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected(source));
                 break;
             }
             Err(protocol::FramingError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -1861,11 +3283,30 @@ fn server_reader_thread(
             }
             Err(err) => {
                 warn!(err = %err, "server read error");
-                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected);
+                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected(source));
                 break;
             }
         }
     }
+}
+
+fn server_message_reaches_main(
+    presentation_active: bool,
+    local_source: bool,
+    message: &ServerMessage,
+) -> bool {
+    presentation_active
+        || local_source && matches!(message, ServerMessage::ReloadSoundConfig)
+        || matches!(
+            message,
+            ServerMessage::EndpointControl { kind, .. }
+                if kind == crate::protocol::endpoint::ENDPOINT_SNAPSHOT_KIND
+        )
+        || matches!(
+            message,
+            ServerMessage::ClientShellEndpointResponseChunk { .. }
+                | ServerMessage::SemanticNotification(_)
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -1890,7 +3331,10 @@ fn reload_local_client_config(
         crossterm::event::KeyModifiers,
     )>,
     mouse_capture: &mut bool,
-) {
+) -> Option<(
+    std::collections::BTreeMap<String, crate::config::RemoteServerConfig>,
+    bool,
+)> {
     match crate::config::load_live_config() {
         Ok(loaded) => {
             let invalid_section = |section: &str| {
@@ -1913,9 +3357,19 @@ fn reload_local_client_config(
                 *remote_image_paste_key = client_remote_image_paste_key(&loaded.config);
             }
             debug!("reloaded local client config");
+            if invalid_section("remote") || invalid_section("remotes") {
+                warn!("invalid remote config; keeping current remote connections");
+                None
+            } else {
+                Some((
+                    loaded.config.remotes,
+                    loaded.config.remote.manage_ssh_config,
+                ))
+            }
         }
         Err(diagnostics) => {
             warn!(diagnostics = ?diagnostics, "failed to reload local client config; keeping current client config");
+            None
         }
     }
 }

@@ -129,6 +129,7 @@ pub(super) enum ClientMobileTarget {
 
 #[derive(Default)]
 pub(super) struct ShellHitMap {
+    pub(super) servers: Vec<(Rect, String)>,
     pub(super) workspaces: Vec<WorkspaceHit>,
     pub(super) workspace_body: Rect,
     pub(super) workspace_scrollbar: Rect,
@@ -215,6 +216,7 @@ pub(super) struct ClientPaneMouseGesture {
 }
 
 pub(super) struct ClientWorkspacePress {
+    pub(super) server_id: String,
     pub(super) workspace_id: String,
     pub(super) start_column: u16,
     pub(super) start_row: u16,
@@ -271,6 +273,7 @@ pub(super) enum ClientChromeDrag {
 
 pub(super) struct WorkspaceHit {
     pub(super) rect: Rect,
+    pub(super) server_id: String,
     pub(super) workspace_id: String,
     pub(super) indented: bool,
     pub(super) group_toggle: Option<(Rect, String)>,
@@ -278,6 +281,15 @@ pub(super) struct WorkspaceHit {
 
 #[derive(Debug)]
 pub(crate) enum ClientShellAction {
+    ActivateServer(String),
+    ActivatePane {
+        server_id: String,
+        pane_id: String,
+    },
+    ActivateWorkspace {
+        server_id: String,
+        workspace_id: String,
+    },
     Endpoint {
         boot_id: String,
         request: Box<crate::api::schema::Request>,
@@ -741,12 +753,14 @@ pub(crate) enum ClientShellNotificationEffect {
 }
 
 pub(super) struct ClientPendingNotification {
+    pub(super) server_id: String,
     pub(super) event: SemanticNotification,
     pub(super) deadline: std::time::Instant,
     pub(super) validate_state: bool,
 }
 
 pub(super) struct ClientVisibleNotification {
+    pub(super) server_id: String,
     pub(super) event: SemanticNotification,
     pub(super) deadline: std::time::Instant,
 }
@@ -767,6 +781,15 @@ pub(super) struct ClientInputContext {
 }
 
 type ClientInputLeases = crate::input::InputLeaseTable<u8, ClientInputContext, ClientInputTarget>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ClientServerLifecycle {
+    Connected,
+    Connecting,
+    Reconnecting(String),
+    Failed(String),
+    VersionMismatch(String),
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct ClientPaneClick {
@@ -860,6 +883,11 @@ pub(super) struct ClientCopyModeState {
 pub(crate) struct ClientShellState {
     pub(super) config: ClientShellConfig,
     pub(super) snapshot: Option<Box<ClientShellSnapshot>>,
+    pub(super) server_snapshots: BTreeMap<String, Box<ClientShellSnapshot>>,
+    pub(super) server_surfaces: BTreeMap<String, PaneSurfaceFrame>,
+    pub(super) server_ids: Vec<String>,
+    pub(super) server_lifecycle: BTreeMap<String, ClientServerLifecycle>,
+    pub(super) active_server_id: String,
     pub(super) pane_surface: Option<PaneSurfaceFrame>,
     pub(super) graphics: crate::kitty_graphics::surface::ClientState,
     pub(super) graphics_cell_size: crate::kitty_graphics::HostCellSize,
@@ -889,6 +917,7 @@ pub(crate) struct ClientShellState {
     pub(super) hits: ShellHitMap,
     pub(super) mode: ClientShellMode,
     pub(super) navigate_workspace_id: Option<String>,
+    pub(super) navigate_server_id: Option<String>,
     pub(super) overlay: Option<ClientShellOverlay>,
     pub(super) previous_pane_id: Option<String>,
     pub(super) pane_mouse_gesture: Option<ClientPaneMouseGesture>,
@@ -999,6 +1028,11 @@ impl ClientShellState {
         Self {
             config,
             snapshot: None,
+            server_snapshots: BTreeMap::new(),
+            server_surfaces: BTreeMap::new(),
+            server_ids: vec!["local".into()],
+            server_lifecycle: BTreeMap::from([("local".into(), ClientServerLifecycle::Connected)]),
+            active_server_id: "local".into(),
             pane_surface: None,
             graphics: crate::kitty_graphics::surface::ClientState::default(),
             graphics_cell_size: crate::kitty_graphics::HostCellSize {
@@ -1031,6 +1065,7 @@ impl ClientShellState {
             hits: ShellHitMap::default(),
             mode: ClientShellMode::Terminal,
             navigate_workspace_id: None,
+            navigate_server_id: None,
             overlay,
             previous_pane_id: None,
             pane_mouse_gesture: None,
@@ -1078,6 +1113,125 @@ impl ClientShellState {
         }
     }
 
+    pub(crate) fn configure_servers(&mut self, server_ids: Vec<String>) {
+        self.server_lifecycle
+            .retain(|server_id, _| server_ids.contains(server_id));
+        self.server_snapshots
+            .retain(|server_id, _| server_ids.contains(server_id));
+        self.server_surfaces
+            .retain(|server_id, _| server_ids.contains(server_id));
+        self.pending_notifications
+            .retain(|notification| server_ids.contains(&notification.server_id));
+        if self
+            .visible_notification
+            .as_ref()
+            .is_some_and(|notification| !server_ids.contains(&notification.server_id))
+        {
+            self.visible_notification = None;
+        }
+        for server_id in &server_ids {
+            self.server_lifecycle
+                .entry(server_id.clone())
+                .or_insert(if server_id == "local" {
+                    ClientServerLifecycle::Connected
+                } else {
+                    ClientServerLifecycle::Connecting
+                });
+        }
+        self.server_ids = server_ids;
+    }
+
+    pub(crate) fn forget_server(&mut self, server_id: &str) {
+        debug_assert_ne!(self.active_server_id, server_id);
+        self.server_snapshots.remove(server_id);
+        self.server_surfaces.remove(server_id);
+        self.server_lifecycle.remove(server_id);
+        self.pending_notifications
+            .retain(|notification| notification.server_id != server_id);
+        if self
+            .visible_notification
+            .as_ref()
+            .is_some_and(|notification| notification.server_id == server_id)
+        {
+            self.visible_notification = None;
+        }
+    }
+
+    pub(crate) fn set_active_server(&mut self, active_server_id: String) {
+        if self.active_server_id == active_server_id {
+            return;
+        }
+        if let Some(surface) = self.pane_surface.take() {
+            self.server_surfaces
+                .insert(self.active_server_id.clone(), surface);
+        }
+        self.graphics
+            .set_scene(crate::protocol::SurfaceGraphicsScene::default());
+        self.active_server_id = active_server_id;
+        let Some(snapshot) = self.server_snapshots.get(&self.active_server_id).cloned() else {
+            return;
+        };
+        let cached_surface = self.server_surfaces.remove(&self.active_server_id);
+        self.set_snapshot(snapshot);
+        if let Some(surface) = cached_surface {
+            self.set_pane_surface(surface);
+        }
+    }
+
+    pub(crate) fn active_server_id(&self) -> &str {
+        &self.active_server_id
+    }
+
+    pub(crate) fn has_server_snapshot(&self, server_id: &str) -> bool {
+        self.server_snapshots.contains_key(server_id)
+    }
+
+    pub(crate) fn outer_focused(&self) -> Option<bool> {
+        self.outer_focused
+    }
+
+    pub(crate) fn set_server_lifecycle(
+        &mut self,
+        server_id: &str,
+        lifecycle: ClientServerLifecycle,
+    ) {
+        if !matches!(&lifecycle, ClientServerLifecycle::Connected) {
+            self.pending_notifications
+                .retain(|notification| notification.server_id != server_id);
+            if self
+                .visible_notification
+                .as_ref()
+                .is_some_and(|notification| notification.server_id == server_id)
+            {
+                self.visible_notification = None;
+            }
+        }
+        self.server_lifecycle
+            .insert(server_id.to_owned(), lifecycle);
+    }
+
+    pub(crate) fn set_server_snapshot(
+        &mut self,
+        server_id: String,
+        snapshot: Box<ClientShellSnapshot>,
+    ) {
+        self.server_snapshots.insert(server_id, snapshot);
+    }
+
+    pub(crate) fn sourced_window_title(
+        &self,
+        server_id: &str,
+        title: Option<&str>,
+    ) -> Option<String> {
+        if self.server_ids.len() == 1 {
+            return title.map(str::to_owned);
+        }
+        Some(match title.filter(|title| !title.is_empty()) {
+            Some(title) => format!("[{}] {title}", server_id.to_ascii_uppercase()),
+            None => format!("[{}] Herdr", server_id.to_ascii_uppercase()),
+        })
+    }
+
     pub(crate) fn set_endpoint_methods(&mut self, methods: Option<Vec<String>>) {
         self.endpoint_methods = methods.map(|methods| methods.into_iter().collect());
     }
@@ -1114,6 +1268,7 @@ impl ClientShellState {
         {
             self.mode = self.copy_or_terminal_mode();
             self.navigate_workspace_id = None;
+            self.navigate_server_id = None;
         } else {
             self.mode = ClientShellMode::Navigate;
         }
@@ -1225,6 +1380,10 @@ impl ClientShellState {
             .snapshot
             .as_ref()
             .is_some_and(|current| current.boot_id != snapshot.boot_id);
+        let active_server_restarted = self
+            .server_snapshots
+            .get(&self.active_server_id)
+            .is_some_and(|current| current.boot_id != snapshot.boot_id);
         if boot_changed
             || self
                 .pane_surface
@@ -1257,12 +1416,22 @@ impl ClientShellState {
             self.popup_pending = false;
             self.popup_pending_deadline = None;
             self.pending_integration_installs = 0;
-            self.pending_notifications.clear();
-            self.visible_notification = None;
+            if active_server_restarted {
+                self.pending_notifications
+                    .retain(|notification| notification.server_id != self.active_server_id);
+                if self
+                    .visible_notification
+                    .as_ref()
+                    .is_some_and(|notification| notification.server_id == self.active_server_id)
+                {
+                    self.visible_notification = None;
+                }
+            }
             self.endpoint_notice_seen.clear();
             self.visible_endpoint_notice = None;
             self.endpoint_error = None;
             self.navigate_workspace_id = None;
+            self.navigate_server_id = None;
             self.overlay = self
                 .config
                 .startup_onboarding
@@ -1407,6 +1576,7 @@ impl ClientShellState {
             })
         {
             self.navigate_workspace_id = snapshot.focused_workspace_id.clone();
+            self.navigate_server_id = Some(self.active_server_id.clone());
             self.reveal_mobile_workspace = self.mobile_layout_active();
         }
         let pane_exists =
@@ -1473,6 +1643,8 @@ impl ClientShellState {
                 Some(_) => {}
             }
         }
+        self.server_snapshots
+            .insert(self.active_server_id.clone(), snapshot.clone());
         self.snapshot = Some(snapshot);
         self.resume_mobile_switcher_if_ready();
         self.reconcile_input_source();
@@ -1516,6 +1688,7 @@ impl ClientShellState {
             }
             self.mode = ClientShellMode::Terminal;
             self.navigate_workspace_id = None;
+            self.navigate_server_id = None;
             if !matches!(
                 self.overlay.as_ref(),
                 Some(ClientShellOverlay::Onboarding | ClientShellOverlay::ProductAnnouncement(_))
