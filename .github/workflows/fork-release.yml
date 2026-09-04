@@ -120,4 +120,4 @@ jobs:
             release-assets/herdr-macos-aarch64
             release-assets/herdr-windows-x86_64.zip
             latest.json
-        body_path: RELEASE_NOTES.md
+          body_path: RELEASE_NOTES.md
