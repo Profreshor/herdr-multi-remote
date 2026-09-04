@@ -20,6 +20,15 @@ pub const ENDPOINT_SNAPSHOT_KIND: &str = SNAPSHOT_CODEC_V1;
 pub const SURFACE_CODEC_V1: &str = "shell.surface.v1";
 pub const INPUT_CODEC_V1: &str = "shell.input.semantic.v1";
 pub const BLOB_CODEC_V1: &str = "shell.blob.v1";
+pub const PRESENTATION_CONTROL_V1: &str = "shell.presentation.v1";
+
+const fn presentation_visible_by_default() -> bool {
+    true
+}
+
+const fn is_visible(value: &bool) -> bool {
+    *value
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointClientHello {
@@ -31,6 +40,11 @@ pub struct EndpointClientHello {
     pub direct_graphics: bool,
     pub endpoint_keybindings: bool,
     pub mouse_capture: bool,
+    #[serde(
+        default = "presentation_visible_by_default",
+        skip_serializing_if = "is_visible"
+    )]
+    pub presentation_visible: bool,
     #[serde(default)]
     pub snapshot_codecs: Vec<String>,
     #[serde(default)]
@@ -47,6 +61,12 @@ pub struct EndpointHandshakeError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointPresentationDemand {
+    pub visible: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointServerWelcome {
     pub generation: u32,
@@ -57,6 +77,8 @@ pub struct EndpointServerWelcome {
     pub blob_codec: String,
     #[serde(default)]
     pub methods: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<EndpointHandshakeError>,
 }
@@ -95,6 +117,7 @@ impl EndpointServerWelcome {
             input_codec: INPUT_CODEC_V1.into(),
             blob_codec: BLOB_CODEC_V1.into(),
             methods,
+            capabilities: vec![PRESENTATION_CONTROL_V1.into()],
             error: None,
         }
     }
@@ -108,6 +131,7 @@ impl EndpointServerWelcome {
             input_codec: INPUT_CODEC_V1.into(),
             blob_codec: BLOB_CODEC_V1.into(),
             methods: Vec::new(),
+            capabilities: Vec::new(),
             error: Some(EndpointHandshakeError {
                 code: code.into(),
                 message: message.into(),
@@ -130,6 +154,7 @@ mod tests {
             direct_graphics: false,
             endpoint_keybindings: false,
             mouse_capture: true,
+            presentation_visible: true,
             snapshot_codecs: vec![SNAPSHOT_CODEC_V1.into()],
             surface_codecs: vec![SURFACE_CODEC_V1.into()],
             input_codecs: vec![INPUT_CODEC_V1.into()],
@@ -192,6 +217,8 @@ mod tests {
         assert_eq!(welcome.surface_codec, SURFACE_CODEC_V1);
         assert_eq!(welcome.input_codec, INPUT_CODEC_V1);
         assert_eq!(welcome.blob_codec, BLOB_CODEC_V1);
+        assert!(welcome.capabilities.is_empty());
+        assert!(hello.presentation_visible);
     }
 
     #[test]
@@ -271,5 +298,29 @@ mod tests {
         value["future_service"] = serde_json::json!("v2");
         let decoded: EndpointServerWelcome = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, welcome);
+    }
+
+    #[test]
+    fn presentation_negotiation_is_optional_and_advertised() {
+        let mut value = serde_json::to_value(hello()).unwrap();
+        assert!(value.get("presentation_visible").is_none());
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("presentation_visible");
+        let decoded: EndpointClientHello = serde_json::from_value(value).unwrap();
+        assert!(decoded.presentation_visible);
+
+        let hidden = EndpointClientHello {
+            presentation_visible: false,
+            ..hello()
+        };
+        assert_eq!(
+            serde_json::to_value(hidden).unwrap()["presentation_visible"],
+            false
+        );
+
+        let welcome = EndpointServerWelcome::compatible(Vec::new());
+        assert_eq!(welcome.capabilities, vec![PRESENTATION_CONTROL_V1]);
     }
 }

@@ -56,7 +56,7 @@ use crate::server::client_shell::{
 use crate::server::client_transport::ServerEvent;
 use crate::server::clients::{
     latest_shell_client, render_targets, terminal_stream_client_ids, ClientConnection,
-    ClientConnectionMode, ClientShellInputTarget, DeferredRender,
+    ClientConnectionMode, ClientShellHeldInput, ClientShellInputTarget, DeferredRender,
 };
 use crate::server::keybindings::{app_keybindings, apply_keybindings};
 use crate::server::notifications::{
@@ -591,7 +591,7 @@ impl HeadlessServer {
                     crate::render_prof::event("retained_surface.invoke");
                 } else {
                     crate::render_prof::event("full_render.invoke");
-                    self.render_and_stream();
+                    self.render_and_stream(needs_full_render);
                 }
                 self.app.record_render_attempt(now, !hidden_only);
                 needs_render = false;
@@ -906,6 +906,13 @@ impl HeadlessServer {
     }
 
     fn promote_client_to_foreground(&mut self, client_id: u64) -> bool {
+        if self
+            .clients
+            .get(&client_id)
+            .is_some_and(|client| client.is_shell_client() && !client.shell_presentation_visible)
+        {
+            return false;
+        }
         let stamp = self.allocate_activity_stamp();
         let Some(client) = self.clients.get_mut(&client_id) else {
             return false;
@@ -926,6 +933,78 @@ impl HeadlessServer {
         changed
     }
 
+    fn set_client_shell_presentation(&mut self, client_id: u64, visible: bool) -> bool {
+        let Some(client) = self.clients.get(&client_id) else {
+            return false;
+        };
+        if !client.is_shell_client() || client.shell_presentation_visible == visible {
+            return false;
+        }
+
+        let focus_target = (client.outer_terminal_focus == Some(true))
+            .then(|| self.shell_focus_target(client_id))
+            .flatten();
+        let focused_tabs_before = self.focused_shell_tabs();
+        let was_foreground = self.foreground_client_id == Some(client_id);
+        if !visible {
+            self.retire_direct_graphics_for_client(client_id);
+            let held_inputs = self
+                .clients
+                .get_mut(&client_id)
+                .map(ClientConnection::drain_shell_held_inputs)
+                .unwrap_or_default();
+            self.release_client_shell_inputs(client_id, held_inputs);
+        }
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return false;
+        };
+        client.shell_presentation_visible = visible;
+        client.render_state.reset_baseline();
+        client.shell_graphics_delivery = crate::kitty_graphics::surface::DeliveryCache::default();
+        client.host_mouse_capture_active = None;
+        client.host_sgr_pixels_active = None;
+        client.host_keyboard_report_all_active = None;
+        if visible {
+            client.request_repaint();
+        } else {
+            client.clear_deferred_render();
+        }
+
+        if visible {
+            self.promote_client_to_foreground(client_id);
+            self.claim_shell_tab_geometry(client_id, true);
+        } else {
+            self.tab_geometry_controllers
+                .retain(|_, controller_id| *controller_id != client_id);
+            if was_foreground {
+                self.promote_latest_remaining_client();
+            }
+            self.reapply_controlled_shell_tab_geometry(true);
+        }
+
+        if let Some(target) = focus_target {
+            let focused_tabs_after = self.focused_shell_tabs();
+            let event = if visible
+                && !focused_tabs_before.contains(&target.tab_id)
+                && focused_tabs_after.contains(&target.tab_id)
+            {
+                Some(crate::ghostty::FocusEvent::Gained)
+            } else if !visible
+                && focused_tabs_before.contains(&target.tab_id)
+                && !focused_tabs_after.contains(&target.tab_id)
+            {
+                Some(crate::ghostty::FocusEvent::Lost)
+            } else {
+                None
+            };
+            if let Some(event) = event {
+                self.send_shell_focus_target(&target, event);
+            }
+        }
+        self.sync_immediate_pty_sources();
+        true
+    }
+
     fn app_client_count(&self) -> usize {
         self.clients
             .values()
@@ -933,9 +1012,16 @@ impl HeadlessServer {
             .count()
     }
 
+    fn visible_app_client_count(&self) -> usize {
+        self.clients
+            .values()
+            .filter(|client| client.is_visible_shell_client() && client.writer.is_some())
+            .count()
+    }
+
     fn client_supports_direct_graphics(&self, client_id: u64) -> bool {
         self.clients.get(&client_id).is_some_and(|client| {
-            client.is_shell_client()
+            client.is_visible_shell_client()
                 && client.writer.is_some()
                 && client.direct_graphics
                 && client.pixel_mouse
@@ -992,12 +1078,14 @@ impl HeadlessServer {
         let disconnected_focus = self
             .clients
             .get(&client_id)
-            .filter(|client| client.is_shell_client() && client.outer_terminal_focus == Some(true))
+            .filter(|client| {
+                client.is_visible_shell_client() && client.outer_terminal_focus == Some(true)
+            })
             .and_then(|_| self.shell_focus_target(client_id));
         let should_release_focus = disconnected_focus.as_ref().is_some_and(|target| {
             !self.clients.iter().any(|(&other_id, client)| {
                 other_id != client_id
-                    && client.is_shell_client()
+                    && client.is_visible_shell_client()
                     && client.outer_terminal_focus == Some(true)
                     && self.shell_tab_id_for_client(other_id).as_deref()
                         == Some(target.tab_id.as_str())
@@ -1008,7 +1096,8 @@ impl HeadlessServer {
         self.tab_geometry_controllers
             .retain(|_, controller_id| *controller_id != client_id);
         if let Some(mut removed) = removed {
-            self.release_client_shell_inputs(client_id, &mut removed);
+            let held_inputs = removed.drain_shell_held_inputs();
+            self.release_client_shell_inputs(client_id, held_inputs);
             crate::server::clipboard_image::remove_files(removed.staged_clipboard_files);
             if let ClientConnectionMode::TerminalAttach { terminal_id } = removed.mode {
                 self.terminal_attach_owners.remove(&terminal_id);
@@ -1033,8 +1122,12 @@ impl HeadlessServer {
         }
     }
 
-    fn release_client_shell_inputs(&mut self, client_id: u64, client: &mut ClientConnection) {
-        for held in client.drain_shell_held_inputs() {
+    fn release_client_shell_inputs(
+        &mut self,
+        client_id: u64,
+        held_inputs: Vec<ClientShellHeldInput>,
+    ) {
+        for held in held_inputs {
             let result = match held.target {
                 ClientShellInputTarget::Pane(pane_id) => {
                     let Some((workspace_index, runtime_pane_id)) = self.app.parse_pane_id(&pane_id)
@@ -1181,16 +1274,18 @@ impl HeadlessServer {
             protocol::ClientClipboardImageTarget::Pane(pane_id) => {
                 !self.handoff_in_progress
                     && self.app.state.popup_pane.is_none()
-                    && self.clients.get(&client_id).is_some_and(|client| {
-                        matches!(client.mode, ClientConnectionMode::ClientShell)
-                    })
+                    && self
+                        .clients
+                        .get(&client_id)
+                        .is_some_and(|client| client.is_visible_shell_client())
                     && self.app.parse_pane_id(pane_id).is_some()
             }
             protocol::ClientClipboardImageTarget::Popup(terminal_id) => {
                 !self.handoff_in_progress
-                    && self.clients.get(&client_id).is_some_and(|client| {
-                        matches!(client.mode, ClientConnectionMode::ClientShell)
-                    })
+                    && self
+                        .clients
+                        .get(&client_id)
+                        .is_some_and(|client| client.is_visible_shell_client())
                     && self
                         .app
                         .state
@@ -1237,9 +1332,10 @@ impl HeadlessServer {
             }
             protocol::ClientClipboardImageTarget::Pane(pane_id) => {
                 if self.handoff_in_progress
-                    || !self.clients.get(&client_id).is_some_and(|client| {
-                        matches!(client.mode, ClientConnectionMode::ClientShell)
-                    })
+                    || !self
+                        .clients
+                        .get(&client_id)
+                        .is_some_and(|client| client.is_visible_shell_client())
                 {
                     return false;
                 }
@@ -1273,9 +1369,10 @@ impl HeadlessServer {
             }
             protocol::ClientClipboardImageTarget::Popup(terminal_id) => {
                 if self.handoff_in_progress
-                    || !self.clients.get(&client_id).is_some_and(|client| {
-                        matches!(client.mode, ClientConnectionMode::ClientShell)
-                    })
+                    || !self
+                        .clients
+                        .get(&client_id)
+                        .is_some_and(|client| client.is_visible_shell_client())
                 {
                     return false;
                 }
@@ -1929,6 +2026,7 @@ impl HeadlessServer {
                 direct_graphics,
                 endpoint_keybindings,
                 mouse_capture,
+                presentation_visible,
                 writer,
             } => {
                 if self.handoff_in_progress {
@@ -1972,6 +2070,7 @@ impl HeadlessServer {
                 connection.direct_graphics = direct_graphics;
                 connection.shell_uses_endpoint_keybindings = endpoint_keybindings;
                 connection.shell_mouse_capture = mouse_capture;
+                connection.shell_presentation_visible = presentation_visible;
                 connection.shell_projection_revision = 1;
                 let config_diagnostic = if endpoint_keybindings {
                     self.server_config_diagnostic.as_deref()
@@ -2002,13 +2101,15 @@ impl HeadlessServer {
                     self.popup_owner_tab_id = self.shell_tab_id_for_client(client_id);
                 }
                 self.send_to_client(client_id, snapshot_message);
-                self.foreground_client_id = Some(client_id);
                 if first_app_client {
                     self.app.mark_git_status_refresh_due(Instant::now());
                 }
-                self.sync_foreground_client_state();
-                self.claim_unowned_shell_tab_geometry(client_id, true);
-                self.nudge_handoff_panes_on_first_client_attach();
+                if presentation_visible {
+                    self.foreground_client_id = Some(client_id);
+                    self.sync_foreground_client_state();
+                    self.claim_unowned_shell_tab_geometry(client_id, true);
+                    self.nudge_handoff_panes_on_first_client_attach();
+                }
                 true
             }
             ServerEvent::GraphicsTransmissionResult {
@@ -2225,6 +2326,9 @@ impl HeadlessServer {
                 }
                 client.pixel_mouse = pixel_mouse && observed.is_known();
                 client.request_repaint();
+                if !client.shell_presentation_visible {
+                    return false;
+                }
                 self.promote_client_to_foreground(client_id);
                 self.resize_shell_tab_if_controller(client_id, true);
                 true
@@ -2261,15 +2365,19 @@ impl HeadlessServer {
                 {
                     return false;
                 }
+                let presentation_visible = client.shell_presentation_visible;
                 let tab_id = self.shell_tab_id_for_client(client_id);
                 let another_focused_viewer = self.clients.iter().any(|(&other_id, client)| {
                     other_id != client_id
-                        && client.is_shell_client()
+                        && client.is_visible_shell_client()
                         && client.outer_terminal_focus == Some(true)
                         && self.shell_tab_id_for_client(other_id) == tab_id
                 });
                 if let Some(client) = self.clients.get_mut(&client_id) {
                     client.outer_terminal_focus = Some(focused);
+                }
+                if !presentation_visible {
+                    return false;
                 }
                 if focused {
                     self.promote_client_to_foreground(client_id);
@@ -2308,15 +2416,19 @@ impl HeadlessServer {
                 client.host_mouse_capture_active = None;
                 true
             }
+            ServerEvent::ClientShellPresentation { client_id, visible } => {
+                self.set_client_shell_presentation(client_id, visible)
+            }
             ServerEvent::ClientShellPaneInput {
                 client_id,
                 pane_id,
                 events,
             } => {
                 if self.handoff_in_progress
-                    || !self.clients.get(&client_id).is_some_and(|client| {
-                        matches!(client.mode, ClientConnectionMode::ClientShell)
-                    })
+                    || !self
+                        .clients
+                        .get(&client_id)
+                        .is_some_and(|client| client.is_visible_shell_client())
                 {
                     return false;
                 }
@@ -2400,9 +2512,10 @@ impl HeadlessServer {
                 events,
             } => {
                 if self.handoff_in_progress
-                    || !self.clients.get(&client_id).is_some_and(|client| {
-                        matches!(client.mode, ClientConnectionMode::ClientShell)
-                    })
+                    || !self
+                        .clients
+                        .get(&client_id)
+                        .is_some_and(|client| client.is_visible_shell_client())
                 {
                     return false;
                 }

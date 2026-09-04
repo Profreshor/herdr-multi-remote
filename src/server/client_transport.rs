@@ -18,8 +18,8 @@ use tracing::{debug, warn};
 
 use crate::ipc::LocalStream;
 use crate::protocol::endpoint::{
-    EndpointClientHello, EndpointServerWelcome, ENDPOINT_HELLO_KIND, ENDPOINT_PROTOCOL_GENERATION,
-    ENDPOINT_WELCOME_KIND,
+    EndpointClientHello, EndpointPresentationDemand, EndpointServerWelcome, ENDPOINT_HELLO_KIND,
+    ENDPOINT_PROTOCOL_GENERATION, ENDPOINT_WELCOME_KIND, PRESENTATION_CONTROL_V1,
 };
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientMessage, ClientPaneInputEvent,
@@ -46,6 +46,9 @@ const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
 const MAX_CLIENT_SHELL_DIMENSION: u16 = 4096;
 const MAX_CLIENT_SHELL_CELLS: u32 = 1_000_000;
 const MAX_CLIENT_CELL_SIZE_PX: u32 = 4096;
+const MAX_PRESENTATION_CONTROL_BYTES: usize = 64;
+const MAX_CLIENT_CONTROL_MESSAGES: usize = 64;
+const MAX_CLIENT_CONTROL_BYTES: usize = 4 * (MAX_FRAME_SIZE + 4);
 
 fn client_shell_geometry_error(
     surface_size: crate::protocol::ClientSurfaceSize,
@@ -124,6 +127,10 @@ pub(crate) struct ClientWriter {
 }
 
 impl ClientWriter {
+    pub(crate) fn send_snapshot(&self, data: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
+        self.control.queue.send_snapshot(data)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_fill_render(&self, data: Vec<u8>) {
         self.render.try_send(data).unwrap();
@@ -247,6 +254,8 @@ struct ClientWriterQueue {
 #[derive(Debug, Default)]
 struct ClientWriterQueueState {
     control: VecDeque<Vec<u8>>,
+    control_bytes: usize,
+    snapshot: Option<Vec<u8>>,
     ordered: VecDeque<Vec<u8>>,
     render: Option<Vec<u8>>,
     senders: usize,
@@ -283,10 +292,33 @@ impl ClientWriterQueue {
 
     fn send_control(&self, data: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
         let mut state = self.lock_state();
+        if data.len() > MAX_CLIENT_CONTROL_BYTES {
+            return Err(SendError(data));
+        }
+        while state.writer_alive
+            && (state.control.len() >= MAX_CLIENT_CONTROL_MESSAGES
+                || state.control_bytes.saturating_add(data.len()) > MAX_CLIENT_CONTROL_BYTES)
+        {
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
         if !state.writer_alive {
             return Err(SendError(data));
         }
+        state.control_bytes += data.len();
         state.control.push_back(data);
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    fn send_snapshot(&self, data: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
+        let mut state = self.lock_state();
+        if !state.writer_alive {
+            return Err(SendError(data));
+        }
+        state.snapshot = Some(data);
         self.ready.notify_one();
         Ok(())
     }
@@ -324,6 +356,11 @@ impl ClientWriterQueue {
         let mut state = self.lock_state();
         loop {
             if let Some(data) = state.control.pop_front() {
+                state.control_bytes = state.control_bytes.saturating_sub(data.len());
+                self.ready.notify_one();
+                return Some(ClientWriteItem::Control(data));
+            }
+            if let Some(data) = state.snapshot.take() {
                 return Some(ClientWriteItem::Control(data));
             }
             if let Some(data) = state.ordered.pop_front() {
@@ -346,6 +383,9 @@ impl ClientWriterQueue {
     fn close_writer(&self) {
         let mut state = self.lock_state();
         state.writer_alive = false;
+        state.control.clear();
+        state.control_bytes = 0;
+        state.snapshot = None;
         state.render = None;
         state.ordered.clear();
         self.ready.notify_all();
@@ -382,6 +422,7 @@ pub(crate) enum ServerEvent {
         direct_graphics: bool,
         endpoint_keybindings: bool,
         mouse_capture: bool,
+        presentation_visible: bool,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -483,6 +524,8 @@ pub(crate) enum ServerEvent {
     ClientShellFocus { client_id: u64, focused: bool },
     /// A client-owned shell updated its local mouse-capture preference.
     ClientShellMouseCapture { client_id: u64, enabled: bool },
+    /// A client-owned shell changed whether it needs pane presentation.
+    ClientShellPresentation { client_id: u64, visible: bool },
     /// A client-owned shell invoked one endpoint operation through this connection.
     ClientShellEndpointRequest {
         client_id: u64,
@@ -744,6 +787,7 @@ pub(crate) fn handle_client_handshake(
                     hello.direct_graphics,
                     hello.endpoint_keybindings,
                     hello.mouse_capture,
+                    hello.presentation_visible,
                 )),
             )
         }
@@ -831,33 +875,38 @@ pub(crate) fn handle_client_handshake(
     }
 
     // Notify the main loop about the new client.
-    let connected =
-        if let Some((pixel_mouse, direct_graphics, endpoint_keybindings, mouse_capture)) =
-            shell_options
-        {
-            ServerEvent::ClientShellConnected {
-                client_id,
-                surface_cols: client_cols,
-                surface_rows: client_rows,
-                cell_width_px,
-                cell_height_px,
-                pixel_mouse,
-                direct_graphics,
-                endpoint_keybindings,
-                mouse_capture,
-                writer,
-            }
-        } else {
-            ServerEvent::ClientConnected {
-                client_id,
-                cols: client_cols,
-                rows: client_rows,
-                cell_width_px,
-                cell_height_px,
-                pixel_mouse: terminal_pixel_mouse,
-                writer,
-            }
-        };
+    let connected = if let Some((
+        pixel_mouse,
+        direct_graphics,
+        endpoint_keybindings,
+        mouse_capture,
+        presentation_visible,
+    )) = shell_options
+    {
+        ServerEvent::ClientShellConnected {
+            client_id,
+            surface_cols: client_cols,
+            surface_rows: client_rows,
+            cell_width_px,
+            cell_height_px,
+            pixel_mouse,
+            direct_graphics,
+            endpoint_keybindings,
+            mouse_capture,
+            presentation_visible,
+            writer,
+        }
+    } else {
+        ServerEvent::ClientConnected {
+            client_id,
+            cols: client_cols,
+            rows: client_rows,
+            cell_width_px,
+            cell_height_px,
+            pixel_mouse: terminal_pixel_mouse,
+            writer,
+        }
+    };
     if let Err(err) = server_event_tx.blocking_send(connected) {
         match err.0 {
             ServerEvent::ClientConnected { writer, .. }
@@ -1242,6 +1291,27 @@ fn client_read_loop(
                     },
                 }
             }
+            ClientMessage::EndpointControl { kind, data } if kind == PRESENTATION_CONTROL_V1 => {
+                if data.len() > MAX_PRESENTATION_CONTROL_BYTES {
+                    warn!(
+                        client_id,
+                        size = data.len(),
+                        "oversized presentation control ignored"
+                    );
+                    continue;
+                }
+                let demand: EndpointPresentationDemand = match serde_json::from_str(&data) {
+                    Ok(demand) => demand,
+                    Err(error) => {
+                        warn!(client_id, %error, "invalid presentation control ignored");
+                        continue;
+                    }
+                };
+                ServerEvent::ClientShellPresentation {
+                    client_id,
+                    visible: demand.visible,
+                }
+            }
             ClientMessage::EndpointControl { kind, .. } => {
                 debug!(client_id, %kind, "ignoring unknown endpoint control message");
                 continue;
@@ -1344,6 +1414,14 @@ mod tests {
     }
 
     fn endpoint_hello(surface_cols: u16, surface_rows: u16) -> ClientMessage {
+        endpoint_hello_with_visibility(surface_cols, surface_rows, true)
+    }
+
+    fn endpoint_hello_with_visibility(
+        surface_cols: u16,
+        surface_rows: u16,
+        presentation_visible: bool,
+    ) -> ClientMessage {
         let hello = EndpointClientHello {
             generation: ENDPOINT_PROTOCOL_GENERATION,
             cell_width_px: 8,
@@ -1356,6 +1434,7 @@ mod tests {
             direct_graphics: true,
             endpoint_keybindings: true,
             mouse_capture: true,
+            presentation_visible,
             snapshot_codecs: vec![crate::protocol::endpoint::SNAPSHOT_CODEC_V1.into()],
             surface_codecs: vec![crate::protocol::endpoint::SURFACE_CODEC_V1.into()],
             input_codecs: vec![crate::protocol::endpoint::INPUT_CODEC_V1.into()],
@@ -1430,6 +1509,81 @@ mod tests {
             writer.render.try_send(second),
             Err(TrySendError::Full(_))
         ));
+    }
+
+    #[test]
+    fn client_writer_queue_coalesces_shell_snapshots() {
+        let (writer, queue) = test_queue_writer();
+        writer.send_snapshot(b"old".to_vec()).unwrap();
+        writer.send_snapshot(b"latest".to_vec()).unwrap();
+
+        assert_eq!(
+            queue.recv(),
+            Some(ClientWriteItem::Control(b"latest".to_vec()))
+        );
+    }
+
+    #[test]
+    fn client_writer_queue_bounds_reliable_control_by_count() {
+        let (writer, queue) = test_queue_writer();
+        for _ in 0..MAX_CLIENT_CONTROL_MESSAGES {
+            writer.control.send(vec![b'x']).expect("control fits");
+        }
+        let blocked = writer.control.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let sender = std::thread::spawn(move || done_tx.send(blocked.send(vec![b'y'])).unwrap());
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+
+        assert_eq!(queue.recv(), Some(ClientWriteItem::Control(vec![b'x'])));
+        assert!(done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .is_ok());
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn client_writer_queue_bounds_reliable_control_by_bytes() {
+        let (writer, queue) = test_queue_writer();
+        let frame_len = MAX_FRAME_SIZE + 4;
+        for _ in 0..4 {
+            writer
+                .control
+                .send(vec![b'x'; frame_len])
+                .expect("control fits byte budget");
+        }
+        let blocked = writer.control.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            done_tx.send(blocked.send(vec![b'y'; frame_len])).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+
+        let _ = queue.recv();
+        assert!(done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .is_ok());
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn closing_client_writer_wakes_a_saturated_control_sender() {
+        let (writer, queue) = test_queue_writer();
+        for _ in 0..MAX_CLIENT_CONTROL_MESSAGES {
+            writer.control.send(vec![b'x']).expect("control fits");
+        }
+        let blocked = writer.control.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let sender = std::thread::spawn(move || done_tx.send(blocked.send(vec![b'y'])).unwrap());
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+
+        queue.close_writer();
+        assert!(done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .is_err());
+        sender.join().unwrap();
     }
 
     #[test]
@@ -1753,6 +1907,7 @@ mod tests {
         let welcome = endpoint_welcome(welcome);
         assert_eq!(welcome.generation, ENDPOINT_PROTOCOL_GENERATION);
         assert!(welcome.error.is_none());
+        assert_eq!(welcome.capabilities, vec![PRESENTATION_CONTROL_V1]);
         match server_event_rx
             .blocking_recv()
             .expect("client shell connected event")
@@ -1767,6 +1922,7 @@ mod tests {
                 direct_graphics,
                 endpoint_keybindings,
                 mouse_capture,
+                presentation_visible,
                 writer,
             } => {
                 assert_eq!(client_id, 43);
@@ -1776,11 +1932,82 @@ mod tests {
                 assert!(direct_graphics);
                 assert!(endpoint_keybindings);
                 assert!(mouse_capture);
+                assert!(presentation_visible);
                 drop(writer);
             }
             other => panic!("expected ClientShellConnected, got {other:?}"),
         }
 
+        drop(client_stream);
+        should_quit.store(true, Ordering::Release);
+        handle
+            .join()
+            .expect("handshake thread join")
+            .expect("handshake thread result");
+    }
+
+    #[test]
+    fn presentation_control_is_validated_and_emitted() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-shell-presentation");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let handshake_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            handle_client_handshake(server_stream, 44, &server_event_tx, &handshake_quit)
+        });
+
+        protocol::write_message(
+            &mut client_stream,
+            &endpoint_hello_with_visibility(80, 29, false),
+        )
+        .expect("write hidden shell hello");
+        let welcome: ServerMessage =
+            protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("read welcome");
+        assert_eq!(
+            endpoint_welcome(welcome).capabilities,
+            vec![PRESENTATION_CONTROL_V1]
+        );
+
+        let connected = recv_server_event(&mut server_event_rx, "hidden shell connected");
+        let ServerEvent::ClientShellConnected {
+            presentation_visible,
+            writer,
+            ..
+        } = connected
+        else {
+            panic!("expected client shell connection");
+        };
+        assert!(!presentation_visible);
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::EndpointControl {
+                kind: PRESENTATION_CONTROL_V1.into(),
+                data: r#"{"visible":true,"extra":false}"#.into(),
+            },
+        )
+        .expect("write invalid presentation control");
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(server_event_rx.try_recv().is_err());
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::EndpointControl {
+                kind: PRESENTATION_CONTROL_V1.into(),
+                data: serde_json::to_string(&EndpointPresentationDemand { visible: true }).unwrap(),
+            },
+        )
+        .expect("write presentation control");
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "presentation event"),
+            ServerEvent::ClientShellPresentation {
+                client_id: 44,
+                visible: true
+            }
+        ));
+
+        drop(writer);
         drop(client_stream);
         should_quit.store(true, Ordering::Release);
         handle

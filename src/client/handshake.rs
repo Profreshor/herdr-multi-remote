@@ -121,6 +121,7 @@ fn set_handshake_recv_timeout(
 pub(super) struct HandshakeResult {
     pub(super) encoding: RenderEncoding,
     pub(super) endpoint_methods: Option<Vec<String>>,
+    pub(super) presentation_control: bool,
 }
 
 /// Performs the client→server handshake.
@@ -136,8 +137,10 @@ pub(super) fn do_handshake(
     cell_height_px: u32,
     exact_cell_size: bool,
     shell_surface_size: Option<crate::protocol::ClientSurfaceSize>,
+    presentation_visible: bool,
     endpoint_keybindings: bool,
     mouse_capture: bool,
+    read_timeout: Duration,
 ) -> Result<HandshakeResult, ClientError> {
     stream
         .set_nonblocking(false)
@@ -157,6 +160,7 @@ pub(super) fn do_handshake(
                 && direct_graphics_profile_allowed(),
             endpoint_keybindings,
             mouse_capture,
+            presentation_visible,
             snapshot_codecs: vec![SNAPSHOT_CODEC_V1.into()],
             surface_codecs: vec![SURFACE_CODEC_V1.into()],
             input_codecs: vec![INPUT_CODEC_V1.into()],
@@ -183,7 +187,7 @@ pub(super) fn do_handshake(
 
     set_handshake_recv_timeout(
         stream,
-        Some(handshake_read_timeout()),
+        Some(read_timeout),
         "client handshake read timeout unavailable",
     )?;
     let welcome: ServerMessage = protocol::read_message(stream, MAX_FRAME_SIZE)?;
@@ -230,14 +234,20 @@ pub(super) fn do_handshake(
                 error: "server has no compatible endpoint core; update this machine".into(),
             });
         }
+        let presentation_control = welcome
+            .capabilities
+            .iter()
+            .any(|capability| capability == crate::protocol::endpoint::PRESENTATION_CONTROL_V1);
         info!(
             generation = welcome.generation,
             server_version = %welcome.server_version,
+            presentation_control,
             "endpoint handshake succeeded"
         );
         return Ok(HandshakeResult {
             encoding: RenderEncoding::SemanticFrame,
             endpoint_methods: Some(welcome.methods),
+            presentation_control,
         });
     }
 
@@ -254,6 +264,7 @@ pub(super) fn do_handshake(
             Ok(HandshakeResult {
                 encoding,
                 endpoint_methods: None,
+                presentation_control: false,
             })
         }
         _ => Err(ClientError::Protocol(protocol::FramingError::Io(

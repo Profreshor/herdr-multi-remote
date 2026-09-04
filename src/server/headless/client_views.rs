@@ -143,9 +143,15 @@ impl HeadlessServer {
                 .and_then(|target| self.tab_id_for_target(target));
         }
         let topology = self.client_shell_topology();
-        let live_clients = self.clients.keys().copied().collect::<HashSet<_>>();
+        let visible_clients = self
+            .clients
+            .iter()
+            .filter_map(|(&client_id, client)| {
+                client.is_visible_shell_client().then_some(client_id)
+            })
+            .collect::<HashSet<_>>();
         self.tab_geometry_controllers.retain(|tab_id, client_id| {
-            topology.tab_workspace_ids.contains_key(tab_id) && live_clients.contains(client_id)
+            topology.tab_workspace_ids.contains_key(tab_id) && visible_clients.contains(client_id)
         });
         for client in self
             .clients
@@ -388,7 +394,7 @@ impl HeadlessServer {
         self.clients
             .iter()
             .filter(|(_, client)| {
-                client.is_shell_client() && client.outer_terminal_focus == Some(true)
+                client.is_visible_shell_client() && client.outer_terminal_focus == Some(true)
             })
             .filter_map(|(&client_id, _)| self.shell_tab_id_for_client(client_id))
             .collect()
@@ -397,7 +403,7 @@ impl HeadlessServer {
     pub(super) fn shell_focus_targets(&self) -> Vec<(u64, Option<ShellFocusTarget>)> {
         self.clients
             .iter()
-            .filter(|(_, client)| client.is_shell_client())
+            .filter(|(_, client)| client.is_visible_shell_client())
             .map(|(&client_id, _)| (client_id, self.shell_focus_target(client_id)))
             .collect()
     }
@@ -571,7 +577,7 @@ impl HeadlessServer {
             crate::kitty_graphics::HostCellSize::default()
         };
         let area = Rect::new(0, 0, cols, rows);
-        if self.app_client_count() == 1 {
+        if self.visible_app_client_count() == 1 {
             for (workspace_index, workspace) in self.app.state.workspaces.iter().enumerate() {
                 for tab_index in 0..workspace.tabs.len() {
                     crate::ui::resize_tab_surface(
@@ -608,11 +614,11 @@ impl HeadlessServer {
         &mut self,
         start_pending_agent_resumes: bool,
     ) -> bool {
-        if self.app_client_count() != 1 {
+        if self.visible_app_client_count() != 1 {
             return false;
         }
         let Some(client_id) = self.clients.iter().find_map(|(&client_id, client)| {
-            (client.is_shell_client() && client.writer.is_some()).then_some(client_id)
+            (client.is_visible_shell_client() && client.writer.is_some()).then_some(client_id)
         }) else {
             return false;
         };
@@ -625,7 +631,7 @@ impl HeadlessServer {
     ) -> bool {
         let mut viewed_tabs = HashMap::<String, Vec<u64>>::new();
         for (&client_id, client) in &self.clients {
-            if !client.is_shell_client() || client.writer.is_none() {
+            if !client.is_visible_shell_client() || client.writer.is_none() {
                 continue;
             }
             let Some(tab_id) = self.shell_tab_id_for_client(client_id) else {
@@ -684,6 +690,13 @@ impl HeadlessServer {
         client_id: u64,
         start_pending_agent_resumes: bool,
     ) -> bool {
+        if !self
+            .clients
+            .get(&client_id)
+            .is_some_and(|client| client.is_visible_shell_client())
+        {
+            return false;
+        }
         let Some(tab_id) = self.shell_tab_id_for_client(client_id) else {
             return false;
         };
@@ -698,6 +711,13 @@ impl HeadlessServer {
         client_id: u64,
         start_pending_agent_resumes: bool,
     ) -> bool {
+        if !self
+            .clients
+            .get(&client_id)
+            .is_some_and(|client| client.is_visible_shell_client())
+        {
+            return false;
+        }
         let Some(tab_id) = self.shell_tab_id_for_client(client_id) else {
             return false;
         };
@@ -713,6 +733,13 @@ impl HeadlessServer {
         client_id: u64,
         start_pending_agent_resumes: bool,
     ) -> bool {
+        if !self
+            .clients
+            .get(&client_id)
+            .is_some_and(|client| client.is_visible_shell_client())
+        {
+            return false;
+        }
         let Some(tab_id) = self.shell_tab_id_for_client(client_id) else {
             return false;
         };

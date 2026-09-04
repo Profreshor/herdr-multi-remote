@@ -38,7 +38,7 @@ impl HeadlessServer {
             .clients
             .iter()
             .filter_map(|(&client_id, client)| match &client.mode {
-                ClientConnectionMode::ClientShell => {
+                ClientConnectionMode::ClientShell if client.shell_presentation_visible => {
                     let focused = self.shell_focused_runtime(client_id);
                     let child_requests_mouse =
                         focused.is_some_and(|(runtime, _)| runtime.mouse_reporting_enabled());
@@ -63,7 +63,8 @@ impl HeadlessServer {
                             .is_some_and(crate::terminal::TerminalRuntime::sgr_pixel_mouse_enabled);
                     Some((client_id, child_requests_mouse, sgr_pixels))
                 }
-                ClientConnectionMode::TerminalPending
+                ClientConnectionMode::ClientShell
+                | ClientConnectionMode::TerminalPending
                 | ClientConnectionMode::TerminalObserve { .. } => None,
             })
             .collect::<Vec<_>>();
@@ -112,7 +113,7 @@ impl HeadlessServer {
         let shell_modes = self
             .clients
             .iter()
-            .filter(|(_, client)| client.is_shell_client())
+            .filter(|(_, client)| client.is_visible_shell_client())
             .map(|(&client_id, _)| {
                 let report_all =
                     self.shell_focused_runtime(client_id)
@@ -224,7 +225,7 @@ impl HeadlessServer {
         let mut pane_ids = HashSet::new();
         if has_app_target {
             for (&client_id, client) in &self.clients {
-                if !client.is_shell_client() || client.writer.is_none() {
+                if !client.is_visible_shell_client() || client.writer.is_none() {
                     continue;
                 }
                 let Some(target) = self.shell_target_for_client(client_id) else {
@@ -279,12 +280,14 @@ impl HeadlessServer {
             .filter(|client| client.writer.is_some())
         {
             match &client.mode {
-                ClientConnectionMode::ClientShell => has_app_target = true,
+                ClientConnectionMode::ClientShell if client.shell_presentation_visible => {
+                    has_app_target = true
+                }
                 ClientConnectionMode::TerminalAttach { terminal_id }
                 | ClientConnectionMode::TerminalObserve { terminal_id } => {
                     direct_terminal_targets.insert(terminal_id.as_str());
                 }
-                ClientConnectionMode::TerminalPending => {}
+                ClientConnectionMode::ClientShell | ClientConnectionMode::TerminalPending => {}
             }
         }
         (has_app_target, direct_terminal_targets)
@@ -339,7 +342,7 @@ impl HeadlessServer {
 
     fn any_shell_surface_contains_pane(&self, pane_id: crate::layout::PaneId) -> bool {
         self.clients.iter().any(|(&client_id, client)| {
-            if !client.is_shell_client() || client.writer.is_none() {
+            if !client.is_visible_shell_client() || client.writer.is_none() {
                 return false;
             }
             if self
@@ -367,8 +370,79 @@ impl HeadlessServer {
         })
     }
 
-    pub(super) fn render_and_stream(&mut self) {
+    fn sync_client_shell_snapshots(&mut self) {
+        let client_ids = self
+            .clients
+            .iter()
+            .filter_map(|(&client_id, client)| {
+                (client.is_shell_client() && client.writer.is_some()).then_some(client_id)
+            })
+            .collect::<Vec<_>>();
+        let mut broken_clients = Vec::new();
+
+        for client_id in client_ids {
+            let location = self
+                .clients
+                .get(&client_id)
+                .and_then(|client| client.shell_location.clone());
+            let Some(client) = self.clients.get_mut(&client_id) else {
+                continue;
+            };
+            let mut candidate = client_shell_snapshot(
+                &self.app,
+                &self.client_shell_boot_id,
+                client.shell_projection_revision,
+                None,
+                location.as_ref(),
+            );
+            candidate.config_diagnostic = if client.shell_uses_endpoint_keybindings {
+                self.server_config_diagnostic.clone()
+            } else {
+                self.server_config_diagnostic_without_keybindings.clone()
+            };
+            candidate.revision = client.shell_projection_revision;
+            if client.shell_snapshot.as_ref() == Some(&candidate) {
+                continue;
+            }
+            client.shell_projection_revision = client.shell_projection_revision.saturating_add(1);
+            candidate.revision = client.shell_projection_revision;
+            let message = match crate::protocol::endpoint::snapshot_message(&candidate) {
+                Ok(message) => message,
+                Err(err) => {
+                    warn!(client_id, err = %err, "failed to encode endpoint snapshot");
+                    broken_clients.push(client_id);
+                    continue;
+                }
+            };
+            let framed = match Self::frame_server_message(&message) {
+                Ok(framed) => framed,
+                Err(err) => {
+                    warn!(client_id, err = %err, "failed to frame endpoint snapshot");
+                    broken_clients.push(client_id);
+                    continue;
+                }
+            };
+            let Some(writer) = client.writer.as_ref() else {
+                broken_clients.push(client_id);
+                continue;
+            };
+            if writer.send_snapshot(framed).is_err() {
+                broken_clients.push(client_id);
+                continue;
+            }
+            client.shell_snapshot = Some(candidate);
+        }
+
+        for client_id in broken_clients {
+            self.remove_client_and_resize_if_needed(client_id);
+        }
+    }
+
+    pub(super) fn render_and_stream(&mut self, sync_semantics: bool) {
         let full_started = crate::render_prof::timer();
+        if sync_semantics {
+            self.sync_client_shell_snapshots();
+        }
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
 
         if render_targets.is_empty() {
@@ -403,60 +477,10 @@ impl HeadlessServer {
             let shell_target = self.shell_target_for_client(client_id);
             let shell_tab_id = self.shell_tab_id_for_client(client_id);
             let shell_shows_popup = shell_tab_id.as_deref() == self.popup_owner_tab_id.as_deref();
-            let mut shell_projection_revision = 0;
-            if matches!(mode, ClientConnectionMode::ClientShell) {
-                let location = self
-                    .clients
-                    .get(&client_id)
-                    .and_then(|client| client.shell_location.clone());
-                let Some(client) = self.clients.get_mut(&client_id) else {
-                    continue;
-                };
-                let mut candidate = client_shell_snapshot(
-                    &self.app,
-                    &self.client_shell_boot_id,
-                    client.shell_projection_revision,
-                    None,
-                    location.as_ref(),
-                );
-                candidate.config_diagnostic = if client.shell_uses_endpoint_keybindings {
-                    self.server_config_diagnostic.clone()
-                } else {
-                    self.server_config_diagnostic_without_keybindings.clone()
-                };
-                candidate.revision = client.shell_projection_revision;
-                if client.shell_snapshot.as_ref() != Some(&candidate) {
-                    client.shell_projection_revision =
-                        client.shell_projection_revision.saturating_add(1);
-                    candidate.revision = client.shell_projection_revision;
-                    let message = match crate::protocol::endpoint::snapshot_message(&candidate) {
-                        Ok(message) => message,
-                        Err(err) => {
-                            warn!(client_id, err = %err, "failed to encode endpoint snapshot");
-                            broken_clients.push(client_id);
-                            continue;
-                        }
-                    };
-                    let framed = match Self::frame_server_message(&message) {
-                        Ok(framed) => framed,
-                        Err(err) => {
-                            warn!(client_id, err = %err, "failed to frame endpoint snapshot");
-                            broken_clients.push(client_id);
-                            continue;
-                        }
-                    };
-                    let Some(writer) = client.writer.as_ref() else {
-                        broken_clients.push(client_id);
-                        continue;
-                    };
-                    if writer.control.send(framed).is_err() {
-                        broken_clients.push(client_id);
-                        continue;
-                    }
-                    client.shell_snapshot = Some(candidate);
-                }
-                shell_projection_revision = client.shell_projection_revision;
-            }
+            let shell_projection_revision = self
+                .clients
+                .get(&client_id)
+                .map_or(0, |client| client.shell_projection_revision);
             let shell_graphics_delivery = self
                 .clients
                 .get(&client_id)

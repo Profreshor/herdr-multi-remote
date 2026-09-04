@@ -161,6 +161,8 @@ pub(crate) struct ClientConnection {
     pub(crate) render_pending: bool,
     /// Whether this shell wants host mouse capture without pane demand.
     pub(crate) shell_mouse_capture: bool,
+    /// Whether this shell currently needs pane presentation and host-side effects.
+    pub(crate) shell_presentation_visible: bool,
     /// Last host mouse capture mode sent to this client.
     pub(crate) host_mouse_capture_active: Option<bool>,
     /// Last SGR pixel provenance mode sent to this client.
@@ -231,6 +233,7 @@ impl ClientConnection {
             host_keyboard_report_all_active: None,
             render_pending: false,
             shell_mouse_capture: false,
+            shell_presentation_visible: true,
             host_mouse_capture_active: None,
             host_sgr_pixels_active: None,
             host_keyboard_protocol_active: None,
@@ -451,12 +454,16 @@ impl ClientConnection {
     pub(crate) fn is_shell_client(&self) -> bool {
         matches!(self.mode, ClientConnectionMode::ClientShell)
     }
+
+    pub(crate) fn is_visible_shell_client(&self) -> bool {
+        self.is_shell_client() && self.shell_presentation_visible
+    }
 }
 
 pub(crate) fn latest_shell_client(clients: &HashMap<u64, ClientConnection>) -> Option<u64> {
     clients
         .iter()
-        .filter(|(_, client)| client.is_shell_client())
+        .filter(|(_, client)| client.is_visible_shell_client())
         .max_by_key(|(_, client)| client.last_activity)
         .map(|(&client_id, _)| client_id)
 }
@@ -487,7 +494,7 @@ pub(crate) fn render_targets(
         .iter()
         .filter(|(_, client)| {
             client.writer.is_some()
-                && (client.is_shell_client()
+                && (client.is_visible_shell_client()
                     || matches!(
                         client.mode,
                         ClientConnectionMode::TerminalAttach { .. }
@@ -586,6 +593,37 @@ mod tests {
                 windows_record: Some(record),
                 ..
             } if *record == windows_record
+        ));
+    }
+
+    #[test]
+    fn hidden_shell_is_not_a_render_target_but_direct_attach_is() {
+        let (control_tx, _control_rx) = std::sync::mpsc::channel();
+        let (render_tx, _render_rx) = std::sync::mpsc::sync_channel(1);
+        let mut shell = shell_client();
+        shell.writer = Some(ClientWriter::test_channel(
+            control_tx.clone(),
+            render_tx.clone(),
+        ));
+        shell.shell_presentation_visible = false;
+        let direct = ClientConnection::new_with_mode(
+            ClientConnectionMode::TerminalAttach {
+                terminal_id: "terminal-1".into(),
+            },
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            2,
+            crate::protocol::RenderEncoding::TerminalAnsi,
+            Some(ClientWriter::test_channel(control_tx, render_tx)),
+        );
+        let clients = HashMap::from([(1, shell), (2, direct)]);
+
+        let targets = render_targets(&clients, None);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, 2);
+        assert!(matches!(
+            targets[0].4,
+            ClientConnectionMode::TerminalAttach { .. }
         ));
     }
 }
