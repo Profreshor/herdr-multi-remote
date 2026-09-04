@@ -2095,15 +2095,21 @@ impl ClientShellState {
                     .hits
                     .agents
                     .iter()
-                    .find(|(rect, _)| super::contains(*rect, point))
-                    .map(|(_, pane_id)| pane_id.clone());
-                if let Some(pane_id) = agent_pane_id {
-                    self.push_endpoint_method(
-                        crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
-                            pane_id,
-                        }),
-                        outcome,
-                    );
+                    .find(|(rect, _, _)| super::contains(*rect, point))
+                    .map(|(_, server_id, pane_id)| (server_id.clone(), pane_id.clone()));
+                if let Some((server_id, pane_id)) = agent_pane_id {
+                    if server_id == self.active_server_id {
+                        self.push_endpoint_method(
+                            crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
+                                pane_id,
+                            }),
+                            outcome,
+                        );
+                    } else {
+                        outcome
+                            .actions
+                            .push(ClientShellAction::ActivatePane { server_id, pane_id });
+                    }
                     return;
                 }
                 let scrollbar_hit = self

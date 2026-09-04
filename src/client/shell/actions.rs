@@ -1,6 +1,68 @@
 use super::*;
 
 impl ClientShellState {
+    pub(super) fn fleet_agent_targets(&self) -> Vec<super::agent_sidebar::FleetAgentTarget> {
+        let Some(active_snapshot) = self.snapshot.as_deref() else {
+            return Vec::new();
+        };
+        super::agent_sidebar::ordered_fleet_agent_targets(
+            &super::agent_sidebar::AgentFleet {
+                active_snapshot,
+                server_ids: &self.server_ids,
+                server_lifecycle: &self.server_lifecycle,
+                server_snapshots: &self.server_snapshots,
+                active_server_id: &self.active_server_id,
+            },
+            self.config.agent_panel_sort,
+        )
+    }
+
+    fn fleet_agent_target_for_action(
+        &mut self,
+        action: crate::input::KeybindAction,
+    ) -> Option<super::agent_sidebar::FleetAgentTarget> {
+        use crate::input::KeybindAction;
+
+        let targets = self.fleet_agent_targets();
+        if targets.is_empty() {
+            return None;
+        }
+        let target = match action {
+            KeybindAction::FocusAgent(index) => targets.get(index)?.clone(),
+            KeybindAction::PreviousAgent | KeybindAction::NextAgent => {
+                let focused_pane_id = self
+                    .snapshot
+                    .as_deref()
+                    .and_then(|snapshot| snapshot.focused_pane_id.as_deref());
+                let current = targets.iter().position(|target| {
+                    target.server_id == self.active_server_id
+                        && Some(target.pane_id.as_str()) == focused_pane_id
+                });
+                let next = match (current, action) {
+                    (Some(current), KeybindAction::PreviousAgent) => {
+                        (current + targets.len() - 1) % targets.len()
+                    }
+                    (Some(current), KeybindAction::NextAgent) => (current + 1) % targets.len(),
+                    (None, KeybindAction::PreviousAgent) => targets.len() - 1,
+                    (None, KeybindAction::NextAgent) => 0,
+                    _ => unreachable!("relative fleet agent action"),
+                };
+                targets[next].clone()
+            }
+            _ => return None,
+        };
+        if !self.hits.agents.iter().any(|(_, server_id, pane_id)| {
+            server_id == &target.server_id && pane_id == &target.pane_id
+        }) {
+            let target_index = targets
+                .iter()
+                .position(|candidate| candidate == &target)
+                .unwrap_or_default();
+            self.agent_scroll = target_index.min(self.hits.agent_max_scroll);
+        }
+        Some(target)
+    }
+
     pub(crate) fn focus_workspace(&mut self, workspace_id: String) -> ClientShellInput {
         let mut outcome = ClientShellInput::default();
         self.push_endpoint_method(
@@ -39,6 +101,22 @@ impl ClientShellState {
                 self.persist_chrome_preferences(outcome);
             }
             crate::input::KeybindMatch::Action(action) => {
+                if self.server_ids.len() > 1
+                    && matches!(
+                        action,
+                        crate::input::KeybindAction::FocusAgent(_)
+                            | crate::input::KeybindAction::PreviousAgent
+                            | crate::input::KeybindAction::NextAgent
+                    )
+                {
+                    if let Some(target) = self.fleet_agent_target_for_action(action) {
+                        outcome.actions.push(ClientShellAction::ActivatePane {
+                            server_id: target.server_id,
+                            pane_id: target.pane_id,
+                        });
+                    }
+                    return;
+                }
                 if matches!(
                     action,
                     crate::input::KeybindAction::NewWorktree
@@ -965,7 +1043,7 @@ impl ClientShellState {
                     .hits
                     .agents
                     .iter()
-                    .any(|(_, visible_pane_id)| visible_pane_id == &pane_id)
+                    .any(|(_, _, visible_pane_id)| visible_pane_id == &pane_id)
                 {
                     self.agent_scroll = next.min(self.hits.agent_max_scroll);
                 }

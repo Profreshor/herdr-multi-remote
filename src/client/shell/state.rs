@@ -139,7 +139,7 @@ pub(super) struct ShellHitMap {
     pub(super) panes: Vec<PaneHit>,
     pub(super) popup: Option<PaneHit>,
     pub(super) pane_splits: Vec<PaneSplitHit>,
-    pub(super) agents: Vec<(Rect, String)>,
+    pub(super) agents: Vec<(Rect, String, String)>,
     pub(super) agent_body: Rect,
     pub(super) agent_scrollbar: Rect,
     pub(super) agent_scroll_metrics: Option<crate::pane::ScrollMetrics>,

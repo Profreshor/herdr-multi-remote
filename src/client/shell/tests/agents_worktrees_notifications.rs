@@ -510,7 +510,7 @@ fn agent_sidebar_honors_priority_symbols_tokens_and_stable_hits() {
             .hits
             .agents
             .first()
-            .map(|(_, pane_id)| pane_id.as_str()),
+            .map(|(_, _, pane_id)| pane_id.as_str()),
         Some("pane_2")
     );
 
@@ -535,7 +535,7 @@ fn agent_sidebar_honors_priority_symbols_tokens_and_stable_hits() {
             .hits
             .agents
             .first()
-            .map(|(_, pane_id)| pane_id.as_str()),
+            .map(|(_, _, pane_id)| pane_id.as_str()),
         Some("pane_2")
     );
     let body = state.hits.agent_body;
@@ -553,7 +553,7 @@ fn agent_sidebar_honors_priority_symbols_tokens_and_stable_hits() {
             .hits
             .agents
             .first()
-            .map(|(_, pane_id)| pane_id.as_str()),
+            .map(|(_, _, pane_id)| pane_id.as_str()),
         Some("pane_1")
     );
 
@@ -563,7 +563,7 @@ fn agent_sidebar_honors_priority_symbols_tokens_and_stable_hits() {
         .hits
         .agents
         .iter()
-        .find(|(_, pane_id)| pane_id == "pane_2")
+        .find(|(_, _, pane_id)| pane_id == "pane_2")
         .expect("blocked compact agent")
         .0;
     let row_start = blocked.y as usize * compact.width as usize + blocked.x as usize;
@@ -642,7 +642,7 @@ fn active_agent_view_controls_sidebar_order_and_focus_indices() {
             .hits
             .agents
             .iter()
-            .map(|(_, pane_id)| pane_id.as_str())
+            .map(|(_, _, pane_id)| pane_id.as_str())
             .collect::<Vec<_>>(),
         vec!["pane_2", "pane_3"]
     );

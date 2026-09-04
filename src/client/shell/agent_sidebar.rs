@@ -11,10 +11,36 @@ use ratatui::{
 use super::*;
 
 struct AgentRow {
+    server_label: Option<String>,
+    server_id: String,
     pane_id: String,
     status: crate::api::schema::AgentStatus,
     focused: bool,
     rows: Vec<Vec<crate::ui::ResolvedToken>>,
+}
+
+pub(super) struct AgentFleet<'a> {
+    pub(super) active_snapshot: &'a ClientShellSnapshot,
+    pub(super) server_ids: &'a [String],
+    pub(super) server_lifecycle: &'a BTreeMap<String, ClientServerLifecycle>,
+    pub(super) server_snapshots: &'a BTreeMap<String, Box<ClientShellSnapshot>>,
+    pub(super) active_server_id: &'a str,
+}
+
+impl AgentFleet<'_> {
+    fn snapshot_for(&self, server_id: &str) -> Option<&ClientShellSnapshot> {
+        if server_id == self.active_server_id {
+            Some(self.active_snapshot)
+        } else {
+            self.server_snapshots.get(server_id).map(Box::as_ref)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct FleetAgentTarget {
+    pub(super) server_id: String,
+    pub(super) pane_id: String,
 }
 
 pub(super) fn ordered_agent_pane_ids(
@@ -49,10 +75,62 @@ pub(super) fn ordered_agent_pane_ids(
         .collect()
 }
 
+pub(super) fn ordered_fleet_agent_targets(
+    fleet: &AgentFleet<'_>,
+    sort: crate::config::AgentPanelSortConfig,
+) -> Vec<FleetAgentTarget> {
+    if fleet.active_snapshot.agent_view_label.is_some() {
+        return ordered_agent_pane_ids(fleet.active_snapshot, sort)
+            .into_iter()
+            .map(|pane_id| FleetAgentTarget {
+                server_id: fleet.active_server_id.to_owned(),
+                pane_id,
+            })
+            .collect();
+    }
+
+    let mut agents = fleet
+        .server_ids
+        .iter()
+        .filter(|server_id| {
+            matches!(
+                fleet.server_lifecycle.get(server_id.as_str()),
+                Some(ClientServerLifecycle::Connected)
+            )
+        })
+        .flat_map(|server_id| {
+            fleet
+                .snapshot_for(server_id)
+                .into_iter()
+                .flat_map(move |snapshot| {
+                    snapshot.agents.iter().map(move |agent| {
+                        (
+                            FleetAgentTarget {
+                                server_id: server_id.clone(),
+                                pane_id: agent.pane_id.clone(),
+                            },
+                            agent.agent_status,
+                            agent.state_change_seq,
+                        )
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+    if sort == crate::config::AgentPanelSortConfig::Priority {
+        agents.sort_by_key(|(_, status, state_change_seq)| {
+            (
+                std::cmp::Reverse(status_priority(*status)),
+                std::cmp::Reverse(*state_change_seq),
+            )
+        });
+    }
+    agents.into_iter().map(|(target, _, _)| target).collect()
+}
+
 pub(super) fn render_agent_panel(
     buffer: &mut Buffer,
     area: Rect,
-    snapshot: &ClientShellSnapshot,
+    fleet: &AgentFleet<'_>,
     config: &ClientShellConfig,
     agent_scroll: &mut usize,
     hits: &mut ShellHitMap,
@@ -81,14 +159,12 @@ pub(super) fn render_agent_panel(
             .fg(config.palette.overlay0)
             .add_modifier(Modifier::BOLD),
     );
-    let sort_label =
-        snapshot
-            .agent_view_label
-            .as_deref()
-            .unwrap_or(match config.agent_panel_sort {
-                crate::config::AgentPanelSortConfig::Spaces => "grouped",
-                crate::config::AgentPanelSortConfig::Priority => "priority",
-            });
+    let sort_label = fleet.active_snapshot.agent_view_label.as_deref().unwrap_or(
+        match config.agent_panel_sort {
+            crate::config::AgentPanelSortConfig::Spaces => "grouped",
+            crate::config::AgentPanelSortConfig::Priority => "priority",
+        },
+    );
     let sort_width = display_width(sort_label).min(area.width as usize) as u16;
     let sort_rect = Rect::new(
         area.right().saturating_sub(sort_width),
@@ -96,11 +172,12 @@ pub(super) fn render_agent_panel(
         sort_width,
         1,
     );
-    hits.agent_sort_toggle = if config.mouse_capture && snapshot.agent_view_label.is_none() {
-        sort_rect
-    } else {
-        Rect::default()
-    };
+    hits.agent_sort_toggle =
+        if config.mouse_capture && fleet.active_snapshot.agent_view_label.is_none() {
+            sort_rect
+        } else {
+            Rect::default()
+        };
     put_text(
         buffer,
         sort_rect.x,
@@ -108,7 +185,7 @@ pub(super) fn render_agent_panel(
         sort_rect.width,
         sort_label,
         Style::default()
-            .fg(if snapshot.agent_view_label.is_some() {
+            .fg(if fleet.active_snapshot.agent_view_label.is_some() {
                 config.palette.accent
             } else {
                 config.palette.overlay0
@@ -116,7 +193,7 @@ pub(super) fn render_agent_panel(
             .add_modifier(Modifier::BOLD),
     );
 
-    let rows = agent_rows(snapshot, config);
+    let rows = agent_rows(fleet, config);
     let body = Rect::new(
         area.x,
         area.y.saturating_add(3),
@@ -126,7 +203,7 @@ pub(super) fn render_agent_panel(
     hits.agent_body = body;
     if body.is_empty() || rows.is_empty() {
         *agent_scroll = 0;
-        if !body.is_empty() && snapshot.agent_view_label.is_some() {
+        if !body.is_empty() && fleet.active_snapshot.agent_view_label.is_some() {
             put_text(
                 buffer,
                 body.x,
@@ -172,7 +249,8 @@ pub(super) fn render_agent_panel(
             break;
         }
         let rect = Rect::new(body.x, y, content_width, height);
-        hits.agents.push((rect, row.pane_id.clone()));
+        hits.agents
+            .push((rect, row.server_id.clone(), row.pane_id.clone()));
         render_agent_row(buffer, rect, row, config);
         y = y
             .saturating_add(height)
@@ -190,14 +268,15 @@ pub(super) fn render_agent_panel(
     }
 }
 
-fn agent_rows(snapshot: &ClientShellSnapshot, config: &ClientShellConfig) -> Vec<AgentRow> {
-    ordered_agent_pane_ids(snapshot, config.agent_panel_sort)
+fn agent_rows(fleet: &AgentFleet<'_>, config: &ClientShellConfig) -> Vec<AgentRow> {
+    ordered_fleet_agent_targets(fleet, config.agent_panel_sort)
         .into_iter()
-        .filter_map(|pane_id| {
+        .filter_map(|target| {
+            let snapshot = fleet.snapshot_for(&target.server_id)?;
             let agent = snapshot
                 .agents
                 .iter()
-                .find(|agent| agent.pane_id == pane_id)?;
+                .find(|agent| agent.pane_id == target.pane_id)?;
             let workspace = snapshot
                 .workspaces
                 .iter()
@@ -252,10 +331,14 @@ fn agent_rows(snapshot: &ClientShellSnapshot, config: &ClientShellConfig) -> Vec
                 },
                 state_text,
             );
+            let focused = fleet.active_server_id == target.server_id && agent.focused;
             Some(AgentRow {
-                pane_id: agent.pane_id.clone(),
+                server_label: (fleet.server_ids.len() > 1)
+                    .then(|| target.server_id.to_ascii_uppercase()),
+                server_id: target.server_id,
+                pane_id: target.pane_id,
                 status: agent.agent_status,
-                focused: agent.focused,
+                focused,
                 rows,
             })
         })
@@ -303,6 +386,18 @@ fn render_agent_row(buffer: &mut Buffer, rect: Rect, row: &AgentRow, config: &Cl
     for (index, tokens) in rows.iter().take(rect.height as usize).enumerate() {
         let indent = if index == 0 { 1 } else { 3 };
         let mut spans = vec![ratatui::text::Span::raw(" ".repeat(indent))];
+        let server_prefix = if index == 0 {
+            row.server_label
+                .as_deref()
+                .map(|label| format!("{label} · "))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let server_width = display_width(&server_prefix);
+        if !server_prefix.is_empty() {
+            spans.push(ratatui::text::Span::styled(server_prefix, secondary));
+        }
         spans.extend(crate::ui::resolved_token_spans(
             tokens,
             icon,
@@ -311,7 +406,9 @@ fn render_agent_row(buffer: &mut Buffer, rect: Rect, row: &AgentRow, config: &Cl
             secondary,
             secondary,
             palette,
-            rect.width.saturating_sub(indent as u16) as usize,
+            rect.width
+                .saturating_sub(indent as u16)
+                .saturating_sub(server_width.min(u16::MAX as usize) as u16) as usize,
         ));
         Paragraph::new(Line::from(spans)).style(row_style).render(
             Rect::new(rect.x, rect.y + index as u16, rect.width, 1),

@@ -151,7 +151,8 @@ pub(crate) fn render_collapsed_sidebar(
             status_icon(agent.agent_status, config.status_indicators),
             Style::default().fg(status_color(agent.agent_status, palette)),
         );
-        hits.agents.push((rect, pane_id));
+        hits.agents
+            .push((rect, active_server_id.to_owned(), pane_id));
     }
     hits.sidebar_toggle = if area.is_empty() || workspace_area.width == 0 {
         Rect::default()
@@ -652,10 +653,17 @@ pub(crate) fn render_sidebar(
         }
     }
 
+    let fleet = super::agent_sidebar::AgentFleet {
+        active_snapshot: snapshot,
+        server_ids: state.server_ids,
+        server_lifecycle: state.server_lifecycle,
+        server_snapshots: state.server_snapshots,
+        active_server_id: state.active_server_id,
+    };
     super::render_agent_panel(
         buffer,
         detail_area,
-        snapshot,
+        &fleet,
         config,
         state.agent_scroll,
         hits,

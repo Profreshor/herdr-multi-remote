@@ -119,6 +119,99 @@ fn fleet_sidebar_namespaces_duplicate_workspace_ids_and_routes_remote_clicks() {
 }
 
 #[test]
+fn fleet_agent_sidebar_lists_and_routes_agents_with_duplicate_resource_ids() {
+    let remote = |server: &str| {
+        let mut snapshot = snapshot();
+        snapshot.boot_id = format!("{server}-boot");
+        snapshot.workspaces[0].label = "TEST".into();
+        snapshot.agents.push(ClientShellAgent {
+            pane_id: "pane_1".into(),
+            workspace_id: "ws_1".into(),
+            tab_id: "tab_1".into(),
+            name: Some(format!("{server}-codex")),
+            display_agent: None,
+            agent: Some("codex".into()),
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            agent_status: AgentStatus::Idle,
+            state_change_seq: 1,
+            state_labels: Vec::new(),
+            tokens: Vec::new(),
+            focused: false,
+        });
+        snapshot
+    };
+
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.configure_servers(vec![
+        "local".into(),
+        "debian".into(),
+        "fedora".into(),
+        "windows".into(),
+    ]);
+    state.set_snapshot(Box::new(snapshot()));
+    for server in ["debian", "fedora", "windows"] {
+        state.set_server_lifecycle(server, ClientServerLifecycle::Connected);
+        state.set_server_snapshot(server.into(), Box::new(remote(server)));
+    }
+    state.set_pane_surface(surface());
+    let frame = state.compose(100, 40).expect("fleet agents frame");
+    let rendered = frame
+        .cells
+        .chunks(frame.width as usize)
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert_eq!(state.hits.agents.len(), 3);
+    assert!(rendered.contains("DEBIAN ·"));
+    assert!(rendered.contains("FEDORA ·"));
+    assert!(rendered.contains("WINDOWS ·"));
+    let remote_agent = state.hits.agents[1].0;
+    let click = state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: remote_agent.x,
+        row: remote_agent.y,
+        modifiers: crossterm::event::KeyModifiers::empty(),
+    })]);
+    assert!(matches!(
+        click.actions.as_slice(),
+        [ClientShellAction::ActivatePane { server_id, pane_id }]
+            if server_id == "fedora" && pane_id == "pane_1"
+    ));
+
+    let mut keyboard = ClientShellInput::default();
+    state.record_binding(
+        crate::input::KeybindMatch::Action(crate::input::KeybindAction::FocusAgent(2)),
+        &mut keyboard,
+    );
+    assert!(matches!(
+        keyboard.actions.as_slice(),
+        [ClientShellAction::ActivatePane { server_id, pane_id }]
+            if server_id == "windows" && pane_id == "pane_1"
+    ));
+
+    state.set_server_lifecycle(
+        "fedora",
+        ClientServerLifecycle::Reconnecting("offline".into()),
+    );
+    state
+        .compose(100, 40)
+        .expect("fleet agents after disconnect");
+    assert_eq!(state.hits.agents.len(), 2);
+    assert!(state
+        .hits
+        .agents
+        .iter()
+        .all(|(_, server_id, _)| server_id != "fedora"));
+}
+
+#[test]
 fn fleet_workspace_context_menu_does_not_cross_server_ownership() {
     let mut local = snapshot();
     local.workspaces[0].branch = None;

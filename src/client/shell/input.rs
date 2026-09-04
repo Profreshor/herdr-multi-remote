@@ -832,14 +832,18 @@ impl ClientShellState {
                 })
                 .is_some(),
             KeybindMatch::Action(KeybindAction::FocusAgent(index)) => {
-                self.snapshot.as_deref().is_some_and(|snapshot| {
-                    super::agent_sidebar::ordered_agent_pane_ids(
-                        snapshot,
-                        self.config.agent_panel_sort,
-                    )
-                    .get(*index)
-                    .is_some()
-                })
+                if self.server_ids.len() > 1 {
+                    self.fleet_agent_targets().get(*index).is_some()
+                } else {
+                    self.snapshot.as_deref().is_some_and(|snapshot| {
+                        super::agent_sidebar::ordered_agent_pane_ids(
+                            snapshot,
+                            self.config.agent_panel_sort,
+                        )
+                        .get(*index)
+                        .is_some()
+                    })
+                }
             }
             _ => true,
         };
