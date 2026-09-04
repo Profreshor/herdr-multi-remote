@@ -3,7 +3,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::{c_void, OsStr},
     mem::{size_of, MaybeUninit},
-    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle},
     path::PathBuf,
     ptr::{copy_nonoverlapping, null_mut},
     sync::{
@@ -14,6 +14,25 @@ use std::{
 };
 
 mod clipboard_image;
+
+pub(crate) fn abort_local_stream(stream: &crate::ipc::LocalStream) -> std::io::Result<()> {
+    let crate::ipc::LocalStream::NamedPipe(stream) = stream;
+    let disconnected = unsafe {
+        windows_sys::Win32::System::Pipes::DisconnectNamedPipe(
+            stream.as_handle().as_raw_handle() as _
+        )
+    };
+    if disconnected != 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_PIPE_NOT_CONNECTED as i32)
+    {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
 
 pub(super) fn read_terminal_grid_size() -> std::io::Result<(u16, u16)> {
     crossterm::terminal::size()

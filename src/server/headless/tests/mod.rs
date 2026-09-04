@@ -5592,6 +5592,39 @@ fn semantic_notifications_broadcast_only_to_client_shells() {
 }
 
 #[test]
+fn saturated_control_client_is_removed_without_blocking_healthy_delivery() {
+    let mut server = test_headless_server();
+    let stalled = ClientWriter::test_saturated_control();
+    let (healthy, healthy_control, _healthy_frames) = test_client_writer();
+    for (client_id, writer) in [(1, stalled), (2, healthy)] {
+        server.clients.insert(
+            client_id,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::ClientShell,
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                client_id,
+                RenderEncoding::SemanticFrame,
+                Some(writer),
+            ),
+        );
+    }
+
+    server.send_to_all_clients(ServerMessage::ReloadSoundConfig);
+
+    assert!(!server.clients.contains_key(&1));
+    assert!(server.clients.contains_key(&2));
+    assert_eq!(
+        read_server_message(
+            healthy_control
+                .recv_timeout(Duration::from_millis(100))
+                .expect("healthy client receives broadcast"),
+        ),
+        ServerMessage::ReloadSoundConfig
+    );
+}
+
+#[test]
 fn notification_show_uses_client_shell_policy_independent_of_server_delivery() {
     let mut server = test_headless_server();
     server.app.state.toast_config.delivery = config::ToastDelivery::Off;

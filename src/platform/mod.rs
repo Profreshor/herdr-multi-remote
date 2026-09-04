@@ -95,6 +95,18 @@ pub(crate) fn terminal_grid_size() -> std::io::Result<(u16, u16)> {
     Ok((cols, rows))
 }
 
+pub(crate) fn abort_local_stream(stream: &crate::ipc::LocalStream) -> std::io::Result<()> {
+    #[cfg(unix)]
+    return unix_common::abort_local_stream(stream);
+    #[cfg(windows)]
+    return windows::abort_local_stream(stream);
+    #[cfg(not(any(unix, windows)))]
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "local stream abort is unsupported on this platform",
+    ))
+}
+
 #[cfg(not(windows))]
 pub fn launch_server_daemon_command(command: &mut std::process::Command) -> std::io::Result<u32> {
     command.spawn().map(|child| child.id())

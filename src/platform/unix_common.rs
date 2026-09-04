@@ -1,5 +1,13 @@
 use std::path::{Path, PathBuf};
 
+pub(crate) fn abort_local_stream(stream: &crate::ipc::LocalStream) -> std::io::Result<()> {
+    match stream {
+        crate::ipc::LocalStream::UdSocket(stream) => {
+            stream.inner().shutdown(std::net::Shutdown::Both)
+        }
+    }
+}
+
 pub(super) fn read_terminal_grid_size() -> std::io::Result<(u16, u16)> {
     crossterm::terminal::window_size().map(|size| (size.columns, size.rows))
 }

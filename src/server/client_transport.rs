@@ -142,11 +142,20 @@ impl ClientWriter {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_saturated_control() -> Self {
+        let (writer, _queue) = test_writer_queue();
+        for _ in 0..MAX_CLIENT_CONTROL_MESSAGES {
+            writer.control.send(vec![b'x']).expect("control fits");
+        }
+        writer
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_channel(
         control: std::sync::mpsc::Sender<Vec<u8>>,
         render: std::sync::mpsc::SyncSender<Vec<u8>>,
     ) -> Self {
-        let queue = ClientWriterQueue::new();
+        let queue = ClientWriterQueue::new(None);
         let drain = queue.clone();
         let control_writer = ClientControlWriter::queue(queue.clone());
         let mut render_writer = ClientRenderWriter::queue(queue);
@@ -169,6 +178,18 @@ impl ClientWriter {
         });
         writer
     }
+}
+
+#[cfg(test)]
+fn test_writer_queue() -> (ClientWriter, Arc<ClientWriterQueue>) {
+    let queue = ClientWriterQueue::new(None);
+    (
+        ClientWriter {
+            control: ClientControlWriter::queue(queue.clone()),
+            render: ClientRenderWriter::queue(queue.clone()),
+        },
+        queue,
+    )
 }
 
 #[derive(Debug)]
@@ -260,6 +281,7 @@ struct ClientWriterQueueState {
     render: Option<Vec<u8>>,
     senders: usize,
     writer_alive: bool,
+    abort_stream: Option<LocalStream>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -269,10 +291,11 @@ enum ClientWriteItem {
 }
 
 impl ClientWriterQueue {
-    fn new() -> Arc<Self> {
+    fn new(abort_stream: Option<LocalStream>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(ClientWriterQueueState {
                 writer_alive: true,
+                abort_stream,
                 ..ClientWriterQueueState::default()
             }),
             ready: Condvar::new(),
@@ -295,14 +318,12 @@ impl ClientWriterQueue {
         if data.len() > MAX_CLIENT_CONTROL_BYTES {
             return Err(SendError(data));
         }
-        while state.writer_alive
-            && (state.control.len() >= MAX_CLIENT_CONTROL_MESSAGES
-                || state.control_bytes.saturating_add(data.len()) > MAX_CLIENT_CONTROL_BYTES)
+        if state.control.len() >= MAX_CLIENT_CONTROL_MESSAGES
+            || state.control_bytes.saturating_add(data.len()) > MAX_CLIENT_CONTROL_BYTES
         {
-            state = self
-                .ready
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            drop(state);
+            self.close_writer();
+            return Err(SendError(data));
         }
         if !state.writer_alive {
             return Err(SendError(data));
@@ -355,6 +376,9 @@ impl ClientWriterQueue {
     fn recv(&self) -> Option<ClientWriteItem> {
         let mut state = self.lock_state();
         loop {
+            if !state.writer_alive {
+                return None;
+            }
             if let Some(data) = state.control.pop_front() {
                 state.control_bytes = state.control_bytes.saturating_sub(data.len());
                 self.ready.notify_one();
@@ -381,14 +405,20 @@ impl ClientWriterQueue {
     }
 
     fn close_writer(&self) {
-        let mut state = self.lock_state();
-        state.writer_alive = false;
-        state.control.clear();
-        state.control_bytes = 0;
-        state.snapshot = None;
-        state.render = None;
-        state.ordered.clear();
+        let abort_stream = {
+            let mut state = self.lock_state();
+            state.writer_alive = false;
+            state.control.clear();
+            state.control_bytes = 0;
+            state.snapshot = None;
+            state.render = None;
+            state.ordered.clear();
+            state.abort_stream.take()
+        };
         self.ready.notify_all();
+        if let Some(stream) = abort_stream {
+            let _ = crate::platform::abort_local_stream(&stream);
+        }
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, ClientWriterQueueState> {
@@ -856,7 +886,7 @@ pub(crate) fn handle_client_handshake(
     )?;
 
     // Create separate channels for reliable control messages and droppable renders.
-    let writer_queue = ClientWriterQueue::new();
+    let writer_queue = ClientWriterQueue::new(Some(stream.try_clone()?));
     let writer = ClientWriter {
         control: ClientControlWriter::queue(writer_queue.clone()),
         render: ClientRenderWriter::queue(writer_queue.clone()),
@@ -1377,6 +1407,7 @@ fn client_read_loop(
 mod tests {
     use super::*;
     use interprocess::local_socket::traits::Listener as _;
+    use std::io::Read as _;
     use std::path::PathBuf;
 
     struct TestSocketPath(PathBuf);
@@ -1478,14 +1509,7 @@ mod tests {
     }
 
     fn test_queue_writer() -> (ClientWriter, Arc<ClientWriterQueue>) {
-        let queue = ClientWriterQueue::new();
-        (
-            ClientWriter {
-                control: ClientControlWriter::queue(queue.clone()),
-                render: ClientRenderWriter::queue(queue.clone()),
-            },
-            queue,
-        )
+        test_writer_queue()
     }
 
     fn frame_server_message(message: &ServerMessage) -> Vec<u8> {
@@ -1524,7 +1548,7 @@ mod tests {
     }
 
     #[test]
-    fn client_writer_queue_bounds_reliable_control_by_count() {
+    fn client_writer_queue_disconnects_saturated_control_without_blocking() {
         let (writer, queue) = test_queue_writer();
         for _ in 0..MAX_CLIENT_CONTROL_MESSAGES {
             writer.control.send(vec![b'x']).expect("control fits");
@@ -1532,18 +1556,24 @@ mod tests {
         let blocked = writer.control.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let sender = std::thread::spawn(move || done_tx.send(blocked.send(vec![b'y'])).unwrap());
-        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
-
-        assert_eq!(queue.recv(), Some(ClientWriteItem::Control(vec![b'x'])));
-        assert!(done_rx
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap()
-            .is_ok());
+        let result = done_rx.recv_timeout(Duration::from_millis(100));
+        if result.is_err() {
+            queue.close_writer();
+        }
         sender.join().unwrap();
+        assert!(
+            matches!(result, Ok(Err(SendError(_)))),
+            "a saturated client must fail without blocking the server loop"
+        );
+        assert_eq!(queue.recv(), None);
+        assert!(matches!(
+            writer.render.try_send(vec![b'z']),
+            Err(TrySendError::Disconnected(_))
+        ));
     }
 
     #[test]
-    fn client_writer_queue_bounds_reliable_control_by_bytes() {
+    fn client_writer_queue_disconnects_saturated_control_by_bytes() {
         let (writer, queue) = test_queue_writer();
         let frame_len = MAX_FRAME_SIZE + 4;
         for _ in 0..4 {
@@ -1552,38 +1582,37 @@ mod tests {
                 .send(vec![b'x'; frame_len])
                 .expect("control fits byte budget");
         }
-        let blocked = writer.control.clone();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let sender = std::thread::spawn(move || {
-            done_tx.send(blocked.send(vec![b'y'; frame_len])).unwrap();
-        });
-        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
-
-        let _ = queue.recv();
-        assert!(done_rx
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap()
-            .is_ok());
-        sender.join().unwrap();
+        assert!(matches!(
+            writer.control.send(vec![b'y'; frame_len]),
+            Err(SendError(_))
+        ));
+        assert_eq!(queue.recv(), None);
     }
 
     #[test]
-    fn closing_client_writer_wakes_a_saturated_control_sender() {
-        let (writer, queue) = test_queue_writer();
+    fn saturated_control_queue_aborts_the_peer_stream() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("saturated-control-abort");
+        let queue = ClientWriterQueue::new(Some(server_stream.try_clone().unwrap()));
+        let writer = ClientWriter {
+            control: ClientControlWriter::queue(queue.clone()),
+            render: ClientRenderWriter::queue(queue),
+        };
         for _ in 0..MAX_CLIENT_CONTROL_MESSAGES {
             writer.control.send(vec![b'x']).expect("control fits");
         }
-        let blocked = writer.control.clone();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let sender = std::thread::spawn(move || done_tx.send(blocked.send(vec![b'y'])).unwrap());
-        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        assert!(matches!(writer.control.send(vec![b'y']), Err(SendError(_))));
 
-        queue.close_writer();
-        assert!(done_rx
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap()
-            .is_err());
-        sender.join().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut byte = [0_u8; 1];
+            done_tx.send(client_stream.read(&mut byte)).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_millis(500));
+        drop(server_stream);
+        reader.join().unwrap();
+        let read = result.expect("saturated client peer observes transport closure");
+        assert!(matches!(read, Ok(0) | Err(_)));
     }
 
     #[test]
