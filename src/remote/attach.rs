@@ -235,7 +235,8 @@ pub(crate) fn connect_remote_client(
     cancelled: Arc<AtomicBool>,
 ) -> io::Result<(crate::ipc::LocalStream, RemoteClientBridge)> {
     let local_socket = local_forward_socket_path(&target, &session_name);
-    let remote_ssh = RemoteSsh::with_cancel(target.clone(), manage_ssh_config, cancelled, true);
+    let remote_ssh =
+        RemoteSsh::with_cancel(target.clone(), manage_ssh_config, cancelled.clone(), true);
     let prepared_remote = prepare_remote_herdr(&remote_ssh, &session_name, false, false)?;
     ensure_remote_server_ready(
         &remote_ssh,
@@ -253,6 +254,7 @@ pub(crate) fn connect_remote_client(
         remote_ssh.options(),
         PathBuf::from("ssh"),
         true,
+        cancelled,
     )?;
     let stream = crate::ipc::connect_local_stream(&local_socket)?;
     Ok((
@@ -2240,6 +2242,7 @@ impl SshStdioBridge {
             ssh_options,
             PathBuf::from("ssh"),
             false,
+            Arc::new(AtomicBool::new(false)),
         )
     }
 
@@ -2251,6 +2254,7 @@ impl SshStdioBridge {
         ssh_options: Option<&ManagedSshOptions>,
         ssh_program: PathBuf,
         batch_mode: bool,
+        cancelled: Arc<AtomicBool>,
     ) -> io::Result<Self> {
         crate::ipc::prepare_socket_path(&local_socket, |path| {
             format!("remote bridge is already listening at {}", path.display())
@@ -2272,7 +2276,7 @@ impl SshStdioBridge {
         let thread_stop = Arc::clone(&should_stop);
         let thread_ssh_options = ssh_options.cloned();
         let thread = thread::spawn(move || {
-            while !thread_stop.load(Ordering::Acquire) {
+            while !thread_stop.load(Ordering::Acquire) && !cancelled.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok(stream) => {
                         let stream = match prepare_remote_bridge_stream(stream) {
@@ -2294,6 +2298,7 @@ impl SshStdioBridge {
                             thread_ssh_options.as_ref(),
                             &thread_stop,
                             batch_mode,
+                            &cancelled,
                         ) {
                             if batch_mode {
                                 tracing::warn!(error = %err, "remote fleet bridge failed");
@@ -2411,6 +2416,7 @@ fn bridge_connection(
     ssh_options: Option<&ManagedSshOptions>,
     bridge_stop: &Arc<AtomicBool>,
     batch_mode: bool,
+    cancelled: &AtomicBool,
 ) -> io::Result<()> {
     let mut command = Command::new(ssh_program);
     apply_managed_ssh_options(&mut command, ssh_options);
@@ -2515,7 +2521,7 @@ fn bridge_connection(
                 break (Err(err), false);
             }
         }
-        if bridge_stop.load(Ordering::Acquire) {
+        if bridge_stop.load(Ordering::Acquire) || cancelled.load(Ordering::Acquire) {
             connection_stop.store(true, Ordering::Release);
             upload_stop.store(true, Ordering::Release);
             let _ = child.kill();
@@ -2555,7 +2561,7 @@ fn bridge_connection(
         .transpose()?
         .unwrap_or_default();
 
-    let stopping = bridge_stop.load(Ordering::Acquire);
+    let stopping = bridge_stop.load(Ordering::Acquire) || cancelled.load(Ordering::Acquire);
     let client_closed = client_closed.load(Ordering::Acquire);
     if !stopping && !client_closed {
         upload_result.map_err(|err| {
@@ -2703,13 +2709,15 @@ fn run_client_process(
 }
 
 fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
+    static NEXT_BRIDGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let attempt = NEXT_BRIDGE.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let target_clean = sanitize_path_component(target);
     let session_clean = sanitize_path_component(session_name);
-    let readable_name = format!("herdr-remote-{pid}-{target_clean}-{session_clean}.sock");
+    let readable_name = format!("herdr-remote-{pid}-{attempt}-{target_clean}-{session_clean}.sock");
     let target_prefix: String = target_clean.chars().take(8).collect();
     let hash = short_socket_hash(target, session_name);
-    let short_name = format!("herdr-r-{pid}-{target_prefix}-{hash}.sock");
+    let short_name = format!("herdr-r-{pid}-{attempt}-{target_prefix}-{hash}.sock");
     crate::platform::remote_bridge_endpoint_path(&readable_name, &short_name)
 }
 
@@ -2850,6 +2858,7 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
 
+        let cancelled = Arc::new(AtomicBool::new(false));
         let bridge = SshStdioBridge::start_with_program(
             "example".to_string(),
             RemoteHerdr::for_platform(RemotePlatform {
@@ -2861,6 +2870,7 @@ mod tests {
             None,
             ssh,
             false,
+            cancelled.clone(),
         )
         .unwrap();
         let _client = crate::ipc::connect_local_stream(&socket).unwrap();
@@ -2875,8 +2885,74 @@ mod tests {
         let drop_started = Instant::now();
         drop(bridge);
         assert!(drop_started.elapsed() < Duration::from_secs(1));
+        assert!(
+            !cancelled.load(Ordering::Acquire),
+            "bridge teardown must allow retries"
+        );
         assert!(!socket.exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_a_connector_unblocks_a_pending_bridge_handshake() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-cancel-handshake-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ssh = dir.join("ssh");
+        let started = dir.join("started");
+        let socket = dir.join("bridge.sock");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nprintf ready > '{}'\nwhile read line; do :; done\n",
+                started.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let bridge = SshStdioBridge::start_with_program(
+            "example".into(),
+            RemoteHerdr::for_platform(RemotePlatform::local()),
+            socket.clone(),
+            "default".into(),
+            None,
+            ssh,
+            true,
+            cancelled.clone(),
+        )
+        .unwrap();
+        let mut client = crate::ipc::connect_local_stream(&socket).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            let welcome: Result<crate::protocol::ServerMessage, _> =
+                crate::protocol::read_message(&mut client, crate::protocol::MAX_FRAME_SIZE);
+            done_tx.send(welcome.is_err()).unwrap();
+        });
+        for _ in 0..100 {
+            if started.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let child_started = started.exists();
+        cancelled.store(true, Ordering::Release);
+        let result = done_rx.recv_timeout(Duration::from_secs(1));
+        // Always release the reader, including when the cancellation regression fails.
+        drop(bridge);
+        reader.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(child_started, "fake ssh child did not start");
+        assert_eq!(
+            result,
+            Ok(true),
+            "cancellation must close the pending welcome read"
+        );
     }
 
     #[cfg(unix)]
@@ -4062,6 +4138,21 @@ mod tests {
             "socket path too long: {} ({} bytes)",
             path.display(),
             socket_path_byte_len(&path)
+        );
+    }
+
+    #[test]
+    fn remote_bridge_paths_distinguish_sanitized_targets_and_attempts() {
+        let _guard = remote_env_lock().lock().unwrap();
+        let targets = ["dev@box", "dev-box"];
+        assert_ne!(
+            local_forward_socket_path(targets[0], "default"),
+            local_forward_socket_path(targets[1], "default"),
+        );
+        assert_ne!(
+            local_forward_socket_path("box", "default"),
+            local_forward_socket_path("box", "default"),
+            "each registry entry and connection attempt owns its endpoint",
         );
     }
 

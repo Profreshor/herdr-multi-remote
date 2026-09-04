@@ -32,6 +32,26 @@ fn remote_connection_retry_policy_distinguishes_outages_from_permanent_errors() 
 }
 
 #[test]
+fn remote_handshake_transport_failures_remain_retryable() {
+    for error in [
+        protocol::FramingError::UnexpectedEof,
+        protocol::FramingError::Io(io::Error::from(io::ErrorKind::ConnectionReset)),
+        protocol::FramingError::Io(io::Error::from(io::ErrorKind::TimedOut)),
+        protocol::FramingError::Io(io::Error::from(io::ErrorKind::WouldBlock)),
+    ] {
+        let error = ClientError::from(error);
+        assert_eq!(remote_connection_retry_limit(&error), None, "{error}");
+    }
+    assert_eq!(
+        remote_connection_retry_limit(&ClientError::HandshakeRejected {
+            version: 0,
+            error: "unsupported endpoint".into(),
+        }),
+        Some(0)
+    );
+}
+
+#[test]
 fn short_remote_connections_back_off_without_spinning() {
     let mut backoff = RemoteReconnectBackoff::default();
     let server_id = ServerId::new("analytics");
@@ -804,6 +824,7 @@ fn reload_local_client_config_refreshes_local_client_presentation_state() {
         &mut draw_host_cursor,
         &mut remote_image_paste_key,
         &mut mouse_capture,
+        true,
     )
     .expect("valid live config");
 
@@ -811,6 +832,20 @@ fn reload_local_client_config_refreshes_local_client_presentation_state() {
     assert!(draw_host_cursor);
     assert!(!mouse_capture);
     assert_eq!(remotes["analytics"].host, "analytics");
+
+    // Explicit --remote and direct-attach clients still reload presentation
+    // preferences, but must never start the configured fleet.
+    mouse_capture = true;
+    assert!(reload_local_client_config(
+        &mut sound_config,
+        &mut redraw_on_focus_gained,
+        &mut draw_host_cursor,
+        &mut remote_image_paste_key,
+        &mut mouse_capture,
+        false,
+    )
+    .is_none());
+    assert!(!mouse_capture);
     let _ = std::fs::remove_file(path);
 }
 
@@ -840,6 +875,7 @@ fn reload_local_client_config_keeps_ui_preferences_when_ui_is_invalid() {
         &mut draw_host_cursor,
         &mut remote_image_paste_key,
         &mut mouse_capture,
+        true,
     );
 
     assert!(!mouse_capture);
@@ -878,6 +914,7 @@ fn reload_local_client_config_keeps_connections_when_remotes_section_is_invalid(
         &mut draw_host_cursor,
         &mut remote_image_paste_key,
         &mut mouse_capture,
+        true,
     )
     .is_none());
     assert!(!mouse_capture);

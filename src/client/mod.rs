@@ -537,6 +537,9 @@ fn spawn_remote_connector(
                     return;
                 }
                 Err(error) => {
+                    if cancelled.load(Ordering::Acquire) {
+                        return;
+                    }
                     attempts += 1;
                     let version_mismatch = matches!(error, ClientError::HandshakeRejected { .. })
                         || matches!(
@@ -544,14 +547,6 @@ fn spawn_remote_connector(
                             ClientError::ConnectionFailed(error)
                                 if crate::remote::is_remote_compatibility_error(error)
                         );
-                    let cancelled_error = matches!(
-                        &error,
-                        ClientError::ConnectionFailed(error)
-                            if error.kind() == io::ErrorKind::Interrupted
-                    );
-                    if cancelled_error && cancelled.load(Ordering::Acquire) {
-                        return;
-                    }
                     let retrying =
                         remote_connection_retry_limit(&error).is_none_or(|limit| attempts < limit);
                     send_connector_event(
@@ -598,7 +593,7 @@ fn send_connector_event(
 
 /// `None` means retry indefinitely with capped delay; zero means never retry.
 fn remote_connection_retry_limit(error: &ClientError) -> Option<usize> {
-    let ClientError::ConnectionFailed(error) = error else {
+    let (ClientError::ConnectionFailed(error) | ClientError::ConnectionLost(error)) = error else {
         return Some(0);
     };
     if crate::remote::is_remote_compatibility_error(error) {
@@ -1124,12 +1119,15 @@ fn activate_server(
         }
         return Ok(false);
     };
-    if servers.is_active(&target)
-        || servers
-            .get_mut(&target)
-            .is_none_or(|connection| connection.latest_snapshot.is_none())
+    if servers
+        .get_mut(&target)
+        .is_none_or(|connection| connection.latest_snapshot.is_none())
     {
         return Ok(false);
+    }
+    // Callers may still need to focus a pane/workspace on the selected server.
+    if servers.is_active(&target) {
+        return Ok(true);
     }
     let previous = servers
         .current_mut()
@@ -2788,6 +2786,7 @@ async fn run_client_loop(
                         &mut state.draw_host_cursor,
                         &mut state.remote_image_paste_key,
                         &mut mouse_capture,
+                        state.shell.is_some() && !is_remote_client,
                     );
                     if let Some((next_remotes, next_manage_ssh_config)) = reloaded_remotes {
                         let (next_ids, removed, added) = remote_config_delta(
@@ -3331,6 +3330,7 @@ fn reload_local_client_config(
         crossterm::event::KeyModifiers,
     )>,
     mouse_capture: &mut bool,
+    allow_remotes: bool,
 ) -> Option<(
     std::collections::BTreeMap<String, crate::config::RemoteServerConfig>,
     bool,
@@ -3357,6 +3357,9 @@ fn reload_local_client_config(
                 *remote_image_paste_key = client_remote_image_paste_key(&loaded.config);
             }
             debug!("reloaded local client config");
+            if !allow_remotes {
+                return None;
+            }
             if invalid_section("remote") || invalid_section("remotes") {
                 warn!("invalid remote config; keeping current remote connections");
                 None

@@ -1,6 +1,124 @@
 use super::*;
 
 #[test]
+fn fleet_agent_shortcuts_dispatch_to_the_already_active_server() {
+    use crate::client::{
+        finish_client_shell_input, ClientState, ServerConnection, ServerConnections,
+    };
+    use interprocess::local_socket::traits::Listener as _;
+
+    struct NoInputSource;
+    impl crate::platform::PrefixInputSource for NoInputSource {
+        fn switch_to_ascii(&mut self) {}
+        fn restore(&mut self) {}
+    }
+
+    for action in [
+        crate::input::KeybindAction::FocusAgent(0),
+        crate::input::KeybindAction::NextAgent,
+        crate::input::KeybindAction::PreviousAgent,
+    ] {
+        let path = crate::platform::remote_private_temp_base()
+            .join(format!("herdr-focus-dispatch-{}.sock", std::process::id()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let listener = crate::ipc::bind_local_listener(&path).unwrap();
+        let stream = crate::ipc::connect_local_stream(&path).unwrap();
+        let mut peer = listener.accept().unwrap();
+        let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let request = crate::protocol::read_message::<_, ClientMessage>(
+                &mut peer,
+                crate::protocol::MAX_FRAME_SIZE,
+            );
+            let _ = sent_tx.send(request);
+        });
+
+        let mut projected = snapshot();
+        let mut other_pane = projected.panes[0].clone();
+        other_pane.pane_id = "pane_2".into();
+        other_pane.focused = false;
+        projected.panes.push(other_pane);
+        projected.agents.push(ClientShellAgent {
+            pane_id: "pane_2".into(),
+            workspace_id: "ws_1".into(),
+            tab_id: "tab_1".into(),
+            name: None,
+            display_agent: None,
+            agent: Some("pi".into()),
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            agent_status: AgentStatus::Idle,
+            state_change_seq: 1,
+            state_labels: Vec::new(),
+            tokens: Vec::new(),
+            focused: false,
+        });
+        let mut connection = ServerConnection::local(stream, None, false);
+        connection.latest_snapshot = Some(Box::new(projected.clone()));
+        let mut servers = ServerConnections::with_local(connection);
+        servers.set_fleet_mode(true);
+        let mut shell = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        shell.configure_servers(vec!["local".into(), "analytics".into()]);
+        shell.set_snapshot(Box::new(projected));
+        let mut outcome = ClientShellInput::default();
+        shell.record_binding(crate::input::KeybindMatch::Action(action), &mut outcome);
+        let mut state = ClientState {
+            blit_encoder: crate::protocol::render_ansi::BlitEncoder::new(),
+            mouse_capture_active: false,
+            endpoint_mouse_capture_requested: false,
+            endpoint_sgr_pixels_requested: false,
+            direct_mouse_capture_preference: false,
+            shell_mouse_capture_preference: false,
+            direct_keyboard_protocol: Default::default(),
+            pane_keyboard_report_all: false,
+            keyboard_report_all_active: false,
+            reported_size: (100, 30),
+            reported_cell_size: (0, 0),
+            sound_config: Default::default(),
+            kitty_graphics_enabled: false,
+            pixel_geometry_enabled: false,
+            pixel_geometry_exact: false,
+            #[cfg(unix)]
+            direct_graphics_response: Default::default(),
+            #[cfg(unix)]
+            retired_direct_graphics: None,
+            #[cfg(unix)]
+            pending_surface_graphics: Default::default(),
+            #[cfg(unix)]
+            direct_graphics_owners: Default::default(),
+            attach_escape: None,
+            #[cfg(unix)]
+            mouse_scroll_lines: 1,
+            remote_image_paste_key: None,
+            redraw_on_focus_gained: false,
+            repaint_pending: false,
+            draw_host_cursor: false,
+            detached_process_children: Vec::new(),
+            shell: Some(shell),
+        };
+        finish_client_shell_input(&mut state, outcome, None, &mut servers, &mut NoInputSource)
+            .unwrap();
+        let sent = sent_rx.recv_timeout(std::time::Duration::from_secs(1));
+        drop(servers);
+        reader.join().unwrap();
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+        let ClientMessage::ClientShellEndpointRequest { boot_id, request } =
+            sent.expect("shortcut must send a focus request").unwrap()
+        else {
+            panic!("expected pane focus endpoint request");
+        };
+        assert_eq!(boot_id, "boot-1");
+        let request: crate::api::schema::Request = serde_json::from_str(&request).unwrap();
+        assert!(
+            matches!(request.method, crate::api::schema::Method::PaneFocus(target)
+            if target.pane_id == "pane_2")
+        );
+    }
+}
+
+#[test]
 fn global_menu_only_adds_server_switching_for_multiple_connections() {
     let projected = snapshot();
     let local = super::super::global_menu::global_menu_items(
