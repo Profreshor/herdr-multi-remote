@@ -1,25 +1,44 @@
 # herdr
 
+> **Downstream fork — Profreshor/herdr-multi-remote.** This build keeps the
+> `herdr` executable, configuration, and artifact names for compatibility, but
+> publishes and updates from this repository only. It is stable-channel-only
+> today; preview releases are not provided. Upstream Herdr remains at
+> [herdrdev/herdr](https://github.com/herdrdev/herdr).
+
+Status: actively maintained downstream fork; release automation and direct
+install/update paths are fork-owned. Package-manager distribution is not
+provided by this fork.
+
+## What this fork adds
+
+One client can operate its local Herdr server and several independent Herdr
+servers over SSH. Each machine keeps ownership of its PTYs, processes,
+workspaces, and agents; the client groups them by machine and routes each action
+to the owning server. A disconnected remote does not take healthy servers down.
+
+Add normal SSH hosts or aliases to Herdr's existing config:
+
+```toml
+[remotes.linux]
+host = "dev@linux.example.com"
+
+[remotes.mac]
+host = "dev@mac.example.com"
+```
+
 
 <p align="center">
   <img src="assets/logo.png" alt="herdr" width="100" />
 </p>
 
 <p align="center">
-  <a href="https://herdr.dev">herdr.dev</a> · <a href="#install">install</a> · <a href="https://herdr.dev/docs/quick-start/">quick start</a> · <a href="https://herdr.dev/docs/">docs</a>
-</p>
-
-<p align="center">
-  English · <a href="README.zh-CN.md">简体中文</a>
+  <a href="https://github.com/Profreshor/herdr-multi-remote">fork repository</a> · <a href="#install">install</a> · <a href="https://herdr.dev/docs/quick-start/">upstream quick start</a> · <a href="https://herdr.dev/docs/">upstream docs</a>
 </p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-666666?labelColor=333333" alt="Apache 2.0 license" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases"><img src="https://img.shields.io/github/downloads/herdrdev/herdr/total?labelColor=333333&color=666666" alt="total GitHub release downloads" /></a>
-  <a href="https://github.com/herdrdev/herdr/stargazers"><img src="https://img.shields.io/github/stars/herdrdev/herdr?labelColor=333333&color=666666&logo=github" alt="GitHub stars" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases/latest"><img src="https://img.shields.io/github/v/release/herdrdev/herdr?label=release&labelColor=333333&color=666666" alt="latest stable release" /></a>
-  <a href="https://formulae.brew.sh/formula/herdr"><img src="https://img.shields.io/homebrew/v/herdr?label=homebrew&labelColor=333333&color=666666" alt="Homebrew version" /></a>
-  <a href="https://x.com/herdrdev"><img src="https://img.shields.io/badge/follow-%40herdrdev-000000?logo=x&logoColor=white" alt="follow @herdrdev on X" /></a>
+  <a href="https://github.com/Profreshor/herdr-multi-remote/releases"><img src="https://img.shields.io/github/v/release/Profreshor/herdr-multi-remote?label=release&labelColor=333333&color=666666" alt="latest stable release" /></a>
 </p>
 
 ---
@@ -41,10 +60,17 @@ https://github.com/user-attachments/assets/043ec09f-4bdd-41d5-aee0-8fda6b83e267
 ## install
 
 ```bash
-curl -fsSL https://herdr.dev/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Profreshor/herdr-multi-remote/master/distribution/install.sh | sh
 ```
 
-or `brew install herdr` · `mise use -g herdr` · windows: `powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"` · [endpoint-protected Windows](https://herdr.dev/docs/windows-beta/) · [binaries](https://github.com/herdrdev/herdr/releases)
+Windows: `powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/Profreshor/herdr-multi-remote/master/distribution/install.ps1 | iex"` · cmd: `curl.exe -fsSLo install.cmd https://raw.githubusercontent.com/Profreshor/herdr-multi-remote/master/distribution/install.cmd && install.cmd && del install.cmd` · [binaries](https://github.com/Profreshor/herdr-multi-remote/releases)
+
+Fork defaults are stable-only and use the existing Herdr configuration format. For example:
+
+```toml
+[update]
+channel = "stable"
+```
 
 then start it where the work lives:
 
@@ -56,13 +82,11 @@ run your agents, split panes, walk away. `ctrl+b q` detaches, `herdr` reattaches
 
 ## docs
 
-everything lives at [herdr.dev/docs](https://herdr.dev/docs/): [quick start](https://herdr.dev/docs/quick-start/) · [concepts](https://herdr.dev/docs/concepts/) · [supported agents](https://herdr.dev/docs/agents/) · [keyboard](https://herdr.dev/docs/keyboard/) · [configuration](https://herdr.dev/docs/configuration/) · [session state](https://herdr.dev/docs/session-state/) · [remote](https://herdr.dev/docs/persistence-remote/) · [integrations](https://herdr.dev/docs/integrations/) · [plugins](https://herdr.dev/docs/plugins/) · [socket api](https://herdr.dev/docs/socket-api/)
+Upstream Herdr's documentation covers the shared runtime and interface at [herdr.dev/docs](https://herdr.dev/docs/): [quick start](https://herdr.dev/docs/quick-start/) · [concepts](https://herdr.dev/docs/concepts/) · [supported agents](https://herdr.dev/docs/agents/) · [keyboard](https://herdr.dev/docs/keyboard/) · [configuration](https://herdr.dev/docs/configuration/) · [session state](https://herdr.dev/docs/session-state/) · [remote](https://herdr.dev/docs/persistence-remote/) · [integrations](https://herdr.dev/docs/integrations/) · [plugins](https://herdr.dev/docs/plugins/) · [socket api](https://herdr.dev/docs/socket-api/)
 
 ## thanks
 
 every past sponsor and backer is listed in [SPONSORS.md](./SPONSORS.md) — thank you 🐑
-
-enterprise / partnership: hey@herdr.dev
 
 ## agent instructions
 
@@ -71,8 +95,8 @@ if you are an ai agent helping with this repository, read [`AGENTS.md`](./AGENTS
 ## development
 
 ```bash
-git clone https://github.com/herdrdev/herdr
-cd herdr
+git clone https://github.com/Profreshor/herdr-multi-remote
+cd herdr-multi-remote
 cargo build --release
 
 just test        # unit tests
