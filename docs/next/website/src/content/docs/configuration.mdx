@@ -119,6 +119,23 @@ manage_ssh_config = true
 
 When enabled, `herdr --remote` writes a private temporary SSH config that includes your user and system SSH configs first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own keepalive settings win. Linux and macOS clients also use a private per-attach OpenSSH control socket to reuse the first authenticated connection; Windows OpenSSH does not. Set `manage_ssh_config = false` to run remote attach through plain `ssh` without Herdr's generated config or control socket.
 
+To keep local Herdr and several remote Herdr servers in one client, add named remote tables. `host` accepts the same OpenSSH target or alias as `herdr --remote`; `session` is optional, and `enabled` defaults to `true`.
+
+```toml
+[remotes.analytics]
+host = "analytics-prod"
+
+[remotes.portal-staging]
+host = "portal-staging"
+session = "agents"
+
+[remotes.spare]
+host = "spare-vm"
+enabled = false
+```
+
+Herdr uses normal OpenSSH authentication and does not store keys or passwords. Provision each machine once with `herdr --remote <host>` if it does not already have a compatible Herdr binary. Fleet connections are non-interactive: unavailable machines remain visible and retry in the background without blocking healthy machines.
+
 ## Keybindings
 
 For a guided introduction to the prefix and a vetted prefix-free setup, see [Keyboard](/docs/keyboard/).

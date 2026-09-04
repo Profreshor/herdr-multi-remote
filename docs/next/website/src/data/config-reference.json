@@ -1435,6 +1435,18 @@
       ]
     },
     {
+      "id": "remotes",
+      "title": "Multi-server remotes",
+      "keys": [
+        {
+          "key": "remotes",
+          "type": "table",
+          "default": "{}",
+          "description": "Named remote servers. Each [remotes.<id>] table accepts host, optional session, and enabled (default true)."
+        }
+      ]
+    },
+    {
       "id": "advanced",
       "title": "Advanced",
       "keys": [
