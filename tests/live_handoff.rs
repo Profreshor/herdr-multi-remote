@@ -1454,19 +1454,31 @@ fn live_handoff_keeps_agent_started_pane_after_agent_exits() {
         .unwrap()
         .to_string();
 
-    let started = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:agent-start",
-            "method": "agent.start",
-            "params": {
-                "name": "handoff-agent",
-                "kind": "pi",
-                "pane_id": pane_id,
-                "timeout_ms": 5000
-            }
-        }),
-    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let started = loop {
+        let response = request(
+            &api_socket,
+            serde_json::json!({
+                "id": "test:agent-start",
+                "method": "agent.start",
+                "params": {
+                    "name": "handoff-agent",
+                    "kind": "pi",
+                    "pane_id": pane_id,
+                    "timeout_ms": 5000
+                }
+            }),
+        );
+        if response.get("result").is_some() {
+            break response;
+        }
+        assert_eq!(response["error"]["code"], "agent_pane_busy", "{response}");
+        assert!(
+            Instant::now() < deadline,
+            "pane shell did not become available: {response}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
     assert_ok(started);
     support::wait_for_file(&started_marker, Duration::from_secs(5));
 
