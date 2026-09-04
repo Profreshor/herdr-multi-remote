@@ -28,6 +28,13 @@ fn clipboard_image_targets_the_focused_pane_or_active_popup() {
     );
     state.overlay = Some(ClientShellOverlay::Onboarding);
     assert_eq!(state.clipboard_image_target(), None);
+
+    state.overlay = None;
+    state.set_server_lifecycle(
+        "local",
+        ClientServerLifecycle::Reconnecting("connection closed".into()),
+    );
+    assert_eq!(state.clipboard_image_target(), None);
 }
 
 #[test]

@@ -8,6 +8,94 @@ fn env_lock() -> &'static Mutex<()> {
 }
 
 #[test]
+fn remote_connection_retry_policy_distinguishes_outages_from_permanent_errors() {
+    let missing = ClientError::ConnectionFailed(io::Error::new(
+        io::ErrorKind::NotFound,
+        "no compatible Herdr endpoint is installed",
+    ));
+    let auth = ClientError::ConnectionFailed(io::Error::other(
+        "remote platform detection failed: Permission denied (publickey)",
+    ));
+    let transient = ClientError::ConnectionFailed(io::Error::new(
+        io::ErrorKind::ConnectionReset,
+        "connection reset",
+    ));
+    let unknown = ClientError::ConnectionFailed(io::Error::other("unexpected ssh failure"));
+
+    assert_eq!(remote_connection_retry_limit(&missing), Some(0));
+    assert_eq!(remote_connection_retry_limit(&auth), Some(0));
+    assert_eq!(remote_connection_retry_limit(&transient), None);
+    assert_eq!(
+        remote_connection_retry_limit(&unknown),
+        Some(MAX_REMOTE_RETRY_ATTEMPTS)
+    );
+}
+
+#[test]
+fn short_remote_connections_back_off_without_spinning() {
+    let mut backoff = RemoteReconnectBackoff::default();
+    let server_id = ServerId::new("analytics");
+    let started = std::time::Instant::now();
+
+    for (attempt, expected) in [(1, 1), (2, 2), (3, 4), (4, 8), (5, 15), (6, 15)] {
+        let connected_at = started + Duration::from_secs(attempt as u64 * 2);
+        backoff.connected(server_id.clone(), connected_at);
+        assert_eq!(
+            backoff
+                .retry_delay_after_disconnect(&server_id, connected_at + Duration::from_secs(1))
+                .as_secs(),
+            expected
+        );
+    }
+
+    backoff.connected(server_id.clone(), started);
+    assert_eq!(
+        backoff
+            .retry_delay_after_disconnect(&server_id, started + REMOTE_CONNECTION_STABLE_AFTER)
+            .as_secs(),
+        1
+    );
+}
+
+#[test]
+fn connector_event_send_observes_cancellation_when_queue_is_full() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    tx.try_send(ClientLoopEvent::Timer).unwrap();
+    let cancelled = AtomicBool::new(true);
+
+    send_connector_event(&tx, ClientLoopEvent::Timer, &cancelled);
+}
+
+#[test]
+fn server_message_admission_is_bounded_per_connection() {
+    let noisy = ServerMessageAdmission::new();
+    let first = noisy.acquire().expect("first noisy event is admitted");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let second = noisy.acquire();
+        admitted_tx.send(second.is_some()).unwrap();
+    });
+    started_rx.recv().unwrap();
+    assert!(
+        admitted_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+        "one connection admitted two undrained messages"
+    );
+
+    let healthy = ServerMessageAdmission::new();
+    let healthy_event = healthy.acquire();
+    assert!(
+        healthy_event.is_some(),
+        "noisy connection blocked a sibling"
+    );
+
+    drop(first);
+    assert!(admitted_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+    waiter.join().unwrap();
+}
+
+#[test]
 fn resize_signal_reports_even_when_polled_size_is_unchanged() {
     let size = (120, 40, 8, 16, true);
     assert!(resize_report_required(true, size, size));
@@ -15,6 +103,77 @@ fn resize_signal_reports_even_when_polled_size_is_unchanged() {
     assert!(resize_report_required(false, (120, 41, 8, 16, true), size));
     assert!(resize_report_required(false, (120, 40, 9, 18, true), size));
     assert!(resize_report_required(false, (120, 40, 8, 16, false), size));
+}
+
+#[test]
+fn hidden_servers_drop_render_frames_but_keep_semantic_events() {
+    let frame = ServerMessage::Terminal(crate::protocol::TerminalFrame {
+        seq: 1,
+        width: 80,
+        height: 24,
+        full: true,
+        bytes: Vec::new(),
+    });
+    let notification = ServerMessage::SemanticNotification(crate::protocol::SemanticNotification {
+        kind: crate::protocol::SemanticNotificationKind::Custom,
+        title: "done".into(),
+        body: None,
+        sound: None,
+        agent: None,
+        workspace_id: None,
+        tab_id: None,
+        pane_id: None,
+        position: None,
+    });
+    let snapshot = ServerMessage::EndpointControl {
+        kind: crate::protocol::endpoint::ENDPOINT_SNAPSHOT_KIND.into(),
+        data: "{}".into(),
+    };
+    let noise = ServerMessage::EndpointControl {
+        kind: "future.noisy.control".into(),
+        data: "{}".into(),
+    };
+    let reload = ServerMessage::ReloadSoundConfig;
+
+    assert!(!server_message_reaches_main(false, false, &frame));
+    assert!(server_message_reaches_main(false, false, &notification));
+    assert!(server_message_reaches_main(false, false, &snapshot));
+    assert!(!server_message_reaches_main(false, false, &noise));
+    assert!(!server_message_reaches_main(false, false, &reload));
+    assert!(server_message_reaches_main(false, true, &reload));
+    assert!(server_message_reaches_main(true, false, &frame));
+}
+
+#[test]
+fn remote_config_delta_adds_removes_and_reconnects_changed_servers() {
+    let remote = |host: &str| crate::config::RemoteServerConfig {
+        host: host.into(),
+        session: None,
+        enabled: true,
+    };
+    let previous = std::collections::BTreeMap::from([
+        ("removed".into(), remote("old")),
+        ("changed".into(), remote("before")),
+        ("stable".into(), remote("same")),
+    ]);
+    let next = std::collections::BTreeMap::from([
+        ("changed".into(), remote("after")),
+        ("stable".into(), remote("same")),
+        ("added".into(), remote("new")),
+    ]);
+
+    let (ids, removed, added) = remote_config_delta(&previous, true, &next, true);
+
+    assert_eq!(
+        ids,
+        std::collections::BTreeSet::from([
+            "added".to_owned(),
+            "changed".to_owned(),
+            "stable".to_owned(),
+        ])
+    );
+    assert_eq!(removed, vec!["removed", "changed"]);
+    assert_eq!(added, vec!["added", "changed"]);
 }
 
 #[test]
@@ -628,7 +787,7 @@ fn reload_local_client_config_refreshes_local_client_presentation_state() {
     ));
     std::fs::write(
         &path,
-        "[ui]\nredraw_on_focus_gained = false\nhost_cursor = \"drawn\"\nmouse_capture = false\n",
+        "[ui]\nredraw_on_focus_gained = false\nhost_cursor = \"drawn\"\nmouse_capture = false\n\n[remotes.analytics]\nhost = \"analytics\"\n",
     )
     .unwrap();
     let path_string = path.to_string_lossy().to_string();
@@ -639,17 +798,19 @@ fn reload_local_client_config_refreshes_local_client_presentation_state() {
     let mut remote_image_paste_key = None;
     let mut mouse_capture = true;
 
-    reload_local_client_config(
+    let (remotes, _) = reload_local_client_config(
         &mut sound_config,
         &mut redraw_on_focus_gained,
         &mut draw_host_cursor,
         &mut remote_image_paste_key,
         &mut mouse_capture,
-    );
+    )
+    .expect("valid live config");
 
     assert!(!redraw_on_focus_gained);
     assert!(draw_host_cursor);
     assert!(!mouse_capture);
+    assert_eq!(remotes["analytics"].host, "analytics");
     let _ = std::fs::remove_file(path);
 }
 
@@ -673,7 +834,7 @@ fn reload_local_client_config_keeps_ui_preferences_when_ui_is_invalid() {
     let mut remote_image_paste_key = None;
     let mut mouse_capture = false;
 
-    reload_local_client_config(
+    let _ = reload_local_client_config(
         &mut sound_config,
         &mut redraw_on_focus_gained,
         &mut draw_host_cursor,
@@ -684,6 +845,42 @@ fn reload_local_client_config_keeps_ui_preferences_when_ui_is_invalid() {
     assert!(!mouse_capture);
     assert!(!redraw_on_focus_gained);
     assert!(draw_host_cursor);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn reload_local_client_config_keeps_connections_when_remotes_section_is_invalid() {
+    let _guard = crate::config::test_config_env_lock().lock().unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "herdr-client-invalid-remotes-reload-{}-{}.toml",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &path,
+        "[ui]\nmouse_capture = false\n\n[remotes]\nanalytics = \"invalid\"\n",
+    )
+    .unwrap();
+    let path_string = path.to_string_lossy().to_string();
+    let _env = EnvVarGuard::set(crate::config::CONFIG_PATH_ENV_VAR, &path_string);
+    let mut sound_config = crate::config::SoundConfig::default();
+    let mut redraw_on_focus_gained = true;
+    let mut draw_host_cursor = false;
+    let mut remote_image_paste_key = None;
+    let mut mouse_capture = true;
+
+    assert!(reload_local_client_config(
+        &mut sound_config,
+        &mut redraw_on_focus_gained,
+        &mut draw_host_cursor,
+        &mut remote_image_paste_key,
+        &mut mouse_capture,
+    )
+    .is_none());
+    assert!(!mouse_capture);
     let _ = std::fs::remove_file(path);
 }
 

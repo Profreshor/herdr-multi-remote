@@ -541,6 +541,7 @@ fn config_diagnostic_offsets_only_the_pane_rows_it_overlaps() {
     state.set_snapshot(Box::new(endpoint_snapshot));
     state.set_pane_surface(surface());
     state.visible_notification = Some(ClientVisibleNotification {
+        server_id: "local".into(),
         event: SemanticNotification {
             kind: SemanticNotificationKind::Custom,
             title: "notification".into(),

@@ -1276,3 +1276,198 @@ fn semantic_notifications_use_client_policy_and_stable_navigation_targets() {
     assert!(state.visible_notification.is_none());
     assert_eq!(state.pending_notifications.len(), 1);
 }
+
+#[test]
+fn remote_notifications_keep_server_ownership() {
+    let mut config = ClientShellConfig::from_config(&Config::default());
+    config.toast_delivery = crate::config::ToastDelivery::Herdr;
+    config.toast_delay_seconds = 0;
+    let mut state = ClientShellState::new(config);
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state.configure_servers(vec!["local".into(), "analytics".into()]);
+
+    let (_, repaint) = state.receive_notification_from(
+        "analytics".into(),
+        SemanticNotification {
+            kind: SemanticNotificationKind::Custom,
+            title: "deploy finished".into(),
+            body: None,
+            sound: None,
+            agent: None,
+            workspace_id: Some("ws_1".into()),
+            tab_id: Some("tab_1".into()),
+            pane_id: Some("pane_1".into()),
+            position: None,
+        },
+        std::time::Instant::now(),
+    );
+
+    assert!(repaint);
+    let frame = state.compose(100, 28).expect("notification frame");
+    let rendered = frame
+        .cells
+        .chunks(frame.width as usize)
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("[ANALYTICS] deploy finished"));
+
+    let mut outcome = ClientShellInput::default();
+    state.focus_visible_notification(&mut outcome);
+    assert!(matches!(
+        outcome.actions.as_slice(),
+        [ClientShellAction::ActivatePane { server_id, pane_id }]
+            if server_id == "analytics" && pane_id == "pane_1"
+    ));
+}
+
+#[test]
+fn remote_notifications_survive_switching_server_snapshots() {
+    let mut config = ClientShellConfig::from_config(&Config::default());
+    config.toast_delivery = crate::config::ToastDelivery::Herdr;
+    config.toast_delay_seconds = 0;
+    let mut state = ClientShellState::new(config);
+    state.set_snapshot(Box::new(snapshot()));
+    state.configure_servers(vec!["local".into(), "analytics".into()]);
+    state.receive_notification_from(
+        "analytics".into(),
+        SemanticNotification {
+            kind: SemanticNotificationKind::Custom,
+            title: "deploy finished".into(),
+            body: None,
+            sound: None,
+            agent: None,
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+            position: None,
+        },
+        std::time::Instant::now(),
+    );
+    let mut remote = snapshot();
+    remote.boot_id = "analytics-boot".into();
+    state.set_server_snapshot("analytics".into(), Box::new(remote.clone()));
+
+    state.set_active_server("analytics".into());
+    state.set_snapshot(Box::new(remote));
+
+    assert_eq!(
+        state
+            .visible_notification
+            .as_ref()
+            .map(|notification| notification.server_id.as_str()),
+        Some("analytics")
+    );
+}
+
+#[test]
+fn removed_or_disconnected_servers_drop_their_notifications() {
+    let mut config = ClientShellConfig::from_config(&Config::default());
+    config.toast_delivery = crate::config::ToastDelivery::Herdr;
+    config.toast_delay_seconds = 60;
+    let mut state = ClientShellState::new(config);
+    state.set_snapshot(Box::new(snapshot()));
+    state.configure_servers(vec!["local".into(), "analytics".into()]);
+    let now = std::time::Instant::now();
+
+    state.receive_notification_from(
+        "analytics".into(),
+        SemanticNotification {
+            kind: SemanticNotificationKind::Custom,
+            title: "visible".into(),
+            body: None,
+            sound: None,
+            agent: None,
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+            position: None,
+        },
+        now,
+    );
+    state.receive_notification_from(
+        "analytics".into(),
+        SemanticNotification {
+            kind: SemanticNotificationKind::NeedsAttention,
+            title: "pending".into(),
+            body: None,
+            sound: None,
+            agent: Some("codex".into()),
+            workspace_id: Some("ws_1".into()),
+            tab_id: Some("tab_1".into()),
+            pane_id: Some("pane_1".into()),
+            position: None,
+        },
+        now,
+    );
+    assert!(state.visible_notification.is_some());
+    assert_eq!(state.pending_notifications.len(), 1);
+
+    state.set_server_lifecycle(
+        "analytics",
+        ClientServerLifecycle::Reconnecting("connection closed".into()),
+    );
+    assert!(state.visible_notification.is_none());
+    assert!(state.pending_notifications.is_empty());
+
+    state.receive_notification_from(
+        "analytics".into(),
+        SemanticNotification {
+            kind: SemanticNotificationKind::Custom,
+            title: "visible again".into(),
+            body: None,
+            sound: None,
+            agent: None,
+            workspace_id: None,
+            tab_id: None,
+            pane_id: None,
+            position: None,
+        },
+        now,
+    );
+    state.configure_servers(vec!["local".into()]);
+    assert!(state.visible_notification.is_none());
+    assert!(state.pending_notifications.is_empty());
+}
+
+#[test]
+fn external_remote_notifications_include_server_identity() {
+    for delivery in [
+        crate::config::ToastDelivery::Terminal,
+        crate::config::ToastDelivery::System,
+    ] {
+        let mut config = ClientShellConfig::from_config(&Config::default());
+        config.toast_delivery = delivery;
+        let mut state = ClientShellState::new(config);
+        state.set_snapshot(Box::new(snapshot()));
+        state.configure_servers(vec!["local".into(), "analytics".into()]);
+
+        let (effects, _) = state.receive_notification_from(
+            "analytics".into(),
+            SemanticNotification {
+                kind: SemanticNotificationKind::Custom,
+                title: "deploy finished".into(),
+                body: None,
+                sound: None,
+                agent: None,
+                workspace_id: None,
+                tab_id: None,
+                pane_id: None,
+                position: None,
+            },
+            std::time::Instant::now(),
+        );
+
+        assert!(matches!(
+            effects.as_slice(),
+            [ClientShellNotificationEffect::Terminal { title, .. }
+                | ClientShellNotificationEffect::System { title, .. }]
+                if title == "[ANALYTICS] deploy finished"
+        ));
+    }
+}

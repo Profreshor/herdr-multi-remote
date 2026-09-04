@@ -1,6 +1,365 @@
 use super::*;
 
 #[test]
+fn global_menu_only_adds_server_switching_for_multiple_connections() {
+    let projected = snapshot();
+    let local = super::super::global_menu::global_menu_items(
+        &projected,
+        &["local".into()],
+        &BTreeMap::from([("local".into(), ClientServerLifecycle::Connected)]),
+        "local",
+    );
+    assert!(local.iter().all(|(label, _)| !label.starts_with("server:")));
+
+    let fleet = super::super::global_menu::global_menu_items(
+        &projected,
+        &["local".into(), "analytics".into()],
+        &BTreeMap::from([
+            ("local".into(), ClientServerLifecycle::Connected),
+            ("analytics".into(), ClientServerLifecycle::Connected),
+        ]),
+        "local",
+    );
+    assert!(fleet.iter().any(|(label, action)| {
+        label == "server: ANALYTICS"
+            && *action
+                == super::super::global_menu::ClientGlobalMenuAction::ActivateServer(
+                    "analytics".into(),
+                )
+    }));
+    assert!(fleet.iter().any(|(label, _)| label == "server: LOCAL ✓"));
+
+    let failed = super::super::global_menu::global_menu_items(
+        &projected,
+        &["local".into(), "analytics".into()],
+        &BTreeMap::from([
+            ("local".into(), ClientServerLifecycle::Connected),
+            (
+                "analytics".into(),
+                ClientServerLifecycle::Failed("permission denied".into()),
+            ),
+        ]),
+        "local",
+    );
+    assert!(failed
+        .iter()
+        .any(|(label, _)| label == "server: ANALYTICS (failed: permission denied)"));
+}
+
+#[test]
+fn fleet_sidebar_namespaces_duplicate_workspace_ids_and_routes_remote_clicks() {
+    let mut local = snapshot();
+    local.workspaces[0].label = "local-workspace".into();
+    let mut remote = snapshot();
+    remote.workspaces[0].label = "remote-workspace".into();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.configure_servers(vec!["local".into(), "analytics".into()]);
+    state.set_server_lifecycle("analytics", ClientServerLifecycle::Connected);
+    state.set_snapshot(Box::new(local));
+    state.set_server_snapshot("analytics".into(), Box::new(remote));
+    state.set_pane_surface(surface());
+
+    let frame = state.compose(100, 28).expect("fleet frame");
+    let rendered = frame
+        .cells
+        .chunks(frame.width as usize)
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("LOCAL"));
+    assert!(rendered.contains("ANALYTICS"));
+    assert!(state
+        .hits
+        .workspaces
+        .iter()
+        .any(|hit| { hit.server_id == "local" && hit.workspace_id == "ws_1" }));
+    state.mode = ClientShellMode::Navigate;
+    state.navigate_server_id = Some("local".into());
+    state.navigate_workspace_id = Some("ws_1".into());
+    state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
+        KeyCode::Down,
+        KeyModifiers::empty(),
+    ))]);
+    assert_eq!(state.navigate_server_id.as_deref(), Some("analytics"));
+    let keyboard = state.handle_raw_events(vec![RawInputEvent::Key(
+        crate::input::TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()),
+    )]);
+    assert!(matches!(
+        keyboard.actions.as_slice(),
+        [ClientShellAction::ActivateWorkspace { server_id, workspace_id }]
+            if server_id == "analytics" && workspace_id == "ws_1"
+    ));
+
+    let remote_hit = state
+        .hits
+        .workspaces
+        .iter()
+        .find(|hit| hit.server_id == "analytics" && hit.workspace_id == "ws_1")
+        .expect("remote workspace hit")
+        .rect;
+    let mouse = |kind| {
+        RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column: remote_hit.x,
+            row: remote_hit.y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+    };
+    state.handle_raw_events(vec![mouse(MouseEventKind::Down(MouseButton::Left))]);
+    let outcome = state.handle_raw_events(vec![mouse(MouseEventKind::Up(MouseButton::Left))]);
+    assert!(matches!(
+        outcome.actions.as_slice(),
+        [ClientShellAction::ActivateWorkspace { server_id, workspace_id }]
+            if server_id == "analytics" && workspace_id == "ws_1"
+    ));
+}
+
+fn fleet_state_with_duplicate_remote_resource_ids() -> ClientShellState {
+    let mut local = snapshot();
+    local.boot_id = "local-boot".into();
+    local.tabs[0].label = "local-tab".into();
+    local.panes[0].label = Some("local-pane".into());
+
+    let mut remote = snapshot();
+    remote.boot_id = "analytics-boot".into();
+    remote.tabs[0].label = "remote-tab".into();
+    remote.panes[0].label = Some("remote-pane".into());
+
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.configure_servers(vec!["local".into(), "analytics".into()]);
+    state.set_server_lifecycle("analytics", ClientServerLifecycle::Connected);
+    state.set_snapshot(Box::new(local));
+    state.set_server_snapshot("analytics".into(), Box::new(remote.clone()));
+    state.set_active_server("analytics".into());
+    state.set_snapshot(Box::new(remote));
+    state
+}
+
+fn sole_remote_endpoint_method(outcome: &ClientShellInput) -> &crate::api::schema::Method {
+    let [ClientShellAction::Endpoint { boot_id, request }] = outcome.actions.as_slice() else {
+        panic!("expected one endpoint request");
+    };
+    assert_eq!(boot_id, "analytics-boot");
+    &request.method
+}
+
+#[test]
+fn fleet_duplicate_tab_and_pane_ids_follow_the_active_server_for_focus() {
+    let mut state = fleet_state_with_duplicate_remote_resource_ids();
+
+    let local = state.server_snapshots["local"].as_ref();
+    let remote = state.server_snapshots["analytics"].as_ref();
+    assert_eq!(local.tabs[0].tab_id, remote.tabs[0].tab_id);
+    assert_eq!(local.panes[0].pane_id, remote.panes[0].pane_id);
+    assert_ne!(local.boot_id, remote.boot_id);
+    assert_eq!(state.active_server_id, "analytics");
+
+    let mut tab_focus = ClientShellInput::default();
+    state.record_binding(
+        crate::input::KeybindMatch::Action(crate::input::KeybindAction::SwitchTab(0)),
+        &mut tab_focus,
+    );
+    assert!(matches!(
+        sole_remote_endpoint_method(&tab_focus),
+        crate::api::schema::Method::TabFocus(target) if target.tab_id == "tab_1"
+    ));
+
+    let pane_focus = state.focus_pane("pane_1".into());
+    assert!(matches!(
+        sole_remote_endpoint_method(&pane_focus),
+        crate::api::schema::Method::PaneFocus(target) if target.pane_id == "pane_1"
+    ));
+}
+
+#[test]
+fn fleet_active_server_routes_create_split_and_kill_requests() {
+    let mut state = fleet_state_with_duplicate_remote_resource_ids();
+
+    let mut create = ClientShellInput::default();
+    state.record_binding(
+        crate::input::KeybindMatch::Action(crate::input::KeybindAction::NewWorkspace),
+        &mut create,
+    );
+    assert!(matches!(
+        sole_remote_endpoint_method(&create),
+        crate::api::schema::Method::WorkspaceCreate(params)
+            if params.source_workspace_id.as_deref() == Some("ws_1")
+    ));
+
+    let mut split = ClientShellInput::default();
+    state.record_binding(
+        crate::input::KeybindMatch::Action(crate::input::KeybindAction::SplitVertical),
+        &mut split,
+    );
+    assert!(matches!(
+        sole_remote_endpoint_method(&split),
+        crate::api::schema::Method::PaneSplit(params)
+            if params.workspace_id.as_deref() == Some("ws_1")
+                && params.target_pane_id.as_deref() == Some("pane_1")
+    ));
+
+    let mut kill = ClientShellInput::default();
+    state.record_binding(
+        crate::input::KeybindMatch::Action(crate::input::KeybindAction::ClosePane),
+        &mut kill,
+    );
+    assert!(matches!(
+        sole_remote_endpoint_method(&kill),
+        crate::api::schema::Method::PaneClose(target) if target.pane_id == "pane_1"
+    ));
+}
+
+#[test]
+fn workspace_picker_starts_from_the_active_server() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.configure_servers(vec!["local".into(), "analytics".into()]);
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_active_server("analytics".into());
+    let mut outcome = ClientShellInput::default();
+
+    state.record_binding(
+        crate::input::KeybindMatch::Action(crate::input::KeybindAction::WorkspacePicker),
+        &mut outcome,
+    );
+
+    assert_eq!(state.navigate_server_id.as_deref(), Some("analytics"));
+    assert_eq!(state.navigate_workspace_id.as_deref(), Some("ws_1"));
+}
+
+#[test]
+fn switching_servers_restores_each_servers_last_cell_surface() {
+    let mut local = snapshot();
+    local.boot_id = "local-boot".into();
+    let mut remote = snapshot();
+    remote.boot_id = "analytics-boot".into();
+    let mut local_surface = surface();
+    local_surface.boot_id = local.boot_id.clone();
+    local_surface.frame.cells[0].symbol = "L".into();
+    let mut remote_surface = surface();
+    remote_surface.boot_id = remote.boot_id.clone();
+    remote_surface.frame.cells[0].symbol = "R".into();
+
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.configure_servers(vec!["local".into(), "analytics".into()]);
+    state.set_snapshot(Box::new(local));
+    state.set_pane_surface(local_surface);
+    state.set_server_snapshot("analytics".into(), Box::new(remote));
+
+    state.set_active_server("analytics".into());
+    assert!(state.pane_surface.is_none());
+    state.set_pane_surface(remote_surface);
+    state.set_active_server("local".into());
+    assert_eq!(
+        state.pane_surface.as_ref().unwrap().frame.cells[0].symbol,
+        "L"
+    );
+    state.set_active_server("analytics".into());
+    assert_eq!(
+        state.pane_surface.as_ref().unwrap().frame.cells[0].symbol,
+        "R"
+    );
+    assert!(state
+        .pane_surface
+        .as_ref()
+        .is_some_and(|surface| surface.graphics == Default::default()));
+}
+
+#[test]
+fn switching_servers_drops_a_cached_surface_from_an_old_boot() {
+    let mut remote = snapshot();
+    remote.boot_id = "analytics-boot".into();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.configure_servers(vec!["local".into(), "analytics".into()]);
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_server_snapshot("analytics".into(), Box::new(remote));
+    let mut stale_surface = surface();
+    stale_surface.boot_id = "retired-analytics-boot".into();
+    state
+        .server_surfaces
+        .insert("analytics".into(), stale_surface);
+
+    state.set_active_server("analytics".into());
+
+    assert!(state.pane_surface.is_none());
+    assert!(!state.server_surfaces.contains_key("analytics"));
+}
+
+#[test]
+fn changed_remote_identity_forgets_cached_state_before_reconfiguration() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.configure_servers(vec!["local".into(), "analytics".into()]);
+    state.set_server_lifecycle("analytics", ClientServerLifecycle::Connected);
+    state.set_server_snapshot("analytics".into(), Box::new(snapshot()));
+    state.server_surfaces.insert("analytics".into(), surface());
+
+    state.forget_server("analytics");
+    state.configure_servers(vec!["local".into(), "analytics".into()]);
+
+    assert!(!state.has_server_snapshot("analytics"));
+    assert!(!state.server_surfaces.contains_key("analytics"));
+    assert_eq!(
+        state.server_lifecycle.get("analytics"),
+        Some(&ClientServerLifecycle::Connecting)
+    );
+}
+
+#[test]
+fn fleet_sidebar_preserves_active_worktree_grouping() {
+    let mut local = snapshot();
+    local.workspaces[0].worktree = Some(ClientShellWorktree {
+        key: "repo".into(),
+        label: "repo".into(),
+        is_linked_worktree: false,
+    });
+    let mut child = local.workspaces[0].clone();
+    child.workspace_id = "ws_child".into();
+    child.label = "repo-feature".into();
+    child.branch = Some("worktree/feature".into());
+    child.focused = false;
+    child.worktree = Some(ClientShellWorktree {
+        key: "repo".into(),
+        label: "repo".into(),
+        is_linked_worktree: true,
+    });
+    local.workspaces.push(child);
+
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.configure_servers(vec!["local".into(), "analytics".into()]);
+    state.set_server_lifecycle("analytics", ClientServerLifecycle::Connected);
+    state.set_snapshot(Box::new(local));
+    state.set_server_snapshot("analytics".into(), Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    let frame = state.compose(106, 24).expect("fleet worktree frame");
+    let rendered = frame
+        .cells
+        .chunks(frame.width as usize)
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let local_hits = state
+        .hits
+        .workspaces
+        .iter()
+        .filter(|hit| hit.server_id == "local")
+        .collect::<Vec<_>>();
+    assert_eq!(local_hits.len(), 2);
+    assert!(!local_hits[0].indented);
+    assert!(local_hits[0].group_toggle.is_some());
+    assert!(local_hits[1].indented);
+    assert!(rendered.contains("└─"));
+    assert!(rendered.contains("feature"));
+}
+
+#[test]
 fn tab_overflow_controls_scroll_the_client_owned_tab_bar() {
     let mut snapshot = snapshot();
     snapshot.tabs.extend((2..=8).map(|number| ClientShellTab {
@@ -337,6 +696,9 @@ fn new_tab_overlay_owns_text_cursor_and_submits_public_api_request() {
 #[test]
 fn close_confirmation_error_becomes_client_owned_overlay_and_stable_group_close() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.configure_servers(vec!["local".into(), "analytics-prod".into()]);
+    state.set_server_lifecycle("analytics-prod", ClientServerLifecycle::Connected);
+    state.set_active_server("analytics-prod".into());
     state.set_snapshot(Box::new(snapshot()));
     state.set_pane_surface(surface());
     let mut close = ClientShellInput::default();
@@ -373,6 +735,7 @@ fn close_confirmation_error_becomes_client_owned_overlay_and_stable_group_close(
         .join("\n");
     assert!(text.contains("Close workspace?"));
     assert!(text.contains("1 pane"));
+    assert!(text.contains("ANALYTICS-PROD"));
 
     let confirm = state.handle_input_bytes(b"\r");
     let [ClientShellAction::Endpoint { request, .. }] = &confirm.actions[..] else {

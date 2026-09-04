@@ -30,6 +30,7 @@ fn navigate_update_status_uses_released_desktop_and_mobile_placement() {
 
     state.config.tab_bar_position = crate::config::TabBarPositionConfig::Top;
     state.visible_notification = Some(ClientVisibleNotification {
+        server_id: "local".into(),
         event: SemanticNotification {
             kind: SemanticNotificationKind::Custom,
             title: "bottom notification".into(),

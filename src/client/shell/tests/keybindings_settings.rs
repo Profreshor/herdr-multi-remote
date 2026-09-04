@@ -491,6 +491,34 @@ fn unavailable_endpoint_method_is_disabled_without_disconnect() {
 }
 
 #[test]
+fn disconnected_server_rejects_endpoint_actions_without_pending_requests() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_server_lifecycle(
+        "local",
+        ClientServerLifecycle::Reconnecting("connection closed".into()),
+    );
+    let mut outcome = ClientShellInput::default();
+
+    state.push_endpoint_method(
+        crate::api::schema::Method::WorkspaceFocus(crate::api::schema::WorkspaceTarget {
+            workspace_id: "ws_1".into(),
+        }),
+        &mut outcome,
+    );
+
+    assert!(outcome.actions.is_empty());
+    assert!(outcome.repaint);
+    assert!(state.pending_requests.is_empty());
+    let notice = state
+        .visible_endpoint_notice
+        .as_ref()
+        .expect("server unavailable notice");
+    assert_eq!(notice.key.kind, ClientEndpointNoticeKind::Unavailable);
+    assert_eq!(notice.key.code, "server");
+}
+
+#[test]
 fn generic_endpoint_failures_and_control_errors_are_visible() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot()));

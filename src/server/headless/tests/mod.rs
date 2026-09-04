@@ -606,6 +606,7 @@ async fn client_shell_attach_seeds_workspace() {
             direct_graphics: false,
             endpoint_keybindings: false,
             mouse_capture: false,
+            presentation_visible: true,
             writer,
         })
     );
@@ -632,6 +633,7 @@ async fn client_shell_endpoint_request_uses_the_selected_connection() {
             direct_graphics: false,
             endpoint_keybindings: false,
             mouse_capture: false,
+            presentation_visible: true,
             writer,
         })
     );
@@ -747,6 +749,7 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
             direct_graphics: false,
             endpoint_keybindings: false,
             mouse_capture: false,
+            presentation_visible: true,
             writer,
         })
     );
@@ -768,7 +771,7 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
         Some(("0.8.2", "client-shell", true))
     );
 
-    server.render_and_stream();
+    server.render_and_stream(true);
     let initial_surface = match read_server_message(render_rx.recv().expect("pane surface")) {
         ServerMessage::PaneSurface(surface) => {
             assert_eq!((surface.frame.width, surface.frame.height), (80, 23));
@@ -843,7 +846,7 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
         .unwrap()
         .render_state
         .request_repaint();
-    server.render_and_stream();
+    server.render_and_stream(true);
     let full = match read_server_message(render_rx.recv().expect("full comparison surface")) {
         ServerMessage::PaneSurface(surface) => surface,
         other => panic!("expected full comparison surface, got {other:?}"),
@@ -852,6 +855,113 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
     assert_eq!(retained.frame, full.frame);
     assert_eq!(retained.panes, full.panes);
     assert_eq!(retained.splits, full.splits);
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn hidden_shell_receives_semantics_without_owning_presentation() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("hidden-shell");
+    let pane_id = workspace.focused_pane_id().expect("focused pane");
+    workspace.insert_test_runtime(
+        pane_id,
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 23, b"HIDDEN"),
+    );
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+
+    let (writer, control_rx, render_rx) = test_client_writer();
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellConnected {
+            client_id: 71,
+            surface_cols: 80,
+            surface_rows: 23,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            pixel_mouse: false,
+            direct_graphics: false,
+            endpoint_keybindings: false,
+            mouse_capture: false,
+            presentation_visible: false,
+            writer,
+        })
+    );
+    let initial = client_shell_snapshot(read_server_message(
+        control_rx.recv().expect("initial hidden snapshot"),
+    ));
+    assert_eq!(initial.workspaces[0].label, "hidden-shell");
+    assert_eq!(server.foreground_client_id, None);
+    assert!(server.tab_geometry_controllers.is_empty());
+
+    server.render_and_stream(true);
+    assert!(render_rx.try_recv().is_err());
+    server.app.state.workspaces[0].test_runtimes[&pane_id]
+        .test_process_pty_bytes(b"\rSTILL_HIDDEN");
+    assert!(!server.pty_sources_visible_to_any_render_target(&HashSet::from([pane_id])));
+    assert!(control_rx.try_recv().is_err());
+    assert!(render_rx.try_recv().is_err());
+
+    server.server_config_diagnostic_without_keybindings = Some("changed".into());
+    server.render_and_stream(false);
+    assert!(control_rx.try_recv().is_err());
+    server.render_and_stream(true);
+    let changed = client_shell_snapshot(read_server_message(
+        control_rx.recv().expect("changed hidden snapshot"),
+    ));
+    assert_eq!(changed.config_diagnostic.as_deref(), Some("changed"));
+    assert!(render_rx.try_recv().is_err());
+
+    let notification = protocol::SemanticNotification {
+        kind: protocol::SemanticNotificationKind::Custom,
+        title: "remote done".into(),
+        body: None,
+        sound: None,
+        agent: None,
+        workspace_id: None,
+        tab_id: None,
+        pane_id: None,
+        position: None,
+    };
+    assert!(server.send_to_client_shells(ServerMessage::SemanticNotification(notification.clone())));
+    assert_eq!(
+        read_server_message(control_rx.recv().expect("hidden notification")),
+        ServerMessage::SemanticNotification(notification)
+    );
+
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellPresentation {
+            client_id: 71,
+            visible: true,
+        })
+    );
+    assert_eq!(server.foreground_client_id, Some(71));
+    assert!(server
+        .tab_geometry_controllers
+        .values()
+        .any(|controller| *controller == 71));
+    server.render_and_stream(true);
+    assert!(matches!(
+        read_server_message(render_rx.recv().expect("visible pane surface")),
+        ServerMessage::PaneSurface(_)
+    ));
+
+    server.clients.get_mut(&71).unwrap().defer_full_render();
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellPresentation {
+            client_id: 71,
+            visible: false,
+        })
+    );
+    assert_eq!(server.foreground_client_id, None);
+    assert!(!server
+        .tab_geometry_controllers
+        .values()
+        .any(|controller| *controller == 71));
+    assert!(!server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 71 }));
+    server.render_and_stream(true);
+    assert!(render_rx.try_recv().is_err());
     shutdown_test_runtimes(&mut server);
 }
 
@@ -890,6 +1000,7 @@ fn connect_test_shell(
             direct_graphics: false,
             endpoint_keybindings: false,
             mouse_capture: false,
+            presentation_visible: true,
             writer,
         })
     );
@@ -955,7 +1066,7 @@ async fn different_size_shells_receive_geometry_specific_patches_from_one_dirty_
     let (small_control, small_render) = connect_test_shell(&mut server, 8, 68, 17);
     let _ = large_control.recv().expect("large snapshot");
     let _ = small_control.recv().expect("small snapshot");
-    server.render_and_stream();
+    server.render_and_stream(true);
     let large_initial = recv_pane_surface(&large_render, "large initial surface");
     let small_initial = recv_pane_surface(&small_render, "small initial surface");
     assert_eq!(
@@ -1020,7 +1131,7 @@ async fn different_size_shells_receive_geometry_specific_patches_from_one_dirty_
 
     write_shared_test_pane(&mut server, pane_id, b"\x1b[?1049hALT");
     assert!(!server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
-    server.render_and_stream();
+    server.render_and_stream(true);
     let large_alt = recv_pane_surface(&large_render, "large alternate-screen surface");
     let small_alt = recv_pane_surface(&small_render, "small alternate-screen surface");
     assert!(large_alt.panes[0].alternate_screen_active);
@@ -1036,7 +1147,7 @@ async fn different_size_shells_receive_geometry_specific_patches_from_one_dirty_
 
     write_shared_test_pane(&mut server, pane_id, b"\x1b[?1049l");
     assert!(!server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
-    server.render_and_stream();
+    server.render_and_stream(true);
     let large_main = recv_pane_surface(&large_render, "large restored main-screen surface");
     let small_main = recv_pane_surface(&small_render, "small restored main-screen surface");
     assert!(!large_main.panes[0].alternate_screen_active);
@@ -1083,7 +1194,7 @@ async fn retained_patches_only_reach_shells_viewing_the_dirty_tab() {
     assert!(
         server.pty_sources_visible_to_any_render_target(&HashSet::from([first_pane, second_pane,]))
     );
-    server.render_and_stream();
+    server.render_and_stream(true);
     let _ = recv_pane_surface(&first_render, "first baseline");
     let _ = recv_pane_surface(&second_render, "second baseline");
 
@@ -1112,7 +1223,7 @@ async fn backpressured_shell_does_not_disable_retained_patches_for_responsive_pe
     let (slow_control, slow_render) = connect_matching_test_shell(&mut server, 8);
     let _ = responsive_control.recv().expect("responsive snapshot");
     let _ = slow_control.recv().expect("slow snapshot");
-    server.render_and_stream();
+    server.render_and_stream(true);
     let _ = responsive_render
         .recv()
         .expect("responsive initial surface");
@@ -1146,7 +1257,7 @@ async fn backpressured_shell_does_not_disable_retained_patches_for_responsive_pe
         ServerMessage::PaneSurfacePatch(_)
     ));
     assert!(server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 8 }));
-    server.render_and_stream();
+    server.render_and_stream(true);
     assert!(matches!(
         read_server_message(slow_render.recv().expect("slow full recovery surface")),
         ServerMessage::PaneSurface(_)
@@ -1163,7 +1274,7 @@ async fn full_render_backpressure_does_not_disable_responsive_peer_patches() {
     let (slow_control, slow_render) = connect_matching_test_shell(&mut server, 8);
     let _ = responsive_control.recv().expect("responsive snapshot");
     let _ = slow_control.recv().expect("slow snapshot");
-    server.render_and_stream();
+    server.render_and_stream(true);
     let _ = responsive_render
         .recv()
         .expect("responsive initial surface");
@@ -1172,7 +1283,7 @@ async fn full_render_backpressure_does_not_disable_responsive_peer_patches() {
     server.clients.get_mut(&7).unwrap().request_repaint();
     server.clients.get_mut(&8).unwrap().request_repaint();
     server.app.full_redraw_pending = true;
-    server.render_and_stream();
+    server.render_and_stream(true);
     let _ = responsive_render
         .recv()
         .expect("responsive full replacement");
@@ -1188,7 +1299,7 @@ async fn full_render_backpressure_does_not_disable_responsive_peer_patches() {
 
     let _ = slow_render.recv().expect("slow queued initial surface");
     assert!(server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 8 }));
-    server.render_and_stream();
+    server.render_and_stream(true);
     assert!(matches!(
         read_server_message(slow_render.recv().expect("slow full recovery surface")),
         ServerMessage::PaneSurface(_)
@@ -1215,6 +1326,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
             direct_graphics: false,
             endpoint_keybindings: false,
             mouse_capture: false,
+            presentation_visible: true,
             writer: local_writer,
         })
     );
@@ -1238,6 +1350,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
             direct_graphics: false,
             endpoint_keybindings: true,
             mouse_capture: false,
+            presentation_visible: true,
             writer: endpoint_writer,
         })
     );
@@ -1309,7 +1422,7 @@ async fn client_shell_tab_focus_changes_only_the_source_connection() {
     assert!(!server.handle_server_event(response_ready));
     let _ = second_control.recv().expect("focus response");
 
-    server.render_and_stream();
+    server.render_and_stream(true);
 
     assert!(
         first_control.try_recv().is_err(),
@@ -1740,7 +1853,7 @@ async fn client_shell_tabs_render_accept_input_and_resize_independently() {
         Bytes::from_static(b"typed")
     );
 
-    server.render_and_stream();
+    server.render_and_stream(true);
     let first_surface = match read_server_message(first_render.recv().expect("first surface")) {
         ServerMessage::PaneSurface(surface) => surface,
         other => panic!("expected first pane surface, got {other:?}"),
@@ -1915,6 +2028,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
             direct_graphics: false,
             endpoint_keybindings: false,
             mouse_capture: false,
+            presentation_visible: true,
             writer,
         })
     );
@@ -1938,7 +2052,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
         stream_active: None,
     });
     assert_eq!(server.app.state.active, Some(1));
-    server.render_and_stream();
+    server.render_and_stream(true);
 
     let replacement = client_shell_snapshot(read_server_message(
         control_rx.recv().expect("replacement snapshot"),
@@ -2164,6 +2278,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
             direct_graphics: false,
             endpoint_keybindings: false,
             mouse_capture: false,
+            presentation_visible: true,
             writer,
         })
     );
@@ -2171,7 +2286,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
         control_rx.recv().expect("shell snapshot"),
     ));
 
-    server.render_and_stream();
+    server.render_and_stream(true);
     let ServerMessage::PaneSurface(surface) =
         read_server_message(render_rx.recv().expect("popup surface"))
     else {
@@ -2261,8 +2376,37 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
     );
     assert!(popup_input.try_recv().is_err());
 
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellPresentation {
+            client_id: 12,
+            visible: false,
+        })
+    );
+    while popup_input.try_recv().is_ok() {}
+    assert!(
+        !server.handle_server_event(ServerEvent::ClientShellPopupInput {
+            client_id: 12,
+            terminal_id: popup_terminal_id.to_string(),
+            events: vec![crate::protocol::ClientPaneInputEvent::TextCommit(
+                "hidden".into()
+            )],
+        })
+    );
+    assert!(!server.paste_client_clipboard_image_path(
+        12,
+        crate::protocol::ClientClipboardImageTarget::Popup(popup_terminal_id.to_string()),
+        "/tmp/hidden.png".into(),
+    ));
+    assert!(popup_input.try_recv().is_err());
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellPresentation {
+            client_id: 12,
+            visible: true,
+        })
+    );
+
     assert!(server.app.close_popup_pane());
-    server.render_and_stream();
+    server.render_and_stream(true);
     let ServerMessage::PaneSurface(surface) =
         read_server_message(render_rx.recv().expect("popup close surface"))
     else {
@@ -2347,7 +2491,7 @@ async fn terminal_popup_is_visible_and_modal_only_on_its_owning_tab() {
             .current_size(),
         popup_size
     );
-    server.render_and_stream();
+    server.render_and_stream(true);
     assert!(recv_pane_surface(&first_render, "popup owner surface")
         .popup
         .is_some());
@@ -4512,7 +4656,7 @@ async fn headless_scheduled_tasks_start_pending_agent_resume_without_foreground_
         dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
     });
 
-    server.render_and_stream();
+    server.render_and_stream(true);
     assert_ne!(server.app.state.view.terminal_area, Rect::default());
 
     let now = Instant::now();
@@ -4734,12 +4878,27 @@ async fn client_shell_release_cleanup_does_not_promote_and_survives_disconnect()
         .await
         .expect("second encoded press")
         .is_empty());
-    assert!(server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 1 }));
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellPresentation {
+            client_id: 1,
+            visible: false,
+        })
+    );
     assert!(!input_rx
         .recv()
         .await
-        .expect("disconnect synthesized release")
+        .expect("presentation hide synthesized release")
         .is_empty());
+    while input_rx.try_recv().is_ok() {}
+    assert!(
+        !server.handle_server_event(ServerEvent::ClientShellPaneInput {
+            client_id: 1,
+            pane_id: server.app.session_snapshot().focused_pane_id.unwrap(),
+            events: vec![key(crate::protocol::ClientKeyKind::Press)],
+        })
+    );
+    assert!(input_rx.try_recv().is_err());
+    assert!(server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 1 }));
     shutdown_test_runtimes(&mut server);
 }
 

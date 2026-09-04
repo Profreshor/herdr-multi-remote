@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use ratatui::layout::{Direction, Rect};
 
 use crate::app::{App, AppPolicy};
-use crate::client::{ClientShellConfig, ClientShellState};
+use crate::client::{ClientServerLifecycle, ClientShellConfig, ClientShellState};
 use crate::config::Config;
 use crate::kitty_graphics::HostCellSize;
 use crate::protocol::PaneSurfaceFrame;
@@ -17,11 +17,14 @@ const SAMPLE_COUNT: usize = 40;
 const WARMUP_COUNT: usize = 5;
 const CARDINALITIES: [usize; 3] = [1, 15, 50];
 const CLIENT_CARDINALITIES: [usize; 2] = [1, 4];
+const REMOTE_CARDINALITIES: [usize; 4] = [0, 1, 3, 5];
+const FLEET_LATENCY_SAMPLE_COUNT: usize = 200;
 
 #[derive(Clone, Copy)]
 struct StageStats {
     median_us: u128,
     p95_us: u128,
+    p99_us: u128,
     max_us: u128,
 }
 
@@ -163,10 +166,12 @@ fn active_panes(pane_count: usize) -> Vec<Workspace> {
 
 fn summarize(mut samples: Vec<Duration>) -> StageStats {
     samples.sort_unstable();
+    let last = samples.len() - 1;
     StageStats {
-        median_us: samples[SAMPLE_COUNT / 2].as_micros(),
-        p95_us: samples[(SAMPLE_COUNT - 1) * 95 / 100].as_micros(),
-        max_us: samples[SAMPLE_COUNT - 1].as_micros(),
+        median_us: samples[samples.len() / 2].as_micros(),
+        p95_us: samples[last * 95 / 100].as_micros(),
+        p99_us: samples[last * 99 / 100].as_micros(),
+        max_us: samples[last].as_micros(),
     }
 }
 
@@ -263,9 +268,135 @@ fn print_snapshot_encoding_profiles(label: &str, build: fn(usize) -> Vec<Workspa
     }
 }
 
+fn configure_fleet(
+    pipeline: &mut RenderPipeline,
+    remote_count: usize,
+) -> (crate::protocol::ClientShellSnapshot, Option<String>) {
+    black_box(pipeline.render_once());
+    let snapshot = super::client_shell::snapshot(&pipeline.app, "bench-boot", 1, None, None);
+    let remote_ids = (1..=remote_count)
+        .map(|index| format!("remote-{index}"))
+        .collect::<Vec<_>>();
+    pipeline.client.configure_servers(
+        std::iter::once("local".to_owned())
+            .chain(remote_ids.iter().cloned())
+            .collect(),
+    );
+    for id in &remote_ids {
+        pipeline
+            .client
+            .set_server_snapshot(id.clone(), Box::new(snapshot.clone()));
+        pipeline
+            .client
+            .set_server_lifecycle(id, ClientServerLifecycle::Connected);
+    }
+    let active_remote = remote_ids.last().cloned();
+    (snapshot, active_remote)
+}
+
+fn profile_fleet_sidebar(remote_count: usize) -> StageStats {
+    let mut pipeline = RenderPipeline::new(workspaces(15));
+    configure_fleet(&mut pipeline, remote_count);
+    let mut run = || {
+        let started = Instant::now();
+        black_box(
+            pipeline
+                .client
+                .compose(COLS, ROWS)
+                .expect("fleet benchmark should compose a complete frame"),
+        );
+        started.elapsed()
+    };
+    for _ in 0..WARMUP_COUNT {
+        black_box(run());
+    }
+    summarize((0..SAMPLE_COUNT).map(|_| run()).collect())
+}
+
+fn print_fleet_sidebar_profile() {
+    println!("fleet sidebar composition (15 workspaces per remote)");
+    println!("     remotes  median_us  p95_us  p99_us  max_us");
+    for remote_count in REMOTE_CARDINALITIES {
+        let stats = profile_fleet_sidebar(remote_count);
+        println!(
+            "  {remote_count:>10}  {:>9}  {:>6}  {:>6}  {:>6}",
+            stats.median_us, stats.p95_us, stats.p99_us, stats.max_us
+        );
+    }
+}
+
+fn profile_fleet_snapshot_latency(remote_count: usize) -> StageStats {
+    let mut pipeline = RenderPipeline::new(workspaces(15));
+    let (snapshot, target) = configure_fleet(&mut pipeline, remote_count);
+    let mut run = || {
+        let started = Instant::now();
+        match &target {
+            Some(server_id) => pipeline
+                .client
+                .set_server_snapshot(server_id.clone(), Box::new(snapshot.clone())),
+            None => pipeline.client.set_snapshot(Box::new(snapshot.clone())),
+        }
+        black_box(
+            pipeline
+                .client
+                .compose(COLS, ROWS)
+                .expect("fleet snapshot benchmark should compose a complete frame"),
+        );
+        started.elapsed()
+    };
+    for _ in 0..WARMUP_COUNT {
+        black_box(run());
+    }
+    summarize((0..FLEET_LATENCY_SAMPLE_COUNT).map(|_| run()).collect())
+}
+
+fn profile_fleet_input_latency(remote_count: usize) -> StageStats {
+    let mut pipeline = RenderPipeline::new(workspaces(15));
+    let (snapshot, target) = configure_fleet(&mut pipeline, remote_count);
+    if let Some(server_id) = target {
+        pipeline.client.set_active_server(server_id);
+        pipeline.client.set_snapshot(Box::new(snapshot));
+        black_box(pipeline.render_once());
+    }
+    let mut run = || {
+        let started = Instant::now();
+        black_box(pipeline.client.handle_input_bytes(b"x"));
+        black_box(
+            pipeline
+                .client
+                .compose(COLS, ROWS)
+                .expect("fleet input benchmark should compose a complete frame"),
+        );
+        started.elapsed()
+    };
+    for _ in 0..WARMUP_COUNT {
+        black_box(run());
+    }
+    summarize((0..FLEET_LATENCY_SAMPLE_COUNT).map(|_| run()).collect())
+}
+
+fn print_fleet_latency_profiles() {
+    println!("fleet update-to-compose latency (200 samples, 15 workspaces per server)");
+    println!("        path     remotes  p50_us  p95_us  p99_us");
+    for remote_count in REMOTE_CARDINALITIES {
+        let snapshot = profile_fleet_snapshot_latency(remote_count);
+        println!(
+            "    snapshot  {remote_count:>10}  {:>6}  {:>6}  {:>6}",
+            snapshot.median_us, snapshot.p95_us, snapshot.p99_us
+        );
+        let input = profile_fleet_input_latency(remote_count);
+        println!(
+            "       input  {remote_count:>10}  {:>6}  {:>6}  {:>6}",
+            input.median_us, input.p95_us, input.p99_us
+        );
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "manual client-rendered pipeline scaling profile"]
 async fn render_scale_profile() {
+    print_fleet_sidebar_profile();
+    print_fleet_latency_profiles();
     print_profiles("background workspaces (one pane each)", workspaces);
     print_snapshot_encoding_profiles("background workspaces", workspaces);
     print_profiles("active panes (one workspace)", active_panes);

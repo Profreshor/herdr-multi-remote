@@ -17,7 +17,7 @@ async fn client_shell_surface_sends_complete_placements_and_each_live_asset_once
     };
     set_graphics_layer(&mut server, pane_id, vec![1, 2, 3, 4]);
 
-    server.render_and_stream();
+    server.render_and_stream(true);
     let first = read_server_message(receive_render(&client_rx, Duration::from_millis(100)));
     let ServerMessage::PaneSurface(first) = first else {
         panic!("expected client shell pane surface");
@@ -31,7 +31,7 @@ async fn client_shell_surface_sends_complete_placements_and_each_live_asset_once
     ));
 
     server.clients.get_mut(&1).unwrap().request_repaint();
-    server.render_and_stream();
+    server.render_and_stream(true);
     let second = read_server_message(receive_render(&client_rx, Duration::from_millis(100)));
     let ServerMessage::PaneSurface(second) = second else {
         panic!("expected replacement client shell pane surface");
@@ -53,12 +53,12 @@ async fn client_shell_asset_delivery_is_bounded_to_the_current_live_scene() {
     };
     set_graphics_layer(&mut server, pane_id, vec![1, 2, 3, 4]);
 
-    server.render_and_stream();
+    server.render_and_stream(true);
     let _first = receive_render(&client_rx, Duration::from_millis(100));
     server.app.pane_graphics.slots.clear();
     server.app.pane_graphics.mark_changed();
     server.clients.get_mut(&1).unwrap().request_repaint();
-    server.render_and_stream();
+    server.render_and_stream(true);
     let removed = read_server_message(receive_render(&client_rx, Duration::from_millis(100)));
     let ServerMessage::PaneSurface(removed) = removed else {
         panic!("expected removed client shell scene");
@@ -67,7 +67,7 @@ async fn client_shell_asset_delivery_is_bounded_to_the_current_live_scene() {
 
     set_graphics_layer(&mut server, pane_id, vec![1, 2, 3, 4]);
     server.clients.get_mut(&1).unwrap().request_repaint();
-    server.render_and_stream();
+    server.render_and_stream(true);
     let restored = read_server_message(receive_render(&client_rx, Duration::from_millis(100)));
     let ServerMessage::PaneSurface(restored) = restored else {
         panic!("expected restored client shell scene");
@@ -89,7 +89,7 @@ async fn client_shell_surface_projects_terminal_kitty_images_from_authoritative_
         height_px: 20,
     };
 
-    server.render_and_stream();
+    server.render_and_stream(true);
     let message = read_server_message(receive_render(&client_rx, Duration::from_millis(100)));
     let ServerMessage::PaneSurface(surface) = message else {
         panic!("expected client shell pane surface");
@@ -120,7 +120,7 @@ async fn client_shell_delivers_equal_pixels_for_distinct_terminal_image_ids() {
         height_px: 20,
     };
 
-    server.render_and_stream();
+    server.render_and_stream(true);
     let message = read_server_message(receive_render(&client_rx, Duration::from_millis(100)));
     let ServerMessage::PaneSurface(surface) = message else {
         panic!("expected client shell pane surface");
@@ -137,7 +137,7 @@ async fn client_shell_delivers_equal_pixels_for_distinct_terminal_image_ids() {
     );
 
     server.clients.get_mut(&1).unwrap().request_repaint();
-    server.render_and_stream();
+    server.render_and_stream(true);
     let message = read_server_message(receive_render(&client_rx, Duration::from_millis(100)));
     let ServerMessage::PaneSurface(surface) = message else {
         panic!("expected replacement client shell pane surface");
@@ -160,9 +160,9 @@ async fn full_client_shell_render_lane_does_not_commit_graphics_delivery() {
     set_graphics_layer(&mut server, pane_id, vec![5, 6, 7, 8]);
 
     fill_render_lane(&server);
-    server.render_and_stream();
+    server.render_and_stream(true);
     let _older = receive_render(&client_rx, Duration::from_millis(100));
-    server.render_and_stream();
+    server.render_and_stream(true);
     let message = read_server_message(receive_render(&client_rx, Duration::from_millis(100)));
     let ServerMessage::PaneSurface(surface) = message else {
         panic!("expected client shell pane surface");
@@ -851,7 +851,7 @@ async fn client_shell_direct_graphics_uploads_without_server_authored_coordinate
     assert!(server.app.direct_graphics_available);
 
     server.clients.get_mut(&1).unwrap().request_repaint();
-    server.render_and_stream();
+    server.render_and_stream(true);
     let surface = read_server_message(
         client_rx
             .recv_timeout(Duration::from_secs(1))
