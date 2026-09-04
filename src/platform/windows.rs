@@ -4,7 +4,7 @@ use std::{
     ffi::{c_void, OsStr},
     mem::{size_of, MaybeUninit},
     os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle},
-    path::PathBuf,
+    path::{Path, PathBuf},
     ptr::{copy_nonoverlapping, null_mut},
     sync::{
         atomic::{AtomicU64, Ordering as AtomicOrdering},
@@ -210,6 +210,10 @@ pub(crate) fn remote_ssh_config_paths() -> super::RemoteSshConfigPaths {
 pub(crate) fn create_remote_ssh_config_dir(_control_socket_name: &str) -> std::io::Result<PathBuf> {
     let base = remote_private_temp_base();
     std::fs::create_dir_all(&base)?;
+    static CLEANUP: std::sync::Once = std::sync::Once::new();
+    CLEANUP.call_once(|| {
+        cleanup_stale_remote_ssh_config_dirs_in(&base, process_exists);
+    });
     for attempt in 0..100 {
         let dir = base.join(format!("ssh-{}-{attempt}", std::process::id()));
         match create_remote_private_dir(&dir) {
@@ -222,6 +226,10 @@ pub(crate) fn create_remote_ssh_config_dir(_control_socket_name: &str) -> std::i
         std::io::ErrorKind::AlreadyExists,
         "failed to create private herdr ssh config directory",
     ))
+}
+
+fn cleanup_stale_remote_ssh_config_dirs_in(base: &Path, process_exists: impl Fn(u32) -> bool) {
+    super::cleanup_stale_remote_ssh_config_dirs(base, "ssh-", |_| true, process_exists);
 }
 
 pub(crate) fn create_remote_ssh_config_file(

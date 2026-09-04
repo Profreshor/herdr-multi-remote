@@ -49,6 +49,12 @@ pub(crate) fn create_remote_ssh_config_dir(control_socket_name: &str) -> std::io
     if bases.first() != Some(&short_tmp) {
         bases.push(short_tmp);
     }
+    static CLEANUP: std::sync::Once = std::sync::Once::new();
+    CLEANUP.call_once(|| {
+        for base in &bases {
+            cleanup_stale_remote_ssh_config_dirs_in(base, super::process_exists);
+        }
+    });
 
     let mut last_error = None;
     let mut path_fits = false;
@@ -86,6 +92,18 @@ pub(crate) fn create_remote_ssh_config_dir(control_socket_name: &str) -> std::io
         },
         message,
     ))
+}
+
+fn cleanup_stale_remote_ssh_config_dirs_in(base: &Path, process_exists: impl Fn(u32) -> bool) {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let current_uid = unsafe { libc::geteuid() };
+    super::cleanup_stale_remote_ssh_config_dirs(
+        base,
+        "herdr-ssh-",
+        |metadata| metadata.uid() == current_uid,
+        process_exists,
+    );
 }
 
 pub(crate) fn create_remote_ssh_config_file(path: &Path) -> std::io::Result<std::fs::File> {

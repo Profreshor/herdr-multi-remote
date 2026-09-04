@@ -234,6 +234,80 @@ pub(crate) struct RemoteSshConfigPaths {
     pub(crate) multiplexing: bool,
 }
 
+fn cleanup_stale_remote_ssh_config_dirs(
+    base: &std::path::Path,
+    prefix: &str,
+    owned_by_current_user: impl Fn(&std::fs::Metadata) -> bool,
+    process_exists: impl Fn(u32) -> bool,
+) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name
+            .to_str()
+            .and_then(|name| name.strip_prefix(prefix))
+        else {
+            continue;
+        };
+        let Some((pid, attempt)) = name.split_once('-') else {
+            continue;
+        };
+        let (Ok(pid), Ok(_attempt)) = (pid.parse::<u32>(), attempt.parse::<u32>()) else {
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if pid == 0 || !file_type.is_dir() || process_exists(pid) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !owned_by_current_user(&metadata) {
+            continue;
+        }
+        if let Err(err) = std::fs::remove_dir_all(entry.path()) {
+            tracing::warn!(path = %entry.path().display(), %err, "failed to remove stale remote ssh directory");
+        }
+    }
+}
+
+#[cfg(test)]
+mod remote_ssh_cleanup_tests {
+    use super::cleanup_stale_remote_ssh_config_dirs;
+
+    #[test]
+    fn preserves_live_and_unrelated_directories_for_each_platform_prefix() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock after Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-stale-ssh-cleanup-test-{}-{nonce}",
+            std::process::id()
+        ));
+
+        for prefix in ["herdr-ssh-", "ssh-"] {
+            let stale = root.join(format!("{prefix}41-0"));
+            let live = root.join(format!("{prefix}42-0"));
+            let unrelated = root.join(format!("not-{prefix}41-0"));
+            std::fs::create_dir_all(&stale).expect("create stale directory");
+            std::fs::create_dir_all(&live).expect("create live directory");
+            std::fs::create_dir_all(&unrelated).expect("create unrelated directory");
+
+            cleanup_stale_remote_ssh_config_dirs(&root, prefix, |_| true, |pid| pid == 42);
+
+            assert!(!stale.exists());
+            assert!(live.exists());
+            assert!(unrelated.exists());
+        }
+        std::fs::remove_dir_all(root).expect("remove test directory");
+    }
+}
+
 #[cfg(unix)]
 mod unix_common;
 #[cfg(unix)]
