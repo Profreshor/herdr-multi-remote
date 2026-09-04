@@ -1076,6 +1076,11 @@ impl ClientShellState {
         } else {
             panes
         };
+        let server = if self.server_ids.len() > 1 {
+            format!(" — {}", self.active_server_id.to_ascii_uppercase())
+        } else {
+            String::new()
+        };
         self.overlay = Some(ClientShellOverlay::ConfirmClose(
             ClientConfirmCloseOverlay {
                 workspace_id,
@@ -1084,7 +1089,7 @@ impl ClientShellState {
                 } else {
                     "Close workspace?".to_owned()
                 },
-                detail: format!("{} — {scope}", workspace.label),
+                detail: format!("{} — {scope}{server}", workspace.label),
             },
         ));
     }

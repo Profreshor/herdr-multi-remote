@@ -53,6 +53,10 @@ impl ClientShellState {
             snapshot,
             &self.config,
             render::ShellRenderState {
+                server_ids: &self.server_ids,
+                server_lifecycle: &self.server_lifecycle,
+                server_snapshots: &self.server_snapshots,
+                active_server_id: &self.active_server_id,
                 collapsed_groups: &self.collapsed_groups,
                 workspace_scroll: &mut self.workspace_scroll,
                 agent_scroll: &mut self.agent_scroll,
@@ -64,6 +68,9 @@ impl ClientShellState {
                 tab_drag_insert_index,
                 selected_workspace_id: (self.mode == ClientShellMode::Navigate)
                     .then_some(self.navigate_workspace_id.as_deref())
+                    .flatten(),
+                selected_server_id: (self.mode == ClientShellMode::Navigate)
+                    .then_some(self.navigate_server_id.as_deref())
                     .flatten(),
                 dragged_workspace_id,
                 workspace_drop_indicator_row,
@@ -399,6 +406,9 @@ impl ClientShellState {
                 &mut composed,
                 Rect::new(0, 0, cols, rows),
                 snapshot,
+                &self.server_ids,
+                &self.server_lifecycle,
+                &self.active_server_id,
                 &self.config,
                 self.navigate_workspace_id.as_deref(),
                 &mut self.mobile_switcher_scroll,
@@ -423,6 +433,9 @@ impl ClientShellState {
                     self.hits.global_launcher,
                     menu,
                     snapshot,
+                    &self.server_ids,
+                    &self.server_lifecycle,
+                    &self.active_server_id,
                     &self.config.palette,
                 )?;
                 None

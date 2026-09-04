@@ -80,16 +80,24 @@ pub(crate) fn render_global_menu(
     launcher: Rect,
     menu: &ClientGlobalMenuOverlay,
     snapshot: &ClientShellSnapshot,
+    server_ids: &[String],
+    server_lifecycle: &BTreeMap<String, ClientServerLifecycle>,
+    active_server_id: &str,
     palette: &Palette,
 ) -> Option<Vec<(Rect, usize)>> {
-    let items = super::super::global_menu::global_menu_items(snapshot);
+    let items = super::super::global_menu::global_menu_items(
+        snapshot,
+        server_ids,
+        server_lifecycle,
+        active_server_id,
+    );
     let screen = buffer.area;
     let width = items
         .iter()
         .map(|(label, action)| {
             display_width(label)
                 + u16::from(super::super::global_menu::global_menu_item_has_badge(
-                    snapshot, *action,
+                    snapshot, action,
                 )) * 2
         })
         .max()
@@ -127,7 +135,7 @@ pub(crate) fn render_global_menu(
             Style::default().fg(palette.text).bg(palette.panel_bg)
         };
         buffer.set_style(row, style);
-        let has_badge = super::super::global_menu::global_menu_item_has_badge(snapshot, *action);
+        let has_badge = super::super::global_menu::global_menu_item_has_badge(snapshot, action);
         if has_badge {
             let badge_style = if highlighted {
                 style

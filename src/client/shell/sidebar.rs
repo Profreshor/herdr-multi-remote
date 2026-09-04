@@ -27,6 +27,7 @@ pub(crate) fn render_collapsed_sidebar(
     area: Rect,
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
+    active_server_id: &str,
     selected_workspace_id: Option<&str>,
     hits: &mut ShellHitMap,
 ) {
@@ -85,6 +86,7 @@ pub(crate) fn render_collapsed_sidebar(
         );
         hits.workspaces.push(WorkspaceHit {
             rect,
+            server_id: active_server_id.to_owned(),
             workspace_id: workspace.workspace_id.clone(),
             indented: false,
             group_toggle: None,
@@ -177,6 +179,236 @@ pub(crate) fn render_collapsed_sidebar(
     );
 }
 
+fn render_fleet_spaces(
+    buffer: &mut Buffer,
+    body: Rect,
+    snapshot: &ClientShellSnapshot,
+    config: &ClientShellConfig,
+    state: &mut ShellRenderState<'_>,
+    hits: &mut ShellHitMap,
+) {
+    struct Row {
+        server_id: String,
+        workspace_id: Option<String>,
+        label: String,
+        status: Option<crate::api::schema::AgentStatus>,
+        focused: bool,
+        indented: bool,
+        last_child: bool,
+        group_toggle: Option<String>,
+    }
+
+    let mut rows = Vec::new();
+    for server_id in state.server_ids {
+        let lifecycle = state.server_lifecycle.get(server_id);
+        let suffix = match lifecycle {
+            Some(ClientServerLifecycle::Connected) => String::new(),
+            Some(ClientServerLifecycle::Connecting) => " · connecting".into(),
+            Some(ClientServerLifecycle::Reconnecting(_)) => " · reconnecting".into(),
+            Some(ClientServerLifecycle::Failed(_)) => " · failed".into(),
+            Some(ClientServerLifecycle::VersionMismatch(_)) => " · version mismatch".into(),
+            None => " · unavailable".into(),
+        };
+        rows.push(Row {
+            server_id: server_id.clone(),
+            workspace_id: None,
+            label: format!("▾ {}{suffix}", server_id.to_ascii_uppercase()),
+            status: None,
+            focused: false,
+            indented: false,
+            last_child: false,
+            group_toggle: None,
+        });
+        let projected = if server_id == state.active_server_id {
+            Some(snapshot)
+        } else {
+            state.server_snapshots.get(server_id).map(Box::as_ref)
+        };
+        if let Some(projected) = projected {
+            let expanded = HashSet::new();
+            let collapsed = if server_id == state.active_server_id {
+                state.collapsed_groups
+            } else {
+                &expanded
+            };
+            rows.extend(
+                workspace_entries(projected, collapsed)
+                    .into_iter()
+                    .filter_map(|entry| {
+                        let workspace = projected.workspaces.get(entry.index)?;
+                        let label = if entry.indented && !workspace.custom_label {
+                            workspace
+                                .branch
+                                .as_deref()
+                                .and_then(|branch| {
+                                    branch.strip_prefix("worktree/").or(Some(branch))
+                                })
+                                .unwrap_or(&workspace.label)
+                        } else {
+                            &workspace.label
+                        };
+                        Some(Row {
+                            server_id: server_id.clone(),
+                            workspace_id: Some(workspace.workspace_id.clone()),
+                            label: label.to_owned(),
+                            status: Some(displayed_workspace_status(
+                                projected, workspace, collapsed,
+                            )),
+                            focused: server_id == state.active_server_id && workspace.focused,
+                            indented: entry.indented,
+                            last_child: entry.last_child,
+                            group_toggle: (server_id == state.active_server_id)
+                                .then(|| parent_group_key(projected, entry.index))
+                                .flatten(),
+                        })
+                    }),
+            );
+        }
+    }
+
+    let heights = vec![1; rows.len()];
+    let gaps = vec![0; rows.len()];
+    let mut metrics =
+        super::scroll::list_scroll_metrics(&heights, &gaps, body.height, *state.workspace_scroll);
+    if !body.is_empty() && std::mem::take(state.reveal_focused_workspace) {
+        if let Some(target) = state
+            .selected_server_id
+            .zip(state.selected_workspace_id)
+            .and_then(|(server_id, workspace_id)| {
+                rows.iter().position(|row| {
+                    row.server_id == server_id && row.workspace_id.as_deref() == Some(workspace_id)
+                })
+            })
+        {
+            *state.workspace_scroll = super::scroll::list_scroll_start_to_reveal(
+                &heights,
+                &gaps,
+                body.height,
+                *state.workspace_scroll,
+                target,
+            );
+            metrics = super::scroll::list_scroll_metrics(
+                &heights,
+                &gaps,
+                body.height,
+                *state.workspace_scroll,
+            );
+        }
+    }
+    hits.workspace_max_scroll = metrics.max_offset_from_bottom;
+    hits.workspace_scroll_metrics = Some(metrics);
+    *state.workspace_scroll = metrics
+        .max_offset_from_bottom
+        .saturating_sub(metrics.offset_from_bottom);
+    let show_scrollbar = metrics.max_offset_from_bottom > 0 && body.width > 1;
+    let width = body.width.saturating_sub(u16::from(show_scrollbar));
+    for (index, row) in rows
+        .iter()
+        .skip(*state.workspace_scroll)
+        .take(body.height as usize)
+        .enumerate()
+    {
+        let rect = Rect::new(body.x, body.y + index as u16, width, 1);
+        if let Some(workspace_id) = row.workspace_id.as_deref() {
+            let selected = state.selected_server_id == Some(row.server_id.as_str())
+                && state.selected_workspace_id == Some(workspace_id);
+            if selected {
+                buffer.set_style(rect, Style::default().bg(config.palette.selection_bg));
+            } else if row.focused {
+                buffer.set_style(rect, Style::default().bg(config.palette.active_row_bg));
+            }
+            if let Some(status) = row.status {
+                let prefix = if row.indented {
+                    if row.last_child {
+                        "   └─ "
+                    } else {
+                        "   ├─ "
+                    }
+                } else {
+                    "  "
+                };
+                put_text(
+                    buffer,
+                    rect.x,
+                    rect.y,
+                    prefix.width().min(rect.width as usize) as u16,
+                    prefix,
+                    Style::default().fg(config.palette.overlay0),
+                );
+                put_text(
+                    buffer,
+                    rect.x.saturating_add(prefix.width() as u16),
+                    rect.y,
+                    2.min(rect.width.saturating_sub(prefix.width() as u16)),
+                    status_icon(status, config.status_indicators),
+                    Style::default().fg(status_color(status, &config.palette)),
+                );
+                let label_x = rect.x.saturating_add(prefix.width() as u16 + 2);
+                put_text(
+                    buffer,
+                    label_x,
+                    rect.y,
+                    rect.right().saturating_sub(label_x),
+                    &row.label,
+                    Style::default().fg(config.palette.text),
+                );
+            }
+            let group_toggle = row.group_toggle.as_ref().map(|key| {
+                let toggle = Rect::new(rect.right().saturating_sub(1), rect.y, 1, 1);
+                put_text(
+                    buffer,
+                    toggle.x,
+                    toggle.y,
+                    1,
+                    if state.collapsed_groups.contains(key) {
+                        "▸"
+                    } else {
+                        "▾"
+                    },
+                    Style::default().fg(config.palette.accent),
+                );
+                (toggle, key.clone())
+            });
+            hits.workspaces.push(WorkspaceHit {
+                rect,
+                server_id: row.server_id.clone(),
+                workspace_id: workspace_id.to_owned(),
+                indented: row.indented,
+                group_toggle,
+            });
+        } else {
+            let lifecycle = state.server_lifecycle.get(&row.server_id);
+            let color = match lifecycle {
+                Some(ClientServerLifecycle::Connected)
+                    if row.server_id == state.active_server_id =>
+                {
+                    config.palette.accent
+                }
+                Some(ClientServerLifecycle::Connected) => config.palette.overlay1,
+                Some(ClientServerLifecycle::Connecting)
+                | Some(ClientServerLifecycle::Reconnecting(_)) => config.palette.yellow,
+                Some(ClientServerLifecycle::Failed(_))
+                | Some(ClientServerLifecycle::VersionMismatch(_)) => config.palette.red,
+                None => config.palette.overlay0,
+            };
+            put_text(
+                buffer,
+                rect.x,
+                rect.y,
+                rect.width,
+                &row.label,
+                Style::default().fg(color),
+            );
+            hits.servers.push((rect, row.server_id.clone()));
+        }
+    }
+    if show_scrollbar {
+        let track = Rect::new(body.right().saturating_sub(1), body.y, 1, body.height);
+        hits.workspace_scrollbar = track;
+        super::scroll::render_list_scrollbar(buffer, track, metrics, &config.palette);
+    }
+}
+
 pub(crate) fn render_sidebar(
     buffer: &mut Buffer,
     area: Rect,
@@ -217,147 +449,152 @@ pub(crate) fn render_sidebar(
             .saturating_sub(WORKSPACE_HEADER_ROWS + 1),
     );
     hits.workspace_body = body;
-    let row_heights = entries
-        .iter()
-        .map(|entry| {
-            snapshot
-                .workspaces
-                .get(entry.index)
-                .map(|workspace| {
-                    workspace_rows(
-                        workspace,
-                        displayed_workspace_status(snapshot, workspace, state.collapsed_groups),
-                        entry.indented,
-                        &config.spaces,
-                    )
-                    .len()
-                    .max(1)
-                    .min(u16::MAX as usize) as u16
-                })
-                .unwrap_or(1)
-        })
-        .collect::<Vec<_>>();
-    let gaps = entries
-        .iter()
-        .enumerate()
-        .map(|(index, _)| {
-            entries
-                .get(index + 1)
-                .map_or(0, |next| u16::from(!next.indented) * config.spaces.row_gap)
-        })
-        .collect::<Vec<_>>();
-    let mut metrics = super::scroll::list_scroll_metrics(
-        &row_heights,
-        &gaps,
-        body.height,
-        *state.workspace_scroll,
-    );
-    if !body.is_empty() && std::mem::take(state.reveal_focused_workspace) {
-        if let Some(target) = entries
+    if state.server_ids.len() > 1 {
+        render_fleet_spaces(buffer, body, snapshot, config, state, hits);
+    } else {
+        let row_heights = entries
             .iter()
-            .position(|entry| snapshot.workspaces[entry.index].focused)
-        {
-            *state.workspace_scroll = super::scroll::list_scroll_start_to_reveal(
-                &row_heights,
-                &gaps,
-                body.height,
-                *state.workspace_scroll,
-                target,
-            );
-            metrics = super::scroll::list_scroll_metrics(
-                &row_heights,
-                &gaps,
-                body.height,
-                *state.workspace_scroll,
-            );
-        }
-    }
-    hits.workspace_max_scroll = metrics.max_offset_from_bottom;
-    hits.workspace_scroll_metrics = Some(metrics);
-    *state.workspace_scroll = metrics
-        .max_offset_from_bottom
-        .saturating_sub(metrics.offset_from_bottom);
-    let show_scrollbar = metrics.max_offset_from_bottom > 0 && body.width > 1;
-    let content_width = body.width.saturating_sub(u16::from(show_scrollbar));
-    let mut y = body.y;
-    for (entry_position, entry) in entries.iter().enumerate().skip(*state.workspace_scroll) {
-        let Some(workspace) = snapshot.workspaces.get(entry.index) else {
-            continue;
-        };
-        let status = displayed_workspace_status(snapshot, workspace, state.collapsed_groups);
-        let rows = workspace_rows(workspace, status, entry.indented, &config.spaces);
-        let row_height = (rows.len().max(1).min(u16::MAX as usize) as u16).min(body.height);
-        if y.saturating_add(row_height) > body.bottom() {
-            break;
-        }
-        let rect = Rect::new(body.x, y, content_width, row_height);
-        let selected = state.selected_workspace_id == Some(workspace.workspace_id.as_str());
-        let dragged = state.dragged_workspace_id == Some(workspace.workspace_id.as_str());
-        if selected {
-            buffer.set_style(rect, Style::default().bg(palette.selection_bg));
-        } else if dragged {
-            buffer.set_style(rect, Style::default().bg(palette.surface1));
-        } else if workspace.focused {
-            buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
-        }
-        render_workspace_rows(
-            buffer,
-            rect,
-            workspace,
-            status,
-            config.status_indicators,
-            entry,
-            rows,
-            selected,
-            dragged,
-            palette,
+            .map(|entry| {
+                snapshot
+                    .workspaces
+                    .get(entry.index)
+                    .map(|workspace| {
+                        workspace_rows(
+                            workspace,
+                            displayed_workspace_status(snapshot, workspace, state.collapsed_groups),
+                            entry.indented,
+                            &config.spaces,
+                        )
+                        .len()
+                        .max(1)
+                        .min(u16::MAX as usize) as u16
+                    })
+                    .unwrap_or(1)
+            })
+            .collect::<Vec<_>>();
+        let gaps = entries
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                entries
+                    .get(index + 1)
+                    .map_or(0, |next| u16::from(!next.indented) * config.spaces.row_gap)
+            })
+            .collect::<Vec<_>>();
+        let mut metrics = super::scroll::list_scroll_metrics(
+            &row_heights,
+            &gaps,
+            body.height,
+            *state.workspace_scroll,
         );
-        let group_toggle = parent_group_key(snapshot, entry.index).map(|key| {
-            let rect = Rect::new(rect.right().saturating_sub(1), rect.y, 1, 1);
+        if !body.is_empty() && std::mem::take(state.reveal_focused_workspace) {
+            if let Some(target) = entries
+                .iter()
+                .position(|entry| snapshot.workspaces[entry.index].focused)
+            {
+                *state.workspace_scroll = super::scroll::list_scroll_start_to_reveal(
+                    &row_heights,
+                    &gaps,
+                    body.height,
+                    *state.workspace_scroll,
+                    target,
+                );
+                metrics = super::scroll::list_scroll_metrics(
+                    &row_heights,
+                    &gaps,
+                    body.height,
+                    *state.workspace_scroll,
+                );
+            }
+        }
+        hits.workspace_max_scroll = metrics.max_offset_from_bottom;
+        hits.workspace_scroll_metrics = Some(metrics);
+        *state.workspace_scroll = metrics
+            .max_offset_from_bottom
+            .saturating_sub(metrics.offset_from_bottom);
+        let show_scrollbar = metrics.max_offset_from_bottom > 0 && body.width > 1;
+        let content_width = body.width.saturating_sub(u16::from(show_scrollbar));
+        let mut y = body.y;
+        for (entry_position, entry) in entries.iter().enumerate().skip(*state.workspace_scroll) {
+            let Some(workspace) = snapshot.workspaces.get(entry.index) else {
+                continue;
+            };
+            let status = displayed_workspace_status(snapshot, workspace, state.collapsed_groups);
+            let rows = workspace_rows(workspace, status, entry.indented, &config.spaces);
+            let row_height = (rows.len().max(1).min(u16::MAX as usize) as u16).min(body.height);
+            if y.saturating_add(row_height) > body.bottom() {
+                break;
+            }
+            let rect = Rect::new(body.x, y, content_width, row_height);
+            let selected = state.selected_workspace_id == Some(workspace.workspace_id.as_str());
+            let dragged = state.dragged_workspace_id == Some(workspace.workspace_id.as_str());
+            if selected {
+                buffer.set_style(rect, Style::default().bg(palette.selection_bg));
+            } else if dragged {
+                buffer.set_style(rect, Style::default().bg(palette.surface1));
+            } else if workspace.focused {
+                buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
+            }
+            render_workspace_rows(
+                buffer,
+                rect,
+                workspace,
+                status,
+                config.status_indicators,
+                entry,
+                rows,
+                selected,
+                dragged,
+                palette,
+            );
+            let group_toggle = parent_group_key(snapshot, entry.index).map(|key| {
+                let rect = Rect::new(rect.right().saturating_sub(1), rect.y, 1, 1);
+                put_text(
+                    buffer,
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    if state.collapsed_groups.contains(&key) {
+                        "▸"
+                    } else {
+                        "▾"
+                    },
+                    Style::default().fg(palette.accent),
+                );
+                (rect, key)
+            });
+            hits.workspaces.push(WorkspaceHit {
+                rect,
+                server_id: state.active_server_id.to_owned(),
+                workspace_id: workspace.workspace_id.clone(),
+                indented: entry.indented,
+                group_toggle,
+            });
+            let gap = entries
+                .get(entry_position + 1)
+                .map_or(0, |next| u16::from(!next.indented) * config.spaces.row_gap);
+            y = y.saturating_add(row_height + gap);
+        }
+
+        if show_scrollbar {
+            let track = Rect::new(body.right().saturating_sub(1), body.y, 1, body.height);
+            hits.workspace_scrollbar = track;
+            super::scroll::render_list_scrollbar(buffer, track, metrics, palette);
+        }
+
+        if let Some(row) = state.workspace_drop_indicator_row.filter(|row| {
+            *row >= workspace_area.y.saturating_add(1)
+                && *row < workspace_area.bottom().saturating_sub(1)
+        }) {
             put_text(
                 buffer,
-                rect.x,
-                rect.y,
-                rect.width,
-                if state.collapsed_groups.contains(&key) {
-                    "▸"
-                } else {
-                    "▾"
-                },
+                body.x,
+                row,
+                body.width,
+                &"─".repeat(body.width as usize),
                 Style::default().fg(palette.accent),
             );
-            (rect, key)
-        });
-        hits.workspaces.push(WorkspaceHit {
-            rect,
-            workspace_id: workspace.workspace_id.clone(),
-            indented: entry.indented,
-            group_toggle,
-        });
-        let gap = entries
-            .get(entry_position + 1)
-            .map_or(0, |next| u16::from(!next.indented) * config.spaces.row_gap);
-        y = y.saturating_add(row_height + gap);
-    }
-
-    if show_scrollbar {
-        let track = Rect::new(body.right().saturating_sub(1), body.y, 1, body.height);
-        hits.workspace_scrollbar = track;
-        super::scroll::render_list_scrollbar(buffer, track, metrics, palette);
-    }
-
-    if let Some(row) = state.workspace_drop_indicator_row.filter(|row| {
-        *row >= workspace_area.y.saturating_add(1)
-            && *row < workspace_area.bottom().saturating_sub(1)
-    }) {
-        put_text(
-            buffer,
-            body.x,
-            row,
-            body.width,
-            &"─".repeat(body.width as usize),
-            Style::default().fg(palette.accent),
-        );
+        }
     }
 
     let footer_y = workspace_area.bottom().saturating_sub(1);

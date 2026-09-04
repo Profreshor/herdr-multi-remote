@@ -1,9 +1,10 @@
 use super::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ClientGlobalMenuAction {
     Binding(crate::input::KeybindAction),
     WhatsNew,
+    ActivateServer(String),
 }
 
 pub(super) fn global_menu_attention(snapshot: &ClientShellSnapshot) -> bool {
@@ -12,27 +13,30 @@ pub(super) fn global_menu_attention(snapshot: &ClientShellSnapshot) -> bool {
 
 pub(super) fn global_menu_item_has_badge(
     snapshot: &ClientShellSnapshot,
-    action: ClientGlobalMenuAction,
+    action: &ClientGlobalMenuAction,
 ) -> bool {
-    (action == ClientGlobalMenuAction::WhatsNew && snapshot.update_available.is_some())
-        || (action == ClientGlobalMenuAction::Binding(crate::input::KeybindAction::Settings)
+    (action == &ClientGlobalMenuAction::WhatsNew && snapshot.update_available.is_some())
+        || (action == &ClientGlobalMenuAction::Binding(crate::input::KeybindAction::Settings)
             && snapshot.integration_updates_available)
 }
 
 pub(super) fn global_menu_items(
     snapshot: &ClientShellSnapshot,
-) -> Vec<(&'static str, ClientGlobalMenuAction)> {
+    server_ids: &[String],
+    server_lifecycle: &BTreeMap<String, ClientServerLifecycle>,
+    active_server_id: &str,
+) -> Vec<(String, ClientGlobalMenuAction)> {
     let mut items = vec![
         (
-            "settings",
+            "settings".into(),
             ClientGlobalMenuAction::Binding(crate::input::KeybindAction::Settings),
         ),
         (
-            "keybinds",
+            "keybinds".into(),
             ClientGlobalMenuAction::Binding(crate::input::KeybindAction::Help),
         ),
         (
-            "reload config",
+            "reload config".into(),
             ClientGlobalMenuAction::Binding(crate::input::KeybindAction::ReloadConfig),
         ),
     ];
@@ -42,12 +46,39 @@ pub(super) fn global_menu_items(
                 "update ready"
             } else {
                 "what's new"
-            },
+            }
+            .into(),
             ClientGlobalMenuAction::WhatsNew,
         ));
     }
+    if server_ids.len() > 1 {
+        items.extend(server_ids.iter().map(|server_id| {
+            let suffix = match server_lifecycle.get(server_id) {
+                Some(ClientServerLifecycle::Connected) if server_id == active_server_id => {
+                    " ✓".to_owned()
+                }
+                Some(ClientServerLifecycle::Connected) => String::new(),
+                Some(ClientServerLifecycle::Connecting) => " (connecting)".to_owned(),
+                Some(ClientServerLifecycle::Reconnecting(error)) => {
+                    format!(" (reconnecting: {})", error.lines().next().unwrap_or(error))
+                }
+                Some(ClientServerLifecycle::Failed(error)) => {
+                    format!(" (failed: {})", error.lines().next().unwrap_or(error))
+                }
+                Some(ClientServerLifecycle::VersionMismatch(error)) => format!(
+                    " (version mismatch: {})",
+                    error.lines().next().unwrap_or(error)
+                ),
+                None => " (unavailable)".to_owned(),
+            };
+            (
+                format!("server: {}{suffix}", server_id.to_ascii_uppercase()),
+                ClientGlobalMenuAction::ActivateServer(server_id.clone()),
+            )
+        }));
+    }
     items.push((
-        "detach",
+        "detach".into(),
         ClientGlobalMenuAction::Binding(crate::input::KeybindAction::Detach),
     ));
     items
@@ -68,7 +99,14 @@ impl ClientShellState {
         let item_count = self
             .snapshot
             .as_deref()
-            .map(global_menu_items)
+            .map(|snapshot| {
+                global_menu_items(
+                    snapshot,
+                    &self.server_ids,
+                    &self.server_lifecycle,
+                    &self.active_server_id,
+                )
+            })
             .map_or(0, |items| items.len());
         let Some(ClientShellOverlay::GlobalMenu(menu)) = self.overlay.as_mut() else {
             return;
@@ -83,9 +121,14 @@ impl ClientShellState {
         outcome: &mut ClientShellInput,
     ) {
         let Some(action) = self.snapshot.as_deref().and_then(|snapshot| {
-            global_menu_items(snapshot)
-                .get(index)
-                .map(|(_, action)| *action)
+            global_menu_items(
+                snapshot,
+                &self.server_ids,
+                &self.server_lifecycle,
+                &self.active_server_id,
+            )
+            .get(index)
+            .map(|(_, action)| action.clone())
         }) else {
             return;
         };
@@ -104,6 +147,11 @@ impl ClientShellState {
                 self.record_binding(crate::input::KeybindMatch::Action(binding), outcome)
             }
             ClientGlobalMenuAction::WhatsNew => self.open_release_notes(),
+            ClientGlobalMenuAction::ActivateServer(server_id) => {
+                outcome
+                    .actions
+                    .push(ClientShellAction::ActivateServer(server_id));
+            }
         }
         outcome.repaint = true;
     }

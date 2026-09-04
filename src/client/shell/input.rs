@@ -623,6 +623,7 @@ impl ClientShellState {
         {
             self.mode = self.copy_or_terminal_mode();
             self.navigate_workspace_id = None;
+            self.navigate_server_id = None;
             outcome.repaint = true;
             return;
         }
@@ -666,6 +667,7 @@ impl ClientShellState {
             if valid {
                 self.mode = ClientShellMode::Terminal;
                 self.navigate_workspace_id = None;
+                self.navigate_server_id = None;
                 self.record_binding(
                     KeybindMatch::Action(KeybindAction::SwitchWorkspace(index)),
                     outcome,
@@ -680,15 +682,26 @@ impl ClientShellState {
             match code {
                 KeyCode::Enter => {
                     let selected = self.navigate_workspace_id.clone();
+                    let selected_server = self.navigate_server_id.clone();
                     self.mode = ClientShellMode::Terminal;
                     self.navigate_workspace_id = None;
+                    self.navigate_server_id = None;
                     if let Some(workspace_id) = selected {
-                        self.push_endpoint_method(
-                            crate::api::schema::Method::WorkspaceFocus(
-                                crate::api::schema::WorkspaceTarget { workspace_id },
-                            ),
-                            outcome,
-                        );
+                        let server_id =
+                            selected_server.unwrap_or_else(|| self.active_server_id.clone());
+                        if server_id == self.active_server_id {
+                            self.push_endpoint_method(
+                                crate::api::schema::Method::WorkspaceFocus(
+                                    crate::api::schema::WorkspaceTarget { workspace_id },
+                                ),
+                                outcome,
+                            );
+                        } else {
+                            outcome.actions.push(ClientShellAction::ActivateWorkspace {
+                                server_id,
+                                workspace_id,
+                            });
+                        }
                     }
                     outcome.repaint = true;
                     return;
@@ -849,6 +862,7 @@ impl ClientShellState {
                 self.mode = self.copy_or_terminal_mode();
             }
             self.navigate_workspace_id = None;
+            self.navigate_server_id = None;
         }
         outcome.repaint = true;
     }
@@ -858,6 +872,42 @@ impl ClientShellState {
             return;
         };
         let mobile = self.mobile_layout_active();
+        if !mobile && self.server_ids.len() > 1 {
+            let targets = self
+                .server_ids
+                .iter()
+                .flat_map(|server_id| {
+                    let projected = if server_id == &self.active_server_id {
+                        Some(snapshot)
+                    } else {
+                        self.server_snapshots.get(server_id).map(Box::as_ref)
+                    };
+                    projected.into_iter().flat_map(move |projected| {
+                        projected.workspaces.iter().map(move |workspace| {
+                            (server_id.clone(), workspace.workspace_id.clone())
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+            if targets.is_empty() {
+                return;
+            }
+            let current = self
+                .navigate_server_id
+                .as_ref()
+                .zip(self.navigate_workspace_id.as_ref())
+                .and_then(|(server_id, workspace_id)| {
+                    targets
+                        .iter()
+                        .position(|target| &target.0 == server_id && &target.1 == workspace_id)
+                })
+                .unwrap_or(0);
+            let next = (current as isize + delta).rem_euclid(targets.len() as isize) as usize;
+            self.navigate_server_id = Some(targets[next].0.clone());
+            self.navigate_workspace_id = Some(targets[next].1.clone());
+            self.reveal_focused_workspace = true;
+            return;
+        }
         let entries = self.navigation_workspace_entries(snapshot);
         if entries.is_empty() {
             return;
@@ -880,6 +930,7 @@ impl ClientShellState {
             .workspace_id
             .clone();
         self.navigate_workspace_id = Some(workspace_id.clone());
+        self.navigate_server_id = Some(self.active_server_id.clone());
         self.reveal_mobile_workspace = mobile;
         if !mobile {
             self.reveal_workspace(&workspace_id);
@@ -973,6 +1024,12 @@ impl ClientShellState {
     pub(crate) fn clipboard_image_target(
         &self,
     ) -> Option<crate::protocol::ClientClipboardImageTarget> {
+        if !matches!(
+            self.server_lifecycle.get(&self.active_server_id),
+            Some(ClientServerLifecycle::Connected)
+        ) {
+            return None;
+        }
         if matches!(
             self.overlay,
             Some(

@@ -473,12 +473,17 @@ impl ClientShellState {
             .hits
             .workspaces
             .iter()
-            .filter(|hit| !hit.indented)
+            .filter(|hit| hit.server_id == self.active_server_id && !hit.indented)
             .map(|hit| (Some(hit.workspace_id.clone()), hit.rect.y.saturating_sub(1)))
             .collect::<Vec<_>>();
         let snapshot = self.snapshot.as_deref()?;
         let entries = render::workspace_entries(snapshot, &self.collapsed_groups);
-        let last_hit = self.hits.workspaces.last()?;
+        let last_hit = self
+            .hits
+            .workspaces
+            .iter()
+            .rev()
+            .find(|hit| hit.server_id == self.active_server_id)?;
         let last_position = entries.iter().position(|entry| {
             snapshot
                 .workspaces
@@ -1103,6 +1108,9 @@ impl ClientShellState {
                 None => {}
             }
             if let Some(press) = self.workspace_press.as_ref() {
+                if press.server_id != self.active_server_id {
+                    return;
+                }
                 let delta = mouse
                     .column
                     .abs_diff(press.start_column)
@@ -1268,14 +1276,21 @@ impl ClientShellState {
                 return;
             }
             if let Some(press) = self.workspace_press.take() {
-                self.push_endpoint_method(
-                    crate::api::schema::Method::WorkspaceFocus(
-                        crate::api::schema::WorkspaceTarget {
-                            workspace_id: press.workspace_id,
-                        },
-                    ),
-                    outcome,
-                );
+                if press.server_id == self.active_server_id {
+                    self.push_endpoint_method(
+                        crate::api::schema::Method::WorkspaceFocus(
+                            crate::api::schema::WorkspaceTarget {
+                                workspace_id: press.workspace_id,
+                            },
+                        ),
+                        outcome,
+                    );
+                } else {
+                    outcome.actions.push(ClientShellAction::ActivateWorkspace {
+                        server_id: press.server_id,
+                        workspace_id: press.workspace_id,
+                    });
+                }
                 return;
             }
             if let Some(press) = self.tab_press.take() {
@@ -2017,12 +2032,26 @@ impl ClientShellState {
                         }
                     }
                 }
+                if let Some((_, server_id)) = self
+                    .hits
+                    .servers
+                    .iter()
+                    .find(|(rect, _)| super::contains(*rect, point))
+                {
+                    if server_id != &self.active_server_id {
+                        outcome
+                            .actions
+                            .push(ClientShellAction::ActivateServer(server_id.clone()));
+                    }
+                    return;
+                }
                 let workspace_press = self
                     .hits
                     .workspaces
                     .iter()
                     .find(|hit| super::contains(hit.rect, point))
                     .map(|hit| ClientWorkspacePress {
+                        server_id: hit.server_id.clone(),
                         workspace_id: hit.workspace_id.clone(),
                         start_column: mouse.column,
                         start_row: mouse.row,

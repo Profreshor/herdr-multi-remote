@@ -5,6 +5,14 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 
+fn notification_title(server_id: &str, title: &str) -> String {
+    if server_id == "local" {
+        title.to_owned()
+    } else {
+        format!("[{}] {title}", server_id.to_ascii_uppercase())
+    }
+}
+
 fn render_mobile_notice_banner(
     buffer: &mut Buffer,
     area: Rect,
@@ -91,6 +99,7 @@ pub(super) fn render_mobile_notification_banner(
             palette.accent
         }
     };
+    let title = notification_title(&notification.server_id, &title);
     render_mobile_notice_banner(
         buffer,
         area,
@@ -209,10 +218,11 @@ pub(super) fn render_visible_notification(
             palette.accent
         }
     };
+    let title = notification_title(&notification.server_id, &event.title);
     render_notification_card(
         buffer,
         area,
-        &event.title,
+        &title,
         event.body.as_deref().unwrap_or_default(),
         event.position.unwrap_or(default_position),
         top_offset,
@@ -253,6 +263,19 @@ impl ClientShellState {
             return;
         };
         outcome.repaint = true;
+        if notification.server_id != self.active_server_id {
+            if let Some(pane_id) = notification.event.pane_id {
+                outcome.actions.push(ClientShellAction::ActivatePane {
+                    server_id: notification.server_id,
+                    pane_id,
+                });
+            } else {
+                outcome
+                    .actions
+                    .push(ClientShellAction::ActivateServer(notification.server_id));
+            }
+            return;
+        }
         if let Some(pane_id) = notification.event.pane_id {
             self.push_endpoint_method(
                 crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget { pane_id }),
@@ -261,8 +284,18 @@ impl ClientShellState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn receive_notification(
         &mut self,
+        event: SemanticNotification,
+        now: std::time::Instant,
+    ) -> (Vec<ClientShellNotificationEffect>, bool) {
+        self.receive_notification_from(self.active_server_id.clone(), event, now)
+    }
+
+    pub(crate) fn receive_notification_from(
+        &mut self,
+        server_id: String,
         event: SemanticNotification,
         now: std::time::Instant,
     ) -> (Vec<ClientShellNotificationEffect>, bool) {
@@ -275,18 +308,20 @@ impl ClientShellState {
             .checked_add(std::time::Duration::from_secs(delay))
             .unwrap_or(now);
         let cleared_visible = event.pane_id.as_deref().is_some_and(|pane_id| {
-            self.visible_notification
-                .as_ref()
-                .is_some_and(|visible| visible.event.pane_id.as_deref() == Some(pane_id))
+            self.visible_notification.as_ref().is_some_and(|visible| {
+                visible.server_id == server_id && visible.event.pane_id.as_deref() == Some(pane_id)
+            })
         });
         if let Some(pane_id) = event.pane_id.as_deref() {
-            self.pending_notifications
-                .retain(|pending| pending.event.pane_id.as_deref() != Some(pane_id));
+            self.pending_notifications.retain(|pending| {
+                pending.server_id != server_id || pending.event.pane_id.as_deref() != Some(pane_id)
+            });
             if cleared_visible {
                 self.visible_notification = None;
             }
         }
         self.pending_notifications.push(ClientPendingNotification {
+            server_id,
             event,
             deadline,
             validate_state: delay > 0,
@@ -324,10 +359,13 @@ impl ClientShellState {
                 self.pending_notifications.push(pending);
                 continue;
             }
-            if pending.validate_state && !self.notification_still_current(&pending.event) {
+            if pending.validate_state
+                && !self.notification_still_current(&pending.server_id, &pending.event)
+            {
                 continue;
             }
-            let target_active = self.notification_target_is_active(&pending.event);
+            let target_active =
+                self.notification_target_is_active(&pending.server_id, &pending.event);
             let suppress_external = target_active && self.outer_focused != Some(false);
             if let Some(sound) = pending.event.sound {
                 let suppress_sound =
@@ -353,6 +391,7 @@ impl ClientShellState {
                         SemanticNotificationKind::Custom => 5,
                     };
                     self.visible_notification = Some(ClientVisibleNotification {
+                        server_id: pending.server_id,
                         event: pending.event,
                         deadline: now + std::time::Duration::from_secs(duration),
                     });
@@ -361,13 +400,13 @@ impl ClientShellState {
                 crate::config::ToastDelivery::Herdr => {}
                 crate::config::ToastDelivery::Terminal if !suppress_external => {
                     effects.push(ClientShellNotificationEffect::Terminal {
-                        title: pending.event.title,
+                        title: notification_title(&pending.server_id, &pending.event.title),
                         body: pending.event.body,
                     });
                 }
                 crate::config::ToastDelivery::System if !suppress_external => {
                     effects.push(ClientShellNotificationEffect::System {
-                        title: pending.event.title,
+                        title: notification_title(&pending.server_id, &pending.event.title),
                         body: pending.event.body,
                     });
                 }
@@ -377,7 +416,10 @@ impl ClientShellState {
         (effects, repaint)
     }
 
-    fn notification_target_is_active(&self, event: &SemanticNotification) -> bool {
+    fn notification_target_is_active(&self, server_id: &str, event: &SemanticNotification) -> bool {
+        if server_id != self.active_server_id {
+            return false;
+        }
         let Some(snapshot) = self.snapshot.as_deref() else {
             return false;
         };
@@ -389,7 +431,10 @@ impl ClientShellState {
         })
     }
 
-    fn notification_still_current(&self, event: &SemanticNotification) -> bool {
+    fn notification_still_current(&self, server_id: &str, event: &SemanticNotification) -> bool {
+        if server_id != self.active_server_id {
+            return true;
+        }
         let Some(pane_id) = event.pane_id.as_deref() else {
             return true;
         };
@@ -420,6 +465,7 @@ mod tests {
 
     fn notification() -> ClientVisibleNotification {
         ClientVisibleNotification {
+            server_id: "local".into(),
             event: SemanticNotification {
                 kind: SemanticNotificationKind::Custom,
                 title: "notice".into(),

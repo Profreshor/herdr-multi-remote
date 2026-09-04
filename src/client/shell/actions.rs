@@ -1,6 +1,26 @@
 use super::*;
 
 impl ClientShellState {
+    pub(crate) fn focus_workspace(&mut self, workspace_id: String) -> ClientShellInput {
+        let mut outcome = ClientShellInput::default();
+        self.push_endpoint_method(
+            crate::api::schema::Method::WorkspaceFocus(crate::api::schema::WorkspaceTarget {
+                workspace_id,
+            }),
+            &mut outcome,
+        );
+        outcome
+    }
+
+    pub(crate) fn focus_pane(&mut self, pane_id: String) -> ClientShellInput {
+        let mut outcome = ClientShellInput::default();
+        self.push_endpoint_method(
+            crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget { pane_id }),
+            &mut outcome,
+        );
+        outcome
+    }
+
     pub(super) fn record_binding(
         &mut self,
         binding: crate::input::KeybindMatch,
@@ -129,6 +149,7 @@ impl ClientShellState {
                     self.mobile_switcher_scroll = 0;
                     self.reveal_mobile_workspace = false;
                     self.mode = ClientShellMode::Navigate;
+                    self.navigate_server_id = Some(self.active_server_id.clone());
                     self.navigate_workspace_id = self
                         .snapshot
                         .as_deref()
@@ -412,6 +433,21 @@ impl ClientShellState {
             return false;
         }
         let method_name = crate::api::api_method_name(&method).to_owned();
+        if !matches!(
+            self.server_lifecycle.get(&self.active_server_id),
+            Some(ClientServerLifecycle::Connected)
+        ) {
+            outcome.repaint |= self.push_endpoint_notice(
+                ClientEndpointNoticeKind::Unavailable,
+                "server",
+                "Server unavailable",
+                format!(
+                    "{} is not connected. Try this action again after it reconnects.",
+                    self.active_server_id
+                ),
+            );
+            return false;
+        }
         if !self.supports_endpoint_method(&method) {
             outcome.repaint |= self.push_endpoint_notice(
                 ClientEndpointNoticeKind::Unsupported,
@@ -636,7 +672,7 @@ impl ClientShellState {
                         text,
                     }) if returned_pane_id == pane_id => text,
                     Ok(crate::api::schema::ResponseResult::PaneSelection { .. }) => {
-                        return (false, Vec::new())
+                        return (false, Vec::new());
                     }
                     Ok(_) => {
                         self.endpoint_error = Some(

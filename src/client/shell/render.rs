@@ -196,6 +196,10 @@ pub(super) fn render_mode_bar(
 }
 
 pub(super) struct ShellRenderState<'a> {
+    pub(super) server_ids: &'a [String],
+    pub(super) server_lifecycle: &'a BTreeMap<String, ClientServerLifecycle>,
+    pub(super) server_snapshots: &'a BTreeMap<String, Box<ClientShellSnapshot>>,
+    pub(super) active_server_id: &'a str,
     pub(super) collapsed_groups: &'a HashSet<String>,
     pub(super) workspace_scroll: &'a mut usize,
     pub(super) agent_scroll: &'a mut usize,
@@ -206,6 +210,7 @@ pub(super) struct ShellRenderState<'a> {
     pub(super) sidebar_section_split: f32,
     pub(super) tab_drag_insert_index: Option<usize>,
     pub(super) selected_workspace_id: Option<&'a str>,
+    pub(super) selected_server_id: Option<&'a str>,
     pub(super) dragged_workspace_id: Option<&'a str>,
     pub(super) workspace_drop_indicator_row: Option<u16>,
 }
@@ -234,6 +239,7 @@ pub(super) fn render_shell(
                 layout.sidebar,
                 snapshot,
                 config,
+                state.active_server_id,
                 state.selected_workspace_id,
                 &mut hits,
             );

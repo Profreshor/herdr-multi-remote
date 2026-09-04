@@ -354,6 +354,9 @@ pub(super) fn render_mobile_switcher(
     buffer: &mut Buffer,
     area: Rect,
     snapshot: &ClientShellSnapshot,
+    server_ids: &[String],
+    server_lifecycle: &BTreeMap<String, ClientServerLifecycle>,
+    active_server_id: &str,
     config: &ClientShellConfig,
     selected_workspace_id: Option<&str>,
     scroll: &mut usize,
@@ -426,6 +429,9 @@ pub(super) fn render_mobile_switcher(
 
     let items = mobile_items(
         snapshot,
+        server_ids,
+        server_lifecycle,
+        active_server_id,
         config,
         selected_workspace_id,
         viewport.width.saturating_sub(1),
@@ -558,6 +564,9 @@ fn render_close_button(buffer: &mut Buffer, area: Rect, palette: &Palette) {
 
 fn mobile_items(
     snapshot: &ClientShellSnapshot,
+    server_ids: &[String],
+    server_lifecycle: &BTreeMap<String, ClientServerLifecycle>,
+    active_server_id: &str,
     config: &ClientShellConfig,
     selected_workspace_id: Option<&str>,
     content_width: u16,
@@ -809,9 +818,14 @@ fn mobile_items(
     }
 
     items.push(MobileItem::section("menu", palette));
-    for (index, (label, _)) in super::global_menu::global_menu_items(snapshot)
-        .into_iter()
-        .enumerate()
+    for (index, (label, _)) in super::global_menu::global_menu_items(
+        snapshot,
+        server_ids,
+        server_lifecycle,
+        active_server_id,
+    )
+    .into_iter()
+    .enumerate()
     {
         items.push(MobileItem {
             lines: vec![Line::from(Span::styled(
@@ -935,12 +949,17 @@ impl ClientShellState {
             }
             Some(ClientMobileTarget::Menu(index)) => {
                 let actionable = self.snapshot.as_deref().is_some_and(|snapshot| {
-                    super::global_menu::global_menu_items(snapshot)
-                        .get(index)
-                        .is_some_and(|(_, action)| {
-                            *action != super::global_menu::ClientGlobalMenuAction::WhatsNew
-                                || snapshot.release_notes.is_some()
-                        })
+                    super::global_menu::global_menu_items(
+                        snapshot,
+                        &self.server_ids,
+                        &self.server_lifecycle,
+                        &self.active_server_id,
+                    )
+                    .get(index)
+                    .is_some_and(|(_, action)| {
+                        action != &super::global_menu::ClientGlobalMenuAction::WhatsNew
+                            || snapshot.release_notes.is_some()
+                    })
                 });
                 if actionable {
                     self.mobile_switcher_suspended = true;
