@@ -1768,7 +1768,10 @@ impl ClientShellState {
                         self.hits
                             .workspaces
                             .iter()
-                            .find(|hit| super::contains(hit.rect, point))
+                            .find(|hit| {
+                                hit.server_id == self.active_server_id
+                                    && super::contains(hit.rect, point)
+                            })
                             .map(|hit| hit.workspace_id.clone())
                     })
                     .flatten();

@@ -118,6 +118,67 @@ fn fleet_sidebar_namespaces_duplicate_workspace_ids_and_routes_remote_clicks() {
     ));
 }
 
+#[test]
+fn fleet_workspace_context_menu_does_not_cross_server_ownership() {
+    let mut local = snapshot();
+    local.workspaces[0].branch = None;
+    let mut remote = snapshot();
+    remote.workspaces[0].branch = Some("remote-branch".into());
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.configure_servers(vec!["local".into(), "analytics".into()]);
+    state.set_server_lifecycle("analytics", ClientServerLifecycle::Connected);
+    state.set_snapshot(Box::new(local));
+    state.set_server_snapshot("analytics".into(), Box::new(remote));
+    state.set_pane_surface(surface());
+    state.compose(100, 28).expect("fleet frame");
+
+    let remote_hit = state
+        .hits
+        .workspaces
+        .iter()
+        .find(|hit| hit.server_id == "analytics" && hit.workspace_id == "ws_1")
+        .expect("remote workspace hit")
+        .rect;
+    let outcome =
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: remote_hit.x,
+            row: remote_hit.y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })]);
+
+    assert!(outcome.actions.is_empty());
+    assert!(state.overlay.is_none());
+
+    state.set_active_server("analytics".into());
+    state.set_pane_surface(surface());
+    state.compose(100, 28).expect("remote fleet frame");
+    let remote_hit = state
+        .hits
+        .workspaces
+        .iter()
+        .find(|hit| hit.server_id == "analytics" && hit.workspace_id == "ws_1")
+        .expect("active remote workspace hit")
+        .rect;
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: remote_hit.x,
+        row: remote_hit.y,
+        modifiers: crossterm::event::KeyModifiers::empty(),
+    })]);
+    assert!(matches!(
+        state.overlay,
+        Some(ClientShellOverlay::ContextMenu(ClientContextMenuOverlay {
+            target: ClientContextMenuTarget::Workspace {
+                ref workspace_id,
+                is_git: true,
+                ..
+            },
+            ..
+        })) if workspace_id == "ws_1"
+    ));
+}
+
 fn fleet_state_with_duplicate_remote_resource_ids() -> ClientShellState {
     let mut local = snapshot();
     local.boot_id = "local-boot".into();
