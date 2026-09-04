@@ -813,9 +813,14 @@ impl HeadlessServer {
         if !self.app.direct_graphics_available {
             self.retire_all_direct_graphics();
         }
+        let hidden_shell_focus = self
+            .clients
+            .values()
+            .any(|client| client.is_shell_client() && !client.shell_presentation_visible)
+            .then_some(false);
         let Some(client_id) = self.foreground_client_id else {
             self.effective_size = self.headless_size;
-            self.app.state.outer_terminal_focus = None;
+            self.app.state.outer_terminal_focus = hidden_shell_focus;
             self.app.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
             self.sync_runtime_view_geometry();
             let server_keybindings = self.server_keybindings.clone();
@@ -826,7 +831,7 @@ impl HeadlessServer {
         let Some(client) = self.clients.get(&client_id) else {
             self.foreground_client_id = None;
             self.effective_size = self.headless_size;
-            self.app.state.outer_terminal_focus = None;
+            self.app.state.outer_terminal_focus = hidden_shell_focus;
             self.app.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
             self.sync_runtime_view_geometry();
             let server_keybindings = self.server_keybindings.clone();
@@ -2109,6 +2114,8 @@ impl HeadlessServer {
                     self.sync_foreground_client_state();
                     self.claim_unowned_shell_tab_geometry(client_id, true);
                     self.nudge_handoff_panes_on_first_client_attach();
+                } else if self.foreground_client_id.is_none() {
+                    self.sync_foreground_client_state();
                 }
                 true
             }

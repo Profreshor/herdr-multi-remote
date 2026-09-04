@@ -893,6 +893,7 @@ async fn hidden_shell_receives_semantics_without_owning_presentation() {
     ));
     assert_eq!(initial.workspaces[0].label, "hidden-shell");
     assert_eq!(server.foreground_client_id, None);
+    assert_eq!(server.app.state.outer_terminal_focus, Some(false));
     assert!(server.tab_geometry_controllers.is_empty());
 
     server.render_and_stream(true);
@@ -955,6 +956,7 @@ async fn hidden_shell_receives_semantics_without_owning_presentation() {
         })
     );
     assert_eq!(server.foreground_client_id, None);
+    assert_eq!(server.app.state.outer_terminal_focus, Some(false));
     assert!(!server
         .tab_geometry_controllers
         .values()
@@ -962,6 +964,38 @@ async fn hidden_shell_receives_semantics_without_owning_presentation() {
     assert!(!server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 71 }));
     server.render_and_stream(true);
     assert!(render_rx.try_recv().is_err());
+
+    server.app.state.ensure_test_terminals();
+    let terminal_id = server.app.state.workspaces[0]
+        .pane_state(pane_id)
+        .expect("hidden agent pane")
+        .attached_terminal_id
+        .clone();
+    server
+        .app
+        .state
+        .terminals
+        .get_mut(&terminal_id)
+        .expect("hidden agent terminal")
+        .set_detected_state(
+            Some(crate::detect::Agent::Codex),
+            crate::detect::AgentState::Working,
+        );
+    assert!(
+        server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(crate::detect::Agent::Codex),
+            state: crate::detect::AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: Instant::now(),
+        })
+    );
+    let pane = server.app.state.workspaces[0]
+        .pane_state(pane_id)
+        .expect("completed hidden agent pane");
+    assert!(!pane.seen);
     shutdown_test_runtimes(&mut server);
 }
 
