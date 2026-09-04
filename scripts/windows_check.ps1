@@ -96,6 +96,11 @@ if ($Mode -eq "lint") {
 
 Invoke-CargoTestFilter "windows_"
 Invoke-CargoTestFilter "server::client_transport::tests"
+Invoke-CargoTestFilter "client::server_connection::tests"
+Invoke-CargoTestFilter "client::endpoint_commands::tests"
+Invoke-CargoTestFilter "client::shell::tests::chrome_context"
+Invoke-CargoTestFilter "client::tests::remote_"
+Invoke-CargoTestFilter "remote::attach::tests"
 Invoke-CargoTestFilter "input::lease::tests::duplicate_physical_press_normalizes_for_forwarded_and_consumed_leases" -Exact
 Invoke-CargoTestFilter "client::shell::tests::input_domain::physical_release_uses_the_leased_press_code_with_current_modifiers" -Exact
 Invoke-CargoTestFilter "client::shell::tests::input_domain::pane_key_release_keeps_the_press_target" -Exact
